@@ -22,8 +22,9 @@
 # coefficient from the same group as UCLA ROMS:
 #   CPU cpp key        roms_gpu &surf_frc_settings   coefficient group (cm/day)
 #   SFLX_CORR          sflx_corr = .true.             &sss_correction dSSSdt
+#   QCORRECTION        qcorrection = .true.           &sst_correction dSSTdt
 #   CFLX_CORR (MARBL)  cflx_corr = .true.             &dic_alk_correction dCdt
-# A forcing file holding the restoring data (sss, sDIC/sALK)
+# A forcing file holding the restoring data (sss, sst, sDIC/sALK)
 # while its switch is off gives a start-up warning. The restoring-flux
 # output (&surf_flx_output_settings wrt_rstflx) is not on the GPU.
 #

@@ -37,9 +37,9 @@ module frc_io
   ! costs one seek, so a month of hourly times is thousands of reads.
   integer, parameter :: MAXTC = 1024
   ! Time axes the binders request (frc_io bind_series, bry_io 'bry_time').
-  character(len=16), parameter :: TAXES(14) = [character(len=16) :: 'time', 'sms_time', 'shf_time', &
+  character(len=16), parameter :: TAXES(15) = [character(len=16) :: 'time', 'sms_time', 'shf_time', &
        'swf_time', 'srf_time', 'sss_time', 'dust_time', 'iron_time', 'nox_time', 'nhy_time', &
-       'xco2_time', 'bry_time', 'sDIC_time', 'sALK_time']
+       'xco2_time', 'bry_time', 'sst_time', 'sDIC_time', 'sALK_time']
   integer, parameter :: AXIS_BLOCK = 8192   ! netCDF block size for the axis reads, bytes
   type :: tc_t
     integer :: ifile = 0, n = 0
@@ -83,6 +83,7 @@ module frc_io
   type(series2d), target :: s_sustr, s_svstr, s_shflx, s_swflx, s_swrad
   type(series2d), target :: s_uwnd, s_vwnd, s_tair, s_qair, s_prate, s_lwrad, s_bswrad
   type(series2d), target :: s_sss              ! SFLX_CORR: sea-surface salinity restoring data
+  type(series2d), target :: s_sst              ! QCORRECTION: sea-surface temperature restoring data
   type(series2d), target :: s_sdic, s_salk     ! CFLX_CORR: sea-surface DIC and ALK restoring data
   ! MARBL surface forcing (dust/iron/nox/nhy climatologies, atmospheric xCO2)
   type(series2d), target :: s_dust, s_iron, s_nox, s_nhy, s_xco2, s_xco2a
@@ -121,20 +122,22 @@ module frc_io
   public :: frc_prefetch, frc_prefetch_drain, frc_run_ncid_path
   logical, public :: bgc_frc_on = .false.
   real(rp), WORK_ATTR allocatable :: uwnd(:,:), vwnd(:,:), qair(:,:), prate(:,:), lwrad_in(:,:)
-  real(rp), WORK_ATTR allocatable :: sss(:,:), sdic(:,:), salk(:,:)
+  real(rp), WORK_ATTR allocatable :: sss(:,:), sst(:,:), sdic(:,:), salk(:,:)
   ! Surface restoring, bulk forcing only (UCLA ROMS bulk_frc.F90; there cpp
   ! keys, here GPU-only &surf_frc_settings switches, see NAMELIST_COMPAT):
   ! SFLX_CORR (sflx_corr): stflx(isalt) = -dSSSdt (S_surface - sss),
   !   &sss_correction dsssdt [cm/day];
+  ! QCORRECTION (qcorrection): stflx(itemp) -= dSSTdt (T_surface - sst),
+  !   before the SEA_ICE_NOFLUX cap, &sst_correction dsstdt [cm/day];
   ! CFLX_CORR (cflx_corr, MARBL): the surface fluxes of DIC and DIC_ALT_CO2
   !   are -dCdt (DIC_ALT_CO2_surface - sDIC), those of ALK and ALK_ALT_CO2
   !   -dCdt (ALK_ALT_CO2_surface - sALK) (the CPU's expressions: both
   !   tracers of a pair restore with the _ALT_CO2 tracer's value), applied
   !   by the passive corrector from the first step on (CPU b49a3e63,
   !   claude-docs#116), &dic_alk_correction dcdt [cm/day].
-  logical,  public :: sflx_corr = .false., cflx_corr = .false.
-  real(rp), public :: dsssdt = 7.777_rp, dcdt = 7.777_rp
-  real(rp)         :: dsssdt_ms = 0.0_rp, dcdt_ms = 0.0_rp   ! piston velocities, m/s
+  logical,  public :: sflx_corr = .false., qcorrection = .false., cflx_corr = .false.
+  real(rp), public :: dsssdt = 7.777_rp, dsstdt = 7.777_rp, dcdt = 7.777_rp
+  real(rp)         :: dsssdt_ms = 0.0_rp, dsstdt_ms = 0.0_rp, dcdt_ms = 0.0_rp   ! piston velocities, m/s
   integer(ip)      :: ic_dic = 0, ic_dica = 0, ic_alk = 0, ic_alka = 0          ! CFLX_CORR passive indices
 
   public :: read_forcing_namelist
@@ -160,8 +163,9 @@ contains
     logical :: interp_bulk_frc, check_bulk_frc_units
     namelist /forcing_files/ frcfiles, frcfile
     namelist /surf_frc_settings/ interp_flux_frc, interp_bulk_frc, check_bulk_frc_units, sflx_corr, &
-                                 cflx_corr
+                                 qcorrection, cflx_corr
     namelist /sss_correction/ dsssdt
+    namelist /sst_correction/ dsstdt
     namelist /dic_alk_correction/ dcdt
     namelist /flux_frc_settings/ interp_flux_frc
     namelist /bulk_frc_settings/ interp_bulk_frc, check_bulk_frc_units
@@ -202,6 +206,12 @@ contains
       error stop 'read_forcing_namelist'
     endif
     rewind(unit)
+    read(unit, nml=sst_correction, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'SST_CORRECTION: ', trim(iomsg_text(msg))
+      error stop 'read_forcing_namelist'
+    endif
+    rewind(unit)
     read(unit, nml=dic_alk_correction, iostat=ios, iomsg=msg)
     if (ios > 0) then
       write(*,*) 'DIC_ALK_CORRECTION: ', trim(iomsg_text(msg))
@@ -209,8 +219,9 @@ contains
     endif
     ! In single precision, as the CPU (surf_flux.F90: default-real dSSSdt, read from the
     ! namelist, then dSSSdt / (100.*86400.)): about -3.6e-8 relative to the double value.
-    ! The same for dCdt.
+    ! The same for dSSTdt and dCdt.
     dsssdt_ms = real(real(dsssdt, 4) / (100.0_4 * 86400.0_4), rp)
+    dsstdt_ms = real(real(dsstdt, 4) / (100.0_4 * 86400.0_4), rp)
     dcdt_ms = real(real(dcdt, 4) / (100.0_4 * 86400.0_4), rp)
     ! Closed walls: the GPU has free slip only (obc.F90 gamma2 = 1, as the CPU default).
     gamma2 = 1.0_rp
@@ -268,6 +279,14 @@ contains
         if (.not. s_sss%ready) error stop 'sflx_corr: sss / sss_time not found in the forcing files'
         write(*,'(a,f8.3,a,es12.4,a)') 'SSS restoring on: dSSSdt =', dsssdt, ' cm/day (', dsssdt_ms, ' m/s)'
       endif
+      ! QCORRECTION: sea-surface temperature restoring data
+      if (.not. allocated(sst)) allocate(sst(decomp%is:decomp%ie, decomp%js:decomp%je))
+      sst = 0.0_rp
+      if (qcorrection) then
+        call bind_series(s_sst, 'sst', 'sst_time', 'r')
+        if (.not. s_sst%ready) error stop 'qcorrection: sst / sst_time not found in the forcing files'
+        write(*,'(a,f8.3,a,es12.4,a)') 'SST restoring on: dSSTdt =', dsstdt, ' cm/day (', dsstdt_ms, ' m/s)'
+      endif
       ! CFLX_CORR: sea-surface DIC and ALK restoring data (the tracers: init_cflx_corr)
       if (.not. allocated(sdic)) allocate(sdic(decomp%is:decomp%ie, decomp%js:decomp%je), &
                                           salk(decomp%is:decomp%ie, decomp%js:decomp%je))
@@ -283,6 +302,7 @@ contains
       return
     endif
     if (sflx_corr) error stop 'sflx_corr needs bulk forcing (as roms_bugfix SFLX_CORR with BULK_FRC)'
+    if (qcorrection) error stop 'qcorrection needs bulk forcing (as roms_bugfix QCORRECTION with BULK_FRC)'
     if (cflx_corr) error stop 'cflx_corr needs bulk forcing (as roms_bugfix CFLX_CORR with BULK_FRC)'
     call warn_unused_restoring()
     nmiss = 0
@@ -319,6 +339,7 @@ contains
       call advance_series(s_lwrad, tneed)
       call advance_series(s_bswrad, tneed)
       if (sflx_corr) call advance_series(s_sss, tneed)
+      if (qcorrection) call advance_series(s_sst, tneed)
       if (cflx_corr) then
         call advance_series(s_sdic, tneed)
         call advance_series(s_salk, tneed)
@@ -346,7 +367,9 @@ contains
         logged_bulk = .true.
       endif
       if (sflx_corr) call fill_r(s_sss, tneed, sss)
-      call calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad_in, sflx_corr, dsssdt_ms, sss)
+      if (qcorrection) call fill_r(s_sst, tneed, sst)
+      call calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad_in, sflx_corr, dsssdt_ms, sss, &
+                           qcorrection, dsstdt_ms, sst)
       if (cflx_corr) then
         ! the passive corrector applies them (the one surface-flux array
         ! with CDR_LITE's, cdrl_psf); from the predicted state at n+1/2,
@@ -931,6 +954,7 @@ contains
     call pf_add(s_lwrad, 6, cand, n)
     call pf_add(s_bswrad, 7, cand, n)
     call pf_add(s_sss, 8, cand, n)
+    call pf_add(s_sst, 20, cand, n)
     call pf_add(s_sdic, 21, cand, n)
     call pf_add(s_salk, 22, cand, n)
     call pf_add(s_sustr, 9, cand, n)
@@ -1007,7 +1031,8 @@ contains
     call pf_drain(s_svstr); call pf_drain(s_shflx); call pf_drain(s_swflx)
     call pf_drain(s_swrad); call pf_drain(s_dust);  call pf_drain(s_iron)
     call pf_drain(s_nox);   call pf_drain(s_nhy);   call pf_drain(s_xco2)
-    call pf_drain(s_xco2a); call pf_drain(s_sdic);  call pf_drain(s_salk)
+    call pf_drain(s_xco2a); call pf_drain(s_sst);   call pf_drain(s_sdic)
+    call pf_drain(s_salk)
   end subroutine frc_prefetch_drain
 
   subroutine init_cflx_corr()
@@ -1042,6 +1067,8 @@ contains
     if (comm_rank() /= 0) return
     if (.not. sflx_corr .and. frc_has_var('sss')) write(*,'(a)') &
       'WARNING: the forcing files hold sss (SSS restoring data) but &surf_frc_settings sflx_corr is off'
+    if (.not. qcorrection .and. frc_has_var('sst')) write(*,'(a)') &
+      'WARNING: the forcing files hold sst (SST restoring data) but &surf_frc_settings qcorrection is off'
     if (.not. cflx_corr .and. (frc_has_var('sDIC') .or. frc_has_var('sALK'))) write(*,'(a)') &
       'WARNING: the forcing files hold sDIC/sALK (DIC/ALK restoring data) but &surf_frc_settings cflx_corr is off'
   end subroutine warn_unused_restoring

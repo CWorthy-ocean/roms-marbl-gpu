@@ -1,8 +1,9 @@
 #include "mem_attr.inc"
 module bulk_coare
   ! COARE 3.0 bulk fluxes (Fairall et al. 2003), ported from
-  ! roms_bugfix/src/bulk_frc.F90, with SFLX_CORR and CFLX_CORR (namelist
-  ! switches, frc_io) and the SEA_ICE_NOFLUX cap. No QCORR / TAU_CORR.
+  ! roms_bugfix/src/bulk_frc.F90, with SFLX_CORR, QCORRECTION and
+  ! CFLX_CORR (namelist switches, frc_io) and the SEA_ICE_NOFLUX cap.
+  ! No TAU_CORRECTION.
   ! All loops are device kernels (pointwise; the COARE iteration stays
   ! serial per point). Inputs must be managed/device arrays.
   use kinds
@@ -36,7 +37,7 @@ module bulk_coare
 
 contains
 
-  subroutine calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad, do_sss, dsss, sss)
+  subroutine calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad, do_sss, dsss, sss, do_sst, dsst, sst)
     real(rp), WORK_ATTR intent(in) :: uwnd(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: vwnd(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: tair(decomp%is:decomp%ie, decomp%js:decomp%je)
@@ -46,7 +47,10 @@ contains
     logical,  intent(in) :: do_sss                 ! SFLX_CORR salinity restoring
     real(rp), intent(in) :: dsss                   ! piston velocity, m/s
     real(rp), WORK_ATTR intent(in) :: sss(decomp%is:decomp%ie, decomp%js:decomp%je)
-    integer(ip) :: i, j, iter, itermax, nx, ny, nz, is, ie, js, je, n_rhs, i_fb, j_fb
+    logical,  intent(in) :: do_sst                 ! QCORRECTION heat-flux correction
+    real(rp), intent(in) :: dsst                   ! piston velocity, m/s
+    real(rp), WORK_ATTR intent(in) :: sst(decomp%is:decomp%ie, decomp%js:decomp%je)
+    integer(ip) :: i, j, iter, itermax, nx, ny, nz, is, ie, js, je, n_rhs, i_fb, j_fb, qc
     real(rp) :: rho0i, cpi, TseaC, TseaK, TairC, TairK, Qsea, rhoAir
     real(rp) :: VisAir, Hlv, delW, delT, delQ, u10, Zo10, Cd10, Ch10, Ct10, Cd
     real(rp) :: Ct, CC, Ri, Ribcu, Zetu, L10, Wstar, Tstar, Qstar
@@ -60,6 +64,7 @@ contains
     r0 = rho0_case
     rho0i = 1.0_rp / r0
     cpi = 1.0_rp / Cp
+    qc = merge(1_ip, 0_ip, do_sst)
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
@@ -174,6 +179,9 @@ contains
         hflat = -hflat * rho0i * cpi
         hfsen = -hfsen * rho0i * cpi
         stflx(i, j, itemp) = apply_mask(srflx(i, j) + hflw + hflat + hfsen, rmask(i, j))
+        ! roms_bugfix QCORRECTION: stflx(itemp) -= dSSTdt (T(nz,nrhs) - sst) rmask,
+        ! before the SEA_ICE_NOFLUX cap below
+        if (qc == 1) stflx(i, j, itemp) = stflx(i, j, itemp) - dsst * (TseaC - sst(i, j)) * rmask(i, j)
         evap = -Cp * hflat / Hlv
         swflx(i, j) = apply_mask(prate(i, j) * cmday2ms - evap, rmask(i, j))
         ! roms_bugfix SEA_ICE_NOFLUX (set_global_definitions.h, always on): no
