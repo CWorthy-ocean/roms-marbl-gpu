@@ -19,7 +19,7 @@ module step2d_mod
   use formulas
   use obc, only: zetabc, uv2dbc, uv2dbc_corners
   use rivers_mod, only: river_on, rivers_ubar, rivers_duon, rf_flx, riv_ufc, riv_vfc, nrf_s2df
-  use cdr_src_mod, only: cdr_vol_on, cdr_zeta_src
+  use cdr_src_mod, only: cdr_vol_on, cdr_zsrc
   use comm_mod, only: comm_size
   use arch_mod, only: sync_arch, on_gpu, graph_is_ready, graph_begin, &
                       graph_end, graph_launch
@@ -203,7 +203,7 @@ contains
     ! Three launches: Drhs; DUon and DVom together (both need Drhs of a
     ! neighbour); zeta_new (needs DUon/DVom of neighbours).
     integer(ip) :: i, j, ks, kb, ko, nx, ny, is, ie, js, je, ju0, ju1, iv0, iv1, lim
-    integer(ip) :: iu_lo, iu_hi, jv_lo, jv_hi, iz_lo, iz_hi, jz_lo, jz_hi
+    integer(ip) :: iu_lo, iu_hi, jv_lo, jv_hi, iz_lo, iz_hi, jz_lo, jz_hi, cvo
     real(rp) :: fwd, fwd1, fwd2, dt_fast, urhs, vrhs
 
     nx = decomp%nx
@@ -267,8 +267,11 @@ contains
     ! ranges, before zeta_new and DU_avg2/DV_avg2 use DUon/DVom
     if (river_on) call rivers_duon(iu_lo, iu_hi, ju0, ju1, iv0, iv1, jv_lo, jv_hi)
 
-    ! CDR volume releases: water into zeta(kstp) before zeta_new (CPU step2d)
-    if (cdr_vol_on) call cdr_zeta_src()
+    ! CDR volume releases (CPU c859943a): dtfast*cdr_zsrc into zeta_new
+    ! after swflx, as the pipe source; cdr_zsrc is exchanged, so the seam
+    ! ring gets the neighbour's releases. The water enters with zero
+    ! momentum (it is not in zeta(kstp), hence not in Drhs/DUon).
+    cvo = merge(1_ip, 0_ip, cdr_vol_on)
 
     CUF_DO2
     do j = jz_lo, jz_hi
@@ -279,6 +282,7 @@ contains
         zeta_new(i, j) = zeta(i, j, ks) + dt_fast * pm(i, j) * pn(i, j) * &
                          (DUon(i, j) - DUon(i + 1, j) + DVom(i, j) - DVom(i, j + 1)) &
                          + dt_fast * swflx(i, j)
+        if (cvo == 1) zeta_new(i, j) = zeta_new(i, j) + dt_fast * cdr_zsrc(i, j)
         zeta_new(i, j) = apply_mask(zeta_new(i, j), rmask(i, j))
       enddo
     enddo

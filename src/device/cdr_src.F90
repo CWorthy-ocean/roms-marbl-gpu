@@ -21,7 +21,7 @@ module cdr_src_mod
   use decomp_mod, only: decomp
   use gpu_state
   use arch_mod, only: sync_arch
-  use time_state, only: fast
+  use halo_mod, only: halo_fill_2d
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
 #endif
@@ -30,7 +30,7 @@ module cdr_src_mod
   public :: cdr_on, cdr_set_lists, cdr_set_record, cdr_copy_upper, cdr_set_weights, cdr_apply_tp
   public :: cdr_src_out
   public :: cdr_mode, CDR_MODE_FLUX, CDR_MODE_VOL, CDR_MODE_DP, CDR_MODE_3D
-  public :: cdr_set_vol, cdr_set_record_vol, cdr_apply_ts, cdr_zeta_src, cdr_vol_on
+  public :: cdr_set_vol, cdr_set_record_vol, cdr_apply_ts, cdr_zsrc, cdr_vol_on
   public :: cdr_cmap, cd_vol, cq_w, cc_p0, cq_rel
   public :: cdr_set_3d, cdr_3d_buf, cdr_src_out3d
   public :: cdr_set_dp, cdr_dp_gather_hz, cdr_set_dp_weights, cdr_dp_hzc
@@ -46,8 +46,9 @@ module cdr_src_mod
   ! Volume releases (cdr_volume): water cd_v(r, slot) [m3/s] carrying
   ! tracers at concentrations cd_flx (passive) and cd_ts (T, S); the flux is
   ! vol*conc with both interpolated in time (CPU set_cdr_frc), and the
-  ! water also enters zeta (step2d, every fast step) and Wi (omega) with
-  ! the release's weights; cd_vol(r) is the volume at the latest set_cdr.
+  ! water also enters zeta (step2d, every fast step, through cdr_zsrc) and
+  ! Wi (omega) with the release's weights; cd_vol(r) is the volume at the
+  ! latest set_cdr.
   integer, parameter :: CDR_MODE_FLUX = 1, CDR_MODE_VOL = 2, CDR_MODE_DP = 3, CDR_MODE_3D = 4
   integer :: cdr_mode = CDR_MODE_FLUX
   ! depth profiles: mapped passive tracers cdp_itr(1:ndp), weights
@@ -69,6 +70,11 @@ module cdr_src_mod
   real(rp), WORK_ATTR allocatable :: cdr_3d_buf(:,:,:,:,:)
   logical :: cdr_vol_on = .false.
   real(rp), allocatable :: h_ts(:,:,:)
+  ! Volume releases: the free-surface source [m/s], sum over the cell's
+  ! profiles of pm*pn*vol*sum_k(w), at the latest set_cdr, on the owned
+  ! cells and exchanged (CPU cdr_frc.F90 cdr_zsrc, c859943a); step2d adds
+  ! dtfast*cdr_zsrc to zeta_new, the halo ring included.
+  real(rp), WORK_ATTR allocatable :: cdr_zsrc(:,:)
 #ifdef USE_CUDA
   real(rp),    device, allocatable :: cd_v(:,:), cd_vol(:), cd_ts(:,:,:), cq_qsum(:)
   integer(ip), device, allocatable :: cdr_cmap(:,:)
@@ -231,7 +237,9 @@ contains
     cdr_vol_on = .true.
     allocate(cd_v(max(nrel, 1), 2), cd_vol(max(nrel, 1)), cd_ts(2, max(nrel, 1), 2), cq_qsum(max(ncq, 1)))
     allocate(cdr_cmap(decomp%is:decomp%ie, decomp%js:decomp%je), h_ts(2, max(nrel, 1), 2))
+    allocate(cdr_zsrc(decomp%is:decomp%ie, decomp%js:decomp%je))
     cd_v = 0.0_rp; cd_vol = 0.0_rp; cd_ts = 0.0_rp; cq_qsum = 0.0_rp; h_ts = 0.0_rp
+    cdr_zsrc = 0.0_rp
     if (ncq > 0) cq_qsum = qsum(1:ncq)
     cdr_cmap = cmap
   end subroutine cdr_set_vol
@@ -253,7 +261,8 @@ contains
 
   subroutine cdr_vol_interp()
     ! cd_vol = c1*v1 + c2*v2 at the latest weights (CPU set_frc_data),
-    ! stream-ordered before the kernels that read it.
+    ! stream-ordered before the kernels that read it; then cdr_zsrc from it
+    ! (CPU set_cdr_zsrc, after every update of cdr_vol).
     integer(ip) :: r, n
     real(rp) :: c1, c2
     n = nrel; c1 = w_cor(1); c2 = w_cor(2)
@@ -263,7 +272,35 @@ contains
     do r = 1, n
       cd_vol(r) = c1 * cd_v(r, 1) + c2 * cd_v(r, 2)
     enddo
+    call cdr_zsrc_set()
   end subroutine cdr_vol_interp
+
+  subroutine cdr_zsrc_set()
+    ! cdr_zsrc(i, j) = sum of ((pm*pn)*vol)*sum_k(w) over the profiles of
+    ! the cell, in release order (CPU set_cdr_zsrc), on the owned release
+    ! cells, then exchanged: the list holds owned cells only, and step2d
+    ! forms zeta_new on the first halo ring of MPI seams too, where the
+    ! neighbour's release must enter as well. Every rank exchanges, with or
+    ! without release cells. Points that never hold a release stay 0.
+    integer(ip) :: c, i, j, q, n, r
+    real(rp) :: z
+    n = ncc
+    if (n > 0) then
+#ifdef USE_CUDA
+      !$cuf kernel do(1) <<<*, *, 0, work_stream>>>
+#endif
+      do c = 1, n
+        i = cc_i(c); j = cc_j(c)
+        z = 0.0_rp
+        do q = cc_p0(c), cc_p0(c + 1) - 1
+          r = cq_rel(q)
+          z = z + pm(i, j) * pn(i, j) * cd_vol(r) * cq_qsum(q)
+        enddo
+        cdr_zsrc(i, j) = z
+      enddo
+    endif
+    call halo_fill_2d(cdr_zsrc, STAGGER_RHO)
+  end subroutine cdr_zsrc_set
 
   subroutine cdr_apply_ts(n_new, dtp, s0, s1)
     ! Volume releases: temperature and salinity (t(:,:,:,n_new,s0:s1)) take
@@ -295,28 +332,6 @@ contains
       enddo
     enddo
   end subroutine cdr_apply_ts
-
-  subroutine cdr_zeta_src()
-    ! Volume releases, every fast step before zeta_new (CPU step2d):
-    ! zeta(kstp) += (((dtfast*pm)*pn)*vol)*sum_k(w) for every profile of the
-    ! cell, in release order. The fast-step index and dtfast are read on the
-    ! device (fast), so a captured graph replays it correctly.
-    integer(ip) :: c, i, j, q, n, ks, r
-    real(rp) :: dtf
-    if (.not. cdr_vol_on .or. ncc == 0) return
-    n = ncc
-#ifdef USE_CUDA
-    !$cuf kernel do(1) <<<*, *, 0, work_stream>>>
-#endif
-    do c = 1, n
-      ks = fast%kstp; dtf = fast%dtfast
-      i = cc_i(c); j = cc_j(c)
-      do q = cc_p0(c), cc_p0(c + 1) - 1
-        r = cq_rel(q)
-        zeta(i, j, ks) = zeta(i, j, ks) + dtf * pm(i, j) * pn(i, j) * cd_vol(r) * cq_qsum(q)
-      enddo
-    enddo
-  end subroutine cdr_zeta_src
 
   subroutine cdr_set_3d(ialk, idic)
     ! 3D forcing: the passive indices of MARBL's ALK and DIC.
