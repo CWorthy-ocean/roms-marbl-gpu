@@ -4,8 +4,10 @@ module rivers_mod
   ! River sources (UCLA river_frc), on the device. A river cell is a land
   ! cell with river_index > 0; each of its faces to an ocean cell carries
   ! the fraction river_fraction / (number of such faces) of that river's
-  ! volume flux. The CPU model handles these faces in five places, and the
+  ! volume flux. The CPU model handles these faces in six places, and the
   ! kernels below repeat its expressions there:
+  !   set_HUV     the predictor transport FlxU/FlxV on the faces, from the
+  !               river volume at time n (rivers_huv; CPU 2805cbef);
   !   step2d      ubar/vbar(knew) and DU/DV_avg1 on the faces, every fast
   !               step (rivers_ubar);
   !   pre_step3d  u/v(nnew) on the faces, before u3dbc (rivers_uv, RIV_PRE);
@@ -39,8 +41,8 @@ module rivers_mod
   private
   public :: river_on, rivers_set_lists, rivers_set_record, rivers_copy_upper, rivers_set_weights
   public :: rivers_set_map
-  public :: rivers_ubar, rivers_uv, rivers_ts, rivers_tp
-  public :: RIV_S2D, RIV_PRE, RIV_COR, RIV_S2DF
+  public :: rivers_ubar, rivers_uv, rivers_ts, rivers_tp, rivers_huv
+  public :: RIV_S2D, RIV_PRE, RIV_COR, RIV_S2DF, RIV_RNG
   ! for the fast-step override fused into step2d_mid's ubar/vbar kernel
   public :: rf_flx, riv_ufc, riv_vfc
 
@@ -49,7 +51,10 @@ module rivers_mod
   ! applies its override (riv_ufc/riv_vfc point to it), RIV_S2D when
   ! rivers_ubar does: faces within two cells of a physical edge, so that
   ! the open-boundary code still sees them before the override, as the CPU.
-  integer, parameter :: RIV_S2D = 1, RIV_PRE = 2, RIV_COR = 4, RIV_S2DF = 8
+  ! RIV_RNG: every face of the river scan (cells 0:nx+1 x 0:ny+1, as the
+  ! CPU's calc_river_flux); rivers_huv tests the ranges of the loop it
+  ! follows (set_HUV's) itself.
+  integer, parameter :: RIV_S2D = 1, RIV_PRE = 2, RIV_COR = 4, RIV_S2DF = 8, RIV_RNG = 16
 
   logical :: river_on = .false.
   integer(ip) :: nrf = 0, nrc = 0, nrl = 0, nrt = 0   ! faces, cells, rivers, tracers of the river data
@@ -224,6 +229,46 @@ contains
       endif
     enddo
   end subroutine rivers_ubar
+
+  subroutine rivers_huv(iu0, iu1, ju0, ju1, iv0, iv1, jv0, jv1)
+    ! CPU set_HUV (2805cbef): on every river face in set_HUV's ranges (u
+    ! faces iu0:iu1 x ju0:ju1, v faces iv0:iv1 x jv0:jv1) the predictor
+    ! transport is the river transport at the predictor's forcing time
+    ! (time n), distributed over the column as the river tracer flux is:
+    !   FlxU = Hz_u * (riv_vol*frac / riv_depth),
+    ! riv_depth the mean column depth of the two cells. u(nrhs) on a river
+    ! face holds the previous step's river velocity (or 0 from an initial
+    ! file without it), so a varying river would otherwise enter the
+    ! predictor's volume (omega, the Hz predictor) with a different volume
+    ! than its tracers. Called before set_HUV's exchange.
+    integer(ip), intent(in) :: iu0, iu1, ju0, ju1, iv0, iv1, jv0, jv1
+    integer(ip) :: f, k, i, j, r, n, nz, a0, a1, b0, b1, c0, c1_, d0, d1
+    real(rp) :: c1, c2, q, dep, rflx
+    if (nrf == 0) return
+    n = nrf; nz = decomp%nz
+    a0 = iu0; a1 = iu1; b0 = ju0; b1 = ju1; c0 = iv0; c1_ = iv1; d0 = jv0; d1 = jv1
+    c1 = w_pre(1); c2 = w_pre(2)
+    CUF_DO2
+    do k = 1, nz
+      do f = 1, n
+        if (iand(rf_s(f), RIV_RNG) == 0) cycle
+        i = rf_i(f); j = rf_j(f); r = rf_r(f)
+        if (rf_t(f) == 1) then
+          if (i < a0 .or. i > a1 .or. j < b0 .or. j > b1) cycle
+          q = (c1 * rv_vol(r, 1) + c2 * rv_vol(r, 2)) * rf_frac(f)
+          dep = 0.5_rp * (z_w(i - 1, j, nz) - z_w(i - 1, j, 0) + z_w(i, j, nz) - z_w(i, j, 0))
+          rflx = q / dep
+          FlxU(i, j, k) = Hz_u(i, j, k) * rflx
+        else
+          if (i < c0 .or. i > c1_ .or. j < d0 .or. j > d1) cycle
+          q = (c1 * rv_vol(r, 1) + c2 * rv_vol(r, 2)) * rf_frac(f)
+          dep = 0.5_rp * (z_w(i, j - 1, nz) - z_w(i, j - 1, 0) + z_w(i, j, nz) - z_w(i, j, 0))
+          rflx = q / dep
+          FlxV(i, j, k) = Hz_v(i, j, k) * rflx
+        endif
+      enddo
+    enddo
+  end subroutine rivers_huv
 
   subroutine rivers_uv(sbit)
     ! CPU pre_step3d (RIV_PRE) and step3d_uv2 (RIV_COR): on every river

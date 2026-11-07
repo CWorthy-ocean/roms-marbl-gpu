@@ -12,7 +12,7 @@ module case_io
   use frc_io, only: read_forcing_namelist, init_forcing, set_forces, close_frc_cache
   use bry_io, only: init_bry, set_bry_all
   use tide_io, only: read_tide_namelist, init_tides, set_tides
-  use river_io, only: read_river_namelist, init_rivers
+  use river_io, only: read_river_namelist, init_rivers, set_rivers
   use cdr_io, only: read_cdr_namelist, init_cdr
   use cdr_lite_io, only: read_cdr_lite_namelist, init_cdr_lite
   use cdr_lite_out, only: read_cdr_lite_output_namelist, set_cdr_lite_output_root, init_cdr_lite_output
@@ -673,6 +673,7 @@ contains
     call close_frc_cache()
     frc_slot = 0
     call set_forces()
+    call set_rivers(0)                ! river volume at time n for set_HUV (CPU: set_forces)
     call set_bry_all()
     call set_tides()
     ! The CPU's start-up diagnostics before its initial history record

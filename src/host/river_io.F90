@@ -306,7 +306,7 @@ contains
     subroutine add_face(typ, ii, jj, flx)
       ! One face as the CPU's riv_uflx/riv_vflx: iriver = nint(flx/10),
       ! frac = flx - 10*iriver. Faces inside the arrays set the river mask;
-      ! faces in at least one of the loop ranges are listed.
+      ! every face is listed, with the bits of the loop ranges it is in.
       integer,  intent(in) :: typ, ii, jj
       real(rp), intent(in) :: flx
       integer :: iriver
@@ -321,8 +321,10 @@ contains
         endif
       endif
       ! fast-loop faces two cells or more from every physical edge are done
-      ! inside step2d_mid's kernel (RIV_S2DF), the others by rivers_ubar
-      sb = 0
+      ! inside step2d_mid's kernel (RIV_S2DF), the others by rivers_ubar.
+      ! Every face of the scan is listed with RIV_RNG: rivers_huv checks
+      ! the ranges of set_HUV itself.
+      sb = int(RIV_RNG, ip)
       if (typ == 1) then
         far = (.not. decomp%edge_w .or. ii >= 3) .and. (.not. decomp%edge_e .or. ii <= nx - 1) .and. &
               (.not. decomp%edge_s .or. jj >= 3) .and. (.not. decomp%edge_n .or. jj <= ny - 2)
@@ -335,12 +337,10 @@ contains
         if (ii >= iu_s2d0 .and. ii <= iu_s2d1 .and. jj >= 1 .and. jj <= ny) sb = ior(sb, s2d)
         if (ii >= iu_pre0 .and. ii <= nx .and. jj >= 1 .and. jj <= ny) sb = ior(sb, int(RIV_PRE, ip))
         if (ii >= 1 .and. ii <= nx .and. jj >= 1 .and. jj <= ny) sb = ior(sb, int(RIV_COR, ip))
-        if (sb == 0 .and. .not. (ii >= 1 .and. ii <= nx + 1 .and. jj >= 1 .and. jj <= ny)) return
       else
         if (ii >= 1 .and. ii <= nx .and. jj >= jv_s2d0 .and. jj <= jv_s2d1) sb = ior(sb, s2d)
         if (ii >= 1 .and. ii <= nx .and. jj >= jv_pre0 .and. jj <= ny) sb = ior(sb, int(RIV_PRE, ip))
         if (ii >= 1 .and. ii <= nx .and. jj >= 1 .and. jj <= ny) sb = ior(sb, int(RIV_COR, ip))
-        if (sb == 0 .and. .not. (ii >= 1 .and. ii <= nx .and. jj >= 1 .and. jj <= ny + 1)) return
       endif
       nf = nf + 1
       fi(nf) = ii; fj(nf) = jj; ft(nf) = typ; fs(nf) = sb
