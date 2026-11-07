@@ -146,11 +146,16 @@ contains
     call set_cdr_lite()                   ! CDR_LITE surface fluxes at n+1/2 (corrector)
     call dump_swflx_b('after corr set_forces')
     call lmd_vmix(nrhs)
-    ! Boundary data and tidal harmonics for n+1 (CPU main.F90 since
-    ! 69a23382; before it read n+3/2); the tidal potential stays at n+1/2.
+    ! Boundary data for n+1 (CPU main.F90 since 69a23382; before it read
+    ! n+3/2). The boundary tidal harmonics are added to the 2D boundary
+    ! arrays, which only the fast loop reads (uv2dbc). The fast loop
+    ! advances the barotropic mode from n to n+1 with these values held
+    ! fixed, so they are evaluated at the centre of that interval, n+1/2;
+    ! at n+1 the boundary-forced tide leads by about omega*dt/2 (CPU
+    ! ab490df8). The potential is at n+1/2 as well, where prsgrd uses it.
     frc_slot = 2
     call set_bry_all()
-    call set_tides(1.0_rp)
+    call set_tides(0.5_rp)
     call dump_bry_north('after tide', frc_modtime())
     call step_mark('corrector forces')
     call dump_vic('before uv1')

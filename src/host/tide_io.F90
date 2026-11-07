@@ -151,10 +151,12 @@ contains
     ! kernel arguments), in the same order as the host loops it replaces.
     ! bry_phase (units of dt, default 0.5): the boundary harmonics are at
     ! time + bry_phase*dt; the potential is always at n+1/2, where prsgrd
-    ! uses it (CPU tides.F90 since 69a23382: the corrector's boundary update
-    ! is at n+1). The coefficients are host-written managed arrays; the
-    ! corrector call overwrites the predictor's only after set_depth's
-    ! device sync, so the predictor's kernels have used them by then.
+    ! uses it. Both calls of the step use n+1/2 (CPU tides.F90 since
+    ! ab490df8): the harmonics enter only the 2D boundary conditions of the
+    ! fast loop, which runs from n to n+1. The coefficients are
+    ! host-written managed arrays; the corrector call overwrites the
+    ! predictor's only after set_depth's device sync, so the predictor's
+    ! kernels have used them by then.
     real(rp), intent(in), optional :: bry_phase
     integer(ip) :: it, i, j, nx, ny, ip, is, ie, js, je, n
     real(rp) :: omT, omTp, c, s, z0, v0, zw, ze, uw, ue, vw, ve, bphase
