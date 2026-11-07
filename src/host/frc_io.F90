@@ -9,7 +9,9 @@ module frc_io
   use gpu_state
   use time_state
   use nc_io
-  use bulk_coare, only: calc_bulk_coare
+  use bulk_coare, only: calc_bulk_coare, calc_cflx_corr
+  use passive_mod, only: ntp, tp, n_marbl, passive_name
+  use cdr_lite_mod, only: cdrl_psf_full, cdrl_psf, psf_cflx
   use arch_mod, only: sync_arch
   use comm_mod, only: comm_rank, comm_size, comm_compute
   use run_timers, only: wall_time
@@ -35,9 +37,9 @@ module frc_io
   ! costs one seek, so a month of hourly times is thousands of reads.
   integer, parameter :: MAXTC = 1024
   ! Time axes the binders request (frc_io bind_series, bry_io 'bry_time').
-  character(len=16), parameter :: TAXES(12) = [character(len=16) :: 'time', 'sms_time', 'shf_time', &
+  character(len=16), parameter :: TAXES(14) = [character(len=16) :: 'time', 'sms_time', 'shf_time', &
        'swf_time', 'srf_time', 'sss_time', 'dust_time', 'iron_time', 'nox_time', 'nhy_time', &
-       'xco2_time', 'bry_time']
+       'xco2_time', 'bry_time', 'sDIC_time', 'sALK_time']
   integer, parameter :: AXIS_BLOCK = 8192   ! netCDF block size for the axis reads, bytes
   type :: tc_t
     integer :: ifile = 0, n = 0
@@ -81,6 +83,7 @@ module frc_io
   type(series2d), target :: s_sustr, s_svstr, s_shflx, s_swflx, s_swrad
   type(series2d), target :: s_uwnd, s_vwnd, s_tair, s_qair, s_prate, s_lwrad, s_bswrad
   type(series2d), target :: s_sss              ! SFLX_CORR: sea-surface salinity restoring data
+  type(series2d), target :: s_sdic, s_salk     ! CFLX_CORR: sea-surface DIC and ALK restoring data
   ! MARBL surface forcing (dust/iron/nox/nhy climatologies, atmospheric xCO2)
   type(series2d), target :: s_dust, s_iron, s_nox, s_nhy, s_xco2, s_xco2a
   ! CDR_LITE surface forcing: carbonate sensitivities and the DIC tracers'
@@ -118,12 +121,21 @@ module frc_io
   public :: frc_prefetch, frc_prefetch_drain, frc_run_ncid_path
   logical, public :: bgc_frc_on = .false.
   real(rp), WORK_ATTR allocatable :: uwnd(:,:), vwnd(:,:), qair(:,:), prate(:,:), lwrad_in(:,:)
-  real(rp), WORK_ATTR allocatable :: sss(:,:)
-  ! SFLX_CORR (roms_bugfix bulk_frc.F90): stflx(isalt) = -dSSSdt (S_surface - sss),
-  ! bulk forcing only. &surf_frc_settings sflx_corr; &sss_correction dsssdt [cm/day].
-  logical,  public :: sflx_corr = .false.
-  real(rp), public :: dsssdt = 7.777_rp
-  real(rp)         :: dsssdt_ms = 0.0_rp       ! piston velocity, m/s
+  real(rp), WORK_ATTR allocatable :: sss(:,:), sdic(:,:), salk(:,:)
+  ! Surface restoring, bulk forcing only (UCLA ROMS bulk_frc.F90; there cpp
+  ! keys, here GPU-only &surf_frc_settings switches, see NAMELIST_COMPAT):
+  ! SFLX_CORR (sflx_corr): stflx(isalt) = -dSSSdt (S_surface - sss),
+  !   &sss_correction dsssdt [cm/day];
+  ! CFLX_CORR (cflx_corr, MARBL): the surface fluxes of DIC and DIC_ALT_CO2
+  !   are -dCdt (DIC_ALT_CO2_surface - sDIC), those of ALK and ALK_ALT_CO2
+  !   -dCdt (ALK_ALT_CO2_surface - sALK) (the CPU's expressions: both
+  !   tracers of a pair restore with the _ALT_CO2 tracer's value), applied
+  !   by the passive corrector from the first step on (CPU b49a3e63,
+  !   claude-docs#116), &dic_alk_correction dcdt [cm/day].
+  logical,  public :: sflx_corr = .false., cflx_corr = .false.
+  real(rp), public :: dsssdt = 7.777_rp, dcdt = 7.777_rp
+  real(rp)         :: dsssdt_ms = 0.0_rp, dcdt_ms = 0.0_rp   ! piston velocities, m/s
+  integer(ip)      :: ic_dic = 0, ic_dica = 0, ic_alk = 0, ic_alka = 0          ! CFLX_CORR passive indices
 
   public :: read_forcing_namelist
   public :: init_forcing
@@ -131,6 +143,7 @@ module frc_io
   public :: init_bgc_forcing
   public :: set_bgc_forces
   public :: init_cdr_lite_forcing, set_cdr_lite_forces
+  public :: init_cflx_corr
   public :: cyc_bracket
   public :: uwnd, vwnd
   public :: write_toy_flux
@@ -146,8 +159,10 @@ contains
     character(len=512) :: frcfiles(max_frc), frcfile(max_frc)
     logical :: interp_bulk_frc, check_bulk_frc_units
     namelist /forcing_files/ frcfiles, frcfile
-    namelist /surf_frc_settings/ interp_flux_frc, interp_bulk_frc, check_bulk_frc_units, sflx_corr
+    namelist /surf_frc_settings/ interp_flux_frc, interp_bulk_frc, check_bulk_frc_units, sflx_corr, &
+                                 cflx_corr
     namelist /sss_correction/ dsssdt
+    namelist /dic_alk_correction/ dcdt
     namelist /flux_frc_settings/ interp_flux_frc
     namelist /bulk_frc_settings/ interp_bulk_frc, check_bulk_frc_units
     real(rp) :: gamma2
@@ -186,9 +201,17 @@ contains
       write(*,*) 'SSS_CORRECTION: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
+    rewind(unit)
+    read(unit, nml=dic_alk_correction, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'DIC_ALK_CORRECTION: ', trim(iomsg_text(msg))
+      error stop 'read_forcing_namelist'
+    endif
     ! In single precision, as the CPU (surf_flux.F90: default-real dSSSdt, read from the
     ! namelist, then dSSSdt / (100.*86400.)): about -3.6e-8 relative to the double value.
+    ! The same for dCdt.
     dsssdt_ms = real(real(dsssdt, 4) / (100.0_4 * 86400.0_4), rp)
+    dcdt_ms = real(real(dcdt, 4) / (100.0_4 * 86400.0_4), rp)
     ! Closed walls: the GPU has free slip only (obc.F90 gamma2 = 1, as the CPU default).
     gamma2 = 1.0_rp
     rewind(unit)
@@ -245,9 +268,23 @@ contains
         if (.not. s_sss%ready) error stop 'sflx_corr: sss / sss_time not found in the forcing files'
         write(*,'(a,f8.3,a,es12.4,a)') 'SSS restoring on: dSSSdt =', dsssdt, ' cm/day (', dsssdt_ms, ' m/s)'
       endif
+      ! CFLX_CORR: sea-surface DIC and ALK restoring data (the tracers: init_cflx_corr)
+      if (.not. allocated(sdic)) allocate(sdic(decomp%is:decomp%ie, decomp%js:decomp%je), &
+                                          salk(decomp%is:decomp%ie, decomp%js:decomp%je))
+      sdic = 0.0_rp; salk = 0.0_rp
+      if (cflx_corr) then
+        call bind_series(s_sdic, 'sDIC', 'sDIC_time', 'r')
+        call bind_series(s_salk, 'sALK', 'sALK_time', 'r')
+        if (.not. (s_sdic%ready .and. s_salk%ready)) &
+          error stop 'cflx_corr: sDIC / sDIC_time or sALK / sALK_time not found in the forcing files'
+        write(*,'(a,f8.3,a,es12.4,a)') 'DIC/ALK restoring on: dCdt =', dcdt, ' cm/day (', dcdt_ms, ' m/s)'
+      endif
+      call warn_unused_restoring()
       return
     endif
     if (sflx_corr) error stop 'sflx_corr needs bulk forcing (as roms_bugfix SFLX_CORR with BULK_FRC)'
+    if (cflx_corr) error stop 'cflx_corr needs bulk forcing (as roms_bugfix CFLX_CORR with BULK_FRC)'
+    call warn_unused_restoring()
     nmiss = 0
     if (s_uwnd%ready .or. s_vwnd%ready .or. s_tair%ready .or. s_qair%ready) then
       if (.not. s_uwnd%ready) nmiss = nmiss + 1
@@ -282,6 +319,10 @@ contains
       call advance_series(s_lwrad, tneed)
       call advance_series(s_bswrad, tneed)
       if (sflx_corr) call advance_series(s_sss, tneed)
+      if (cflx_corr) then
+        call advance_series(s_sdic, tneed)
+        call advance_series(s_salk, tneed)
+      endif
       call frc_batch_flush()
       call fill_r(s_uwnd, tneed, uwnd)
       call fill_r(s_vwnd, tneed, vwnd)
@@ -306,6 +347,14 @@ contains
       endif
       if (sflx_corr) call fill_r(s_sss, tneed, sss)
       call calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad_in, sflx_corr, dsssdt_ms, sss)
+      if (cflx_corr) then
+        ! the passive corrector applies them (the one surface-flux array
+        ! with CDR_LITE's, cdrl_psf); from the predicted state at n+1/2,
+        ! as the CPU's set_forces before step3d_t
+        call fill_r(s_sdic, tneed, sdic)
+        call fill_r(s_salk, tneed, salk)
+        call calc_cflx_corr(tp, ntp, nrhs, cdrl_psf, sdic, salk, dcdt_ms, ic_dic, ic_dica, ic_alk, ic_alka)
+      endif
       return
     endif
     if (.not. have_flux) return
@@ -882,6 +931,8 @@ contains
     call pf_add(s_lwrad, 6, cand, n)
     call pf_add(s_bswrad, 7, cand, n)
     call pf_add(s_sss, 8, cand, n)
+    call pf_add(s_sdic, 21, cand, n)
+    call pf_add(s_salk, 22, cand, n)
     call pf_add(s_sustr, 9, cand, n)
     call pf_add(s_svstr, 10, cand, n)
     call pf_add(s_shflx, 11, cand, n)
@@ -956,8 +1007,57 @@ contains
     call pf_drain(s_svstr); call pf_drain(s_shflx); call pf_drain(s_swflx)
     call pf_drain(s_swrad); call pf_drain(s_dust);  call pf_drain(s_iron)
     call pf_drain(s_nox);   call pf_drain(s_nhy);   call pf_drain(s_xco2)
-    call pf_drain(s_xco2a)
+    call pf_drain(s_xco2a); call pf_drain(s_sdic);  call pf_drain(s_salk)
   end subroutine frc_prefetch_drain
+
+  subroutine init_cflx_corr()
+    ! CFLX_CORR: the passive indices of DIC, DIC_ALT_CO2, ALK and
+    ! ALK_ALT_CO2 (MARBL), and the passive surface-flux array at full size.
+    ! After init_cdr_lite (which sizes cdrl_psf for CDR_LITE).
+    integer(ip) :: m
+    if (.not. cflx_corr) return
+    ic_dic = 0; ic_dica = 0; ic_alk = 0; ic_alka = 0
+    do m = 1, n_marbl
+      select case (trim(passive_name(m)))
+      case ('DIC'); ic_dic = m
+      case ('DIC_ALT_CO2'); ic_dica = m
+      case ('ALK'); ic_alk = m
+      case ('ALK_ALT_CO2'); ic_alka = m
+      end select
+    enddo
+    if (ic_dic == 0 .or. ic_dica == 0 .or. ic_alk == 0 .or. ic_alka == 0) &
+      error stop 'cflx_corr needs the MARBL tracers DIC, DIC_ALT_CO2, ALK and ALK_ALT_CO2 (as roms_bugfix CFLX_CORR with MARBL)'
+    call cdrl_psf_full(ntp)
+    psf_cflx = .true.
+    if (comm_rank() == 0) write(*,'(a,4(1x,i0))') 'cflx_corr: passive DIC, DIC_ALT_CO2, ALK, ALK_ALT_CO2 =', &
+         ic_dic, ic_dica, ic_alk, ic_alka
+  end subroutine init_cflx_corr
+
+  subroutine warn_unused_restoring()
+    ! Restoring data in the forcing files with its switch off: a CPU case
+    ! built with the cpp key would restore, the GPU would not (the GPU
+    ! cannot see cpp keys). Warn, as the data alone do not prove the key.
+    ! The variable names are the CPU's (surf_flux.F90; a flux file's
+    ! upper-case SST/SSS are not restoring data).
+    if (comm_rank() /= 0) return
+    if (.not. sflx_corr .and. frc_has_var('sss')) write(*,'(a)') &
+      'WARNING: the forcing files hold sss (SSS restoring data) but &surf_frc_settings sflx_corr is off'
+    if (.not. cflx_corr .and. (frc_has_var('sDIC') .or. frc_has_var('sALK'))) write(*,'(a)') &
+      'WARNING: the forcing files hold sDIC/sALK (DIC/ALK restoring data) but &surf_frc_settings cflx_corr is off'
+  end subroutine warn_unused_restoring
+
+  logical function frc_has_var(name)
+    ! Whether any forcing file has the variable (handles of the init cache).
+    character(len=*), intent(in) :: name
+    integer :: i
+    frc_has_var = .false.
+    do i = 1, case_nfrc
+      if (nc_has_var(frc_file_ncid(i), name)) then
+        frc_has_var = .true.
+        return
+      endif
+    enddo
+  end function frc_has_var
 
   subroutine pf_drain(s)
     type(series2d), intent(inout) :: s

@@ -9,7 +9,7 @@ module case_io
   use nc_io
   use host_buf, only: host_read_2d, host_read_3d
   use par_read, only: pr_begin, pr_flush, pr_take, pr_end, pr_taking, pr_store_2d, pr_store_3d, pr_store_3d_pt
-  use frc_io, only: read_forcing_namelist, init_forcing, set_forces, close_frc_cache
+  use frc_io, only: read_forcing_namelist, init_forcing, set_forces, close_frc_cache, init_cflx_corr
   use bry_io, only: init_bry, set_bry_all
   use tide_io, only: read_tide_namelist, init_tides, set_tides
   use river_io, only: read_river_namelist, init_rivers, set_rivers
@@ -669,6 +669,7 @@ contains
     call init_cdr(case_grdname)       ! CDR releases (passive list and columns final)
     call wall_stamp('cdr init')
     call init_cdr_lite()              ! CDR_LITE surface forcing (binds forcing series)
+    call init_cflx_corr()             ! CFLX_CORR tracers (after init_cdr_lite sizes cdrl_psf)
     call wall_stamp('cdr_lite init')
     call close_frc_cache()
     frc_slot = 0
