@@ -141,6 +141,18 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   `np_eta` (GPU tiles), `nt_bgc` (32 with MARBL) and `nt_passive`. Paths are
   relative to the namelist file. A group with a key the GPU model does not
   know stops the run at start-up, naming the group.
+- **Surface forcing:** bulk (COARE 3.0) when the forcing files hold
+  `uwnd`, `vwnd`, `Tair` and `qair`, otherwise flux forcing (`sustr`,
+  `svstr`, `shflux`, `swflux`, `swrad`). Each field is read either on the
+  model grid in the UCLA ROMS layout (rho points `xi_rho x eta_rho`, u
+  points `xi_u x eta_rho`, v points `xi_rho x eta_v`) or at half
+  resolution, as the CPU model's `interp_bulk_frc` / `interp_flux_frc` /
+  `interp_bgc_frc` inputs; the GPU model tells the two apart by the file
+  shape and interpolates half-resolution fields as the CPU model does. Any
+  other shape stops the run at start-up. Surface restoring (SSS, SST,
+  MARBL DIC/ALK), selected on the CPU with cpp keys, is switched on with
+  `&surf_frc_settings sflx_corr / qcorrection / cflx_corr` (see
+  `NAMELIST_COMPAT`).
 - **MARBL output:** with `nt_bgc = 32` the history file carries every
   MARBL tracer, the surface diagnostics PH, pCO2SURF, DpCO2, FG_CO2 and
   their ALT_CO2 twins (PH_ALT_CO2, pCO2SURF_ALT_CO2, FG_ALT_CO2), the
@@ -161,6 +173,29 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
 `examples/minipac/` is a complete small case (namelist, MARBL settings, PBS
 script): 3 days of MiniPac, a small coarse Pacific test domain, with MARBL on one 4-GPU node. The input data are
 not included; its README lists the files.
+
+## Changes after v0.1.2-beta
+
+Ports of recent UCLA ROMS fixes and features, and fixes of GPU-only
+defects. Runs that use none of the items below give the same results as
+v0.1.2-beta, bit for bit.
+
+- Boundary tides are evaluated at the middle of the step for the
+  barotropic loop (tidal runs change).
+- Rivers deliver exactly the volume of the river file in the split
+  barotropic step (predictor transport from the current river volume,
+  river faces carry the river transport in the fast loop).
+- CDR volume releases conserve volume (S stays constant for a release at
+  the ambient salinity) and no longer depend on the tiling.
+- Surface restoring switches `sflx_corr`, `qcorrection` (new) and
+  `cflx_corr` (new; DIC/ALK restoring applies from the first step, as in
+  current UCLA ROMS).
+- Flux forcing: the unit conversions of the forcing fields raced with the
+  GPU kernels, so flux-forced runs were not reproducible; wind stress in
+  the standard u/v layout was misread as half-resolution data; and
+  half-resolution inputs were interpolated without the tile offset (wrong
+  on more than one GPU) and not as the CPU model does. All fixed; a field
+  of unknown shape now stops the run.
 
 ## Numerics
 
