@@ -2,8 +2,8 @@
 module frc_io
   ! Flux-file or COARE 3.0 bulk surface forcing; two-level time
   ! interpolation. Records are read on the host into managed buffers;
-  ! the interpolation onto the grid and the bulk fluxes run as device
-  ! kernels (the 2x-coarse upsampling path stays on the host). No rivers / BGC.
+  ! the interpolation onto the grid (also from 2x-coarse inputs, as the
+  ! CPU's interp_*_frc) and the bulk fluxes run as device kernels.
   use kinds
   use decomp_mod
   use gpu_state
@@ -1289,16 +1289,15 @@ contains
   end subroutine fill_v
 
   subroutine fill_any(s, tneed, dest, gtype, kn)
-    ! The field at tneed on the model grid: a field on the grid (any of the
-    ! layouts of classify_layout) by the device kernel over this tile's
-    ! window; a 2x-coarse field by the host interpolation.
+    ! The field at tneed on the model grid, by a device kernel: a field on
+    ! the grid (any of the layouts of classify_layout) over this tile's
+    ! window; a 2x-coarse field interpolated to every point of the tile.
     type(series2d), intent(inout), target :: s
     real(rp),       intent(in)    :: tneed
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
     character(len=1), intent(in)  :: gtype
     logical,        intent(in)    :: kn
     real(rp) :: c1, c2
-    real(rp), allocatable :: tmp(:,:)
     if (.not. s%ready) return
     call advance_series(s, tneed)
     call weights(s, tneed, c1, c2)
@@ -1309,17 +1308,86 @@ contains
         call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0)
       endif
     else
-      allocate(tmp(s%n1, s%n2))
-      call sync_arch()
-      tmp = c1 * s%buf(:,:,1) + c2 * s%buf(:,:,2)
-      if (.not. kn) where (is_nan(tmp)) tmp = 0.0_rp
-      call map_field(tmp, s%n1, s%n2, dest, gtype)
+      call interp_coarse(s%buf, s%n1, s%n2, c1, c2, dest, gtype, kn)
     endif
   end subroutine fill_any
 
+  subroutine interp_coarse(b, n1, n2, c1, c2, dest, gtype, kn)
+    ! A 2x-coarse field (two buffered records b(:,:,1:2), the whole file
+    ! extent) on this tile, as the CPU (roms_read_write coarse2fine, then
+    ! set_frc_data's time interpolation): each record is interpolated
+    ! bilinearly to the fine point from its GLOBAL index, then the two are
+    ! combined in time. With gi the global fine index (local i + i0 - 1):
+    !   rho: coarse index 0.5 gi + 0.25 (file index 1 = coarse rho 0)
+    !   u (xi) / v (eta): 0.5 gi + 0.5 (file index 1 = coarse u/v 1)
+    ! The weights are exact (multiples of 1/4), so the result does not
+    ! depend on the tiling. Coarse points beyond the file extent (the last
+    ! fine row of an odd LLm / MMm, and the u/v end faces) count as 0, as
+    ! the CPU's zero-initialized coarse buffer; NaN propagates as on the
+    ! CPU and becomes 0 at the end unless kn (keep NaN).
+    ! Filled: rho i = 0:nx+1, j = 0:ny+1; u i = 1:nx+1, j = 0:ny+1;
+    ! v i = 0:nx+1, j = 1:ny+1 (the standard on-grid windows).
+    integer,          intent(in) :: n1, n2
+    real(rp), WORK_ATTR intent(in) :: b(n1, n2, 2)
+    real(rp),         intent(in) :: c1, c2
+    real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
+    character(len=1), intent(in) :: gtype
+    logical,          intent(in) :: kn
+    integer :: i, j, ib, jb, ie, je, gi0, gj0, ox, oy, ic, jc
+    real(rp) :: xo, yo, xg, yg, xl, yl
+    real(rp) :: a00, a10, a01, a11, q00, q10, q01, q11, f1, f2, x
+    logical :: in0, in1, jn0, jn1
+    ib = 0; jb = 0; xo = 0.25_rp; yo = 0.25_rp; ox = 1; oy = 1
+    if (gtype == 'u') then
+      ib = 1; xo = 0.5_rp; ox = 0
+    elseif (gtype == 'v') then
+      jb = 1; yo = 0.5_rp; oy = 0
+    endif
+    ie = int(decomp%nx) + 1; je = int(decomp%ny) + 1
+    gi0 = int(decomp%i0) - 1; gj0 = int(decomp%j0) - 1
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = jb, je
+      do i = ib, ie
+        xg = 0.5_rp * real(i + gi0, rp) + xo
+        yg = 0.5_rp * real(j + gj0, rp) + yo
+        ic = floor(xg)
+        jc = floor(yg)
+        xl = xg - real(ic, rp)
+        yl = yg - real(jc, rp)
+        ic = ic + ox
+        jc = jc + oy
+        in0 = (ic >= 1 .and. ic <= n1)
+        in1 = (ic + 1 >= 1 .and. ic + 1 <= n1)
+        jn0 = (jc >= 1 .and. jc <= n2)
+        jn1 = (jc + 1 >= 1 .and. jc + 1 <= n2)
+        a00 = 0.0_rp; a10 = 0.0_rp; a01 = 0.0_rp; a11 = 0.0_rp
+        q00 = 0.0_rp; q10 = 0.0_rp; q01 = 0.0_rp; q11 = 0.0_rp
+        if (in0 .and. jn0) then
+          a00 = b(ic, jc, 1); q00 = b(ic, jc, 2)
+        endif
+        if (in1 .and. jn0) then
+          a10 = b(ic + 1, jc, 1); q10 = b(ic + 1, jc, 2)
+        endif
+        if (in0 .and. jn1) then
+          a01 = b(ic, jc + 1, 1); q01 = b(ic, jc + 1, 2)
+        endif
+        if (in1 .and. jn1) then
+          a11 = b(ic + 1, jc + 1, 1); q11 = b(ic + 1, jc + 1, 2)
+        endif
+        f1 = (1.0_rp - yl) * ((1.0_rp - xl) * a00 + xl * a10) + yl * ((1.0_rp - xl) * a01 + xl * a11)
+        f2 = (1.0_rp - yl) * ((1.0_rp - xl) * q00 + xl * q10) + yl * ((1.0_rp - xl) * q01 + xl * q11)
+        x = c1 * f1 + c2 * f2
+        if (.not. kn .and. x /= x) x = 0.0_rp
+        dest(i, j) = x
+      enddo
+    enddo
+  end subroutine interp_coarse
+
   subroutine interp_on_grid(b, n1, n2, c1, c2, dest, i0, j0)
     ! Device time interpolation of two buffered records onto the grid,
-    ! NaN (missing) -> 0, as the host tmp/where/map_field path.
+    ! NaN (missing) -> 0.
     integer,  intent(in) :: n1, n2, i0, j0
     real(rp), WORK_ATTR intent(in) :: b(n1, n2, 2)
     real(rp), intent(in) :: c1, c2
@@ -1516,83 +1584,6 @@ contains
       enddo
     enddo
   end subroutine divide_2d
-
-  subroutine map_field(src, n1, n2, dest, gtype)
-    integer,          intent(in)    :: n1, n2
-    real(rp),         intent(in)    :: src(n1, n2)
-    real(rp),         intent(inout) :: dest(decomp%is:, decomp%js:)
-    character(len=*), intent(in)    :: gtype
-    integer :: i0, j0, nxi, neta, i, j
-    real(rp), allocatable :: fine(:,:)
-
-    if (gtype == 'u') then
-      nxi = decomp%nx + 1; neta = decomp%ny
-    elseif (gtype == 'v') then
-      nxi = decomp%nx; neta = decomp%ny + 1
-    else
-      nxi = decomp%nx + 2; neta = decomp%ny + 2
-    endif
-
-    ! 2x coarse (classify_layout; fields on the grid take fill_any's kernel).
-    allocate(fine(nxi, neta))
-    call upsample2(src, n1, n2, fine, nxi, neta, gtype)
-    if (gtype == 'r') then
-      i0 = 0; j0 = 0
-      if (nxi == decomp%nx) then
-        i0 = 1; j0 = 1
-      endif
-      do j = 1, neta
-        do i = 1, nxi
-          dest(i0 + i - 1, j0 + j - 1) = fine(i, j)
-        enddo
-      enddo
-    elseif (gtype == 'u') then
-      dest(1:nxi, 1:neta) = fine
-    else
-      dest(1:nxi, 1:neta) = fine
-    endif
-    deallocate(fine)
-  end subroutine map_field
-
-  subroutine upsample2(c, ncx, ncy, f, nfx, nfy, gtype)
-    integer,          intent(in)  :: ncx, ncy, nfx, nfy
-    real(rp),         intent(in)  :: c(ncx, ncy)
-    real(rp),         intent(out) :: f(nfx, nfy)
-    character(len=*), intent(in)  :: gtype
-    integer :: i, j, ic, jc
-    real(rp) :: xl, yl, xi, yj
-    do j = 1, nfy
-      do i = 1, nfx
-        if (gtype == 'u') then
-          xi = 0.5_rp * real(i, rp) + 0.5_rp
-          yj = 0.5_rp * real(j, rp) + 0.25_rp
-        elseif (gtype == 'v') then
-          xi = 0.5_rp * real(i, rp) + 0.25_rp
-          yj = 0.5_rp * real(j, rp) + 0.5_rp
-        else
-          xi = 0.5_rp * real(i, rp) + 0.25_rp
-          yj = 0.5_rp * real(j, rp) + 0.25_rp
-        endif
-        ic = max(1, min(ncx - 1, int(floor(xi))))
-        jc = max(1, min(ncy - 1, int(floor(yj))))
-        xl = xi - real(ic, rp)
-        yl = yj - real(jc, rp)
-        xl = min(1.0_rp, max(0.0_rp, xl))
-        yl = min(1.0_rp, max(0.0_rp, yl))
-        f(i, j) = (1.0_rp - yl) * ((1.0_rp - xl) * nan0(c(ic, jc)) + xl * nan0(c(ic + 1, jc))) + &
-                  yl * ((1.0_rp - xl) * nan0(c(ic, jc + 1)) + xl * nan0(c(ic + 1, jc + 1)))
-      enddo
-    enddo
-  end subroutine upsample2
-
-  real(rp) function nan0(x)
-    real(rp), intent(in) :: x
-    if (is_nan(x)) then
-      nan0 = 0.0_rp
-    else
-      nan0 = x
-    endif
-  end function nan0
 
   function find_var_file(vname, tname) result(path)
     character(len=*), intent(in) :: vname
