@@ -27,6 +27,7 @@ module frc_io
   private
 
   integer, parameter :: max_frc = 64
+  integer, parameter :: LAY_GRID = 1, LAY_COARSE = 2
   character(len=512), public :: case_frcfiles(max_frc)
   integer,            public :: case_nfrc = 0
   integer, private :: frc_cache(max_frc) = -1   ! read handles kept open during initialization
@@ -64,6 +65,12 @@ module frc_io
     character(len=1)   :: gtype = 'r'
     integer :: ntot = 0, it1 = 1, it2 = 2, n1 = 0, n2 = 0, time_axis = 3
     integer :: fi0 = 1, fj0 = 1   ! file start of this tile's window (on-grid fields)
+    ! Layout (bind_series, from the file shape): lay = LAY_GRID, a field on
+    ! the model grid, read as this tile's window buf(1:n1, 1:n2), which is
+    ! dest(li0:li0+n1-1, lj0:lj0+n2-1); lay = LAY_COARSE, a 2x-coarse field
+    ! (whole file in buf).
+    integer :: lay = 0, li0 = 1, lj0 = 1
+    integer :: fn1 = 0, fn2 = 0   ! file shape (xi, eta), the same in every file
     logical :: ready = .false.
     ! climatology: cycle_length attribute of the time axis (<= 0: none);
     ! t1e/t2e are the shifted record times of the current bracket
@@ -559,16 +566,12 @@ contains
         call nc_forcing_layout(ncid, vname, tname, nxi, neta, nrec, tax)
         ntot = ntot + max(nrec, 1)
         if (s%n1 == 0) then
-          s%n1 = nxi; s%n2 = neta; s%time_axis = tax
-          ! a field on the global model grid: this tile reads only its window
-          if ((gtype == 'r' .and. nxi == decomp%gnx + 2 .and. neta == decomp%gny + 2) .or. &
-              (gtype == 'u' .and. nxi == decomp%gnx + 1 .and. neta == decomp%gny) .or. &
-              (gtype == 'v' .and. nxi == decomp%gnx .and. neta == decomp%gny + 1) .or. &
-              (gtype == 'r' .and. nxi == decomp%gnx .and. neta == decomp%gny)) then
-            s%n1 = nxi - int(decomp%gnx) + int(decomp%nx)
-            s%n2 = neta - int(decomp%gny) + int(decomp%ny)
-            s%fi0 = int(decomp%i0); s%fj0 = int(decomp%j0)
-          endif
+          s%time_axis = tax
+          call classify_layout(s, gtype, nxi, neta, case_frcfiles(i))
+        elseif (nxi /= s%fn1 .or. neta /= s%fn2) then
+          write(*,'(3a,2(i0,a),2a,2(i0,a))') 'bind_series: ', trim(vname), ' is ', nxi, ' x ', neta, &
+               ' (xi x eta) in ', trim(case_frcfiles(i)), ' but ', s%fn1, ' x ', s%fn2, ' in an earlier file'
+          error stop 'bind_series: forcing variable with different shapes in different files'
         endif
       endif
     enddo
@@ -640,6 +643,59 @@ contains
     if (first_bind) call wall_stamp('bound '//trim(vname))
     first_bind = .false.
   end subroutine bind_series
+
+  subroutine classify_layout(s, gtype, nxi, neta, path)
+    ! The layout of a forcing field from its file shape (xi x eta), as the
+    ! CPU reads it (roms_read_write fill_frc_slice_surf):
+    !   on the model grid, read window by window:
+    !     r: xi_rho x eta_rho = (gnx+2) x (gny+2), or the interior gnx x gny
+    !     u: xi_u x eta_rho   = (gnx+1) x (gny+2), or (gnx+1) x gny
+    !     v: xi_rho x eta_v   = (gnx+2) x (gny+1), or gnx x (gny+1)
+    !   2x coarse (the CPU's interp_*_frc inputs; gxc = gnx/2, gyc = gny/2):
+    !     r: (gxc+2) x (gyc+2), u: (gxc+1) x (gyc+2), v: (gxc+2) x (gyc+1)
+    ! Any other shape stops the run.
+    type(series2d),   intent(inout) :: s
+    character(len=*), intent(in)    :: gtype, path
+    integer,          intent(in)    :: nxi, neta
+    integer :: gx, gy, gxc, gyc
+    gx = int(decomp%gnx); gy = int(decomp%gny)
+    gxc = gx / 2; gyc = gy / 2
+    s%fn1 = nxi; s%fn2 = neta
+    s%lay = LAY_GRID
+    s%fi0 = int(decomp%i0); s%fj0 = int(decomp%j0)
+    if (gtype == 'r' .and. nxi == gx + 2 .and. neta == gy + 2) then
+      s%li0 = 0; s%lj0 = 0
+    elseif (gtype == 'r' .and. nxi == gx .and. neta == gy) then
+      s%li0 = 1; s%lj0 = 1
+    elseif (gtype == 'u' .and. nxi == gx + 1 .and. neta == gy + 2) then
+      s%li0 = 1; s%lj0 = 0
+    elseif (gtype == 'u' .and. nxi == gx + 1 .and. neta == gy) then
+      s%li0 = 1; s%lj0 = 1
+    elseif (gtype == 'v' .and. nxi == gx + 2 .and. neta == gy + 1) then
+      s%li0 = 0; s%lj0 = 1
+    elseif (gtype == 'v' .and. nxi == gx .and. neta == gy + 1) then
+      s%li0 = 1; s%lj0 = 1
+    elseif ((gtype == 'r' .and. nxi == gxc + 2 .and. neta == gyc + 2) .or. &
+            (gtype == 'u' .and. nxi == gxc + 1 .and. neta == gyc + 2) .or. &
+            (gtype == 'v' .and. nxi == gxc + 2 .and. neta == gyc + 1)) then
+      s%lay = LAY_COARSE
+      s%fi0 = 1; s%fj0 = 1
+      s%n1 = nxi; s%n2 = neta
+      if (comm_rank() == 0) write(*,'(3a,2(i0,a))') 'forcing ', trim(s%vname), ': 2x-coarse input (', nxi, ' x ', &
+           neta, '), interpolated to the model grid'
+      return
+    else
+      write(*,'(5a,2(i0,a))') 'bind_series: ', trim(s%vname), ' (', gtype, '-point) has the shape ', nxi, ' x ', neta, &
+           ' (xi x eta) in '//trim(path)
+      write(*,'(a,2(i0,a))') '  the model grid is LLm x MMm = ', gx, ' x ', gy, '; accepted shapes:'
+      write(*,'(a,6(i0,a))') '  rho: ', gx + 2, ' x ', gy + 2, ' or ', gx, ' x ', gy, ', 2x coarse ', gxc + 2, ' x ', gyc + 2
+      write(*,'(a,6(i0,a))') '  u:   ', gx + 1, ' x ', gy + 2, ' or ', gx + 1, ' x ', gy, ', 2x coarse ', gxc + 1, ' x ', gyc + 2
+      write(*,'(a,6(i0,a))') '  v:   ', gx + 2, ' x ', gy + 1, ' or ', gx, ' x ', gy + 1, ', 2x coarse ', gxc + 2, ' x ', gyc + 1
+      error stop 'bind_series: forcing field shape matches neither the model grid nor the 2x-coarse grid'
+    endif
+    s%n1 = nxi - gx + int(decomp%nx)
+    s%n2 = neta - gy + int(decomp%ny)
+  end subroutine classify_layout
 
   subroutine sort_catalog(s)
     type(series2d), intent(inout) :: s
@@ -1212,92 +1268,54 @@ contains
     real(rp),       intent(in)    :: tneed
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
     logical, optional, intent(in) :: keep_nan
-    real(rp) :: c1, c2
-    real(rp), allocatable :: tmp(:,:)
-    integer :: i0, j0
     logical :: kn
-    if (.not. s%ready) return
     kn = .false.
     if (present(keep_nan)) kn = keep_nan
-    call advance_series(s, tneed)
-    call weights(s, tneed, c1, c2)
-    if (on_grid(s%n1, s%n2, 'r', i0, j0)) then
-      if (kn) then
-        call interp_on_grid_nan(s%buf, s%n1, s%n2, c1, c2, dest, i0, j0)
-      else
-        call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, i0, j0)
-      endif
-    else
-      allocate(tmp(s%n1, s%n2))
-      call sync_arch()
-      tmp = c1 * s%buf(:,:,1) + c2 * s%buf(:,:,2)
-      if (.not. kn) where (is_nan(tmp)) tmp = 0.0_rp
-      call map_field(tmp, s%n1, s%n2, dest, 'r')
-    endif
+    call fill_any(s, tneed, dest, 'r', kn)
   end subroutine fill_r
 
   subroutine fill_u(s, tneed, dest)
     type(series2d), intent(inout), target :: s
     real(rp),       intent(in)    :: tneed
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
-    real(rp) :: c1, c2
-    real(rp), allocatable :: tmp(:,:)
-    integer :: i0, j0
-    if (.not. s%ready) return
-    call advance_series(s, tneed)
-    call weights(s, tneed, c1, c2)
-    if (on_grid(s%n1, s%n2, 'u', i0, j0)) then
-      call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, i0, j0)
-    else
-      allocate(tmp(s%n1, s%n2))
-      call sync_arch()
-      tmp = c1 * s%buf(:,:,1) + c2 * s%buf(:,:,2)
-      where (is_nan(tmp)) tmp = 0.0_rp
-      call map_field(tmp, s%n1, s%n2, dest, 'u')
-    endif
+    call fill_any(s, tneed, dest, 'u', .false.)
   end subroutine fill_u
 
   subroutine fill_v(s, tneed, dest)
     type(series2d), intent(inout), target :: s
     real(rp),       intent(in)    :: tneed
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
+    call fill_any(s, tneed, dest, 'v', .false.)
+  end subroutine fill_v
+
+  subroutine fill_any(s, tneed, dest, gtype, kn)
+    ! The field at tneed on the model grid: a field on the grid (any of the
+    ! layouts of classify_layout) by the device kernel over this tile's
+    ! window; a 2x-coarse field by the host interpolation.
+    type(series2d), intent(inout), target :: s
+    real(rp),       intent(in)    :: tneed
+    real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
+    character(len=1), intent(in)  :: gtype
+    logical,        intent(in)    :: kn
     real(rp) :: c1, c2
     real(rp), allocatable :: tmp(:,:)
-    integer :: i0, j0
     if (.not. s%ready) return
     call advance_series(s, tneed)
     call weights(s, tneed, c1, c2)
-    if (on_grid(s%n1, s%n2, 'v', i0, j0)) then
-      call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, i0, j0)
+    if (s%lay == LAY_GRID) then
+      if (kn) then
+        call interp_on_grid_nan(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0)
+      else
+        call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0)
+      endif
     else
       allocate(tmp(s%n1, s%n2))
       call sync_arch()
       tmp = c1 * s%buf(:,:,1) + c2 * s%buf(:,:,2)
-      where (is_nan(tmp)) tmp = 0.0_rp
-      call map_field(tmp, s%n1, s%n2, dest, 'v')
+      if (.not. kn) where (is_nan(tmp)) tmp = 0.0_rp
+      call map_field(tmp, s%n1, s%n2, dest, gtype)
     endif
-  end subroutine fill_v
-
-  logical function on_grid(n1, n2, gtype, i0, j0)
-    ! The file field is on the model stencil (the direct-copy cases of
-    ! map_field): dest(i0+i-1, j0+j-1) = src(i, j).
-    integer,          intent(in)  :: n1, n2
-    character(len=*), intent(in)  :: gtype
-    integer,          intent(out) :: i0, j0
-    on_grid = .true.
-    i0 = 1; j0 = 1
-    if (gtype == 'r' .and. n1 == decomp%nx + 2 .and. n2 == decomp%ny + 2) then
-      i0 = 0; j0 = 0
-    elseif (gtype == 'r' .and. n1 == decomp%nx .and. n2 == decomp%ny) then
-      continue
-    elseif (gtype == 'u' .and. n1 == decomp%nx + 1 .and. n2 == decomp%ny) then
-      continue
-    elseif (gtype == 'v' .and. n1 == decomp%nx .and. n2 == decomp%ny + 1) then
-      continue
-    else
-      on_grid = .false.
-    endif
-  end function on_grid
+  end subroutine fill_any
 
   subroutine interp_on_grid(b, n1, n2, c1, c2, dest, i0, j0)
     ! Device time interpolation of two buffered records onto the grid,
@@ -1515,25 +1533,7 @@ contains
       nxi = decomp%nx + 2; neta = decomp%ny + 2
     endif
 
-    ! File on the LLm+2 rho / matching u,v stencil.
-    if (gtype == 'r' .and. n1 == decomp%nx + 2 .and. n2 == decomp%ny + 2) then
-      dest(0:decomp%nx+1, 0:decomp%ny+1) = src
-      return
-    endif
-    if (gtype == 'r' .and. n1 == decomp%nx .and. n2 == decomp%ny) then
-      dest(1:decomp%nx, 1:decomp%ny) = src
-      return
-    endif
-    if (gtype == 'u' .and. n1 == decomp%nx + 1 .and. n2 == decomp%ny) then
-      dest(1:decomp%nx+1, 1:decomp%ny) = src
-      return
-    endif
-    if (gtype == 'v' .and. n1 == decomp%nx .and. n2 == decomp%ny + 1) then
-      dest(1:decomp%nx, 1:decomp%ny+1) = src
-      return
-    endif
-
-    ! 2x coarse (standalone flux file).
+    ! 2x coarse (classify_layout; fields on the grid take fill_any's kernel).
     allocate(fine(nxi, neta))
     call upsample2(src, n1, n2, fine, nxi, neta, gtype)
     if (gtype == 'r') then
