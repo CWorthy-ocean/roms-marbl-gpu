@@ -24,6 +24,7 @@ module case_io
   use avg_out, only: read_avg_namelist, set_avg_root, init_avg_output
   use extract_out, only: read_extract_namelist, init_extract
   use comm_mod, only: comm_rank, comm_size, comm_min_real
+  use arch_mod, only: sync_arch
   use tile_balance, only: balance_cuts, uniform_cuts
   use halo_mod, only: halo_fill_2d, halo_fill_2d_s, halo_fill_3d_s, halo_fill_3d_t, halo_fill_3d_tp
   use formulas, only: rho0_eos => rho0
@@ -596,6 +597,10 @@ contains
     call sanitize_land()
     call pad_physical_halo()
     call fill_static_halos()
+    ! setup_metrics, the mask builders and build_tp_columns are host loops
+    ! over pm/pn/h/rmask: wait for the sanitize/pad kernels (on one tile
+    ! without neighbours no halo exchange synchronizes them).
+    call sync_arch()
     call setup_metrics()
     call fill_metric_halos()
     call build_wet_list()

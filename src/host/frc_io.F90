@@ -325,7 +325,6 @@ contains
   end subroutine init_forcing
 
   subroutine set_forces()
-    integer(ip) :: i, j
     real(rp) :: tneed
     logical, save :: logged_bulk = .false.
     if (have_bulk) then
@@ -389,24 +388,24 @@ contains
     call advance_series(s_swflx, tneed)
     call advance_series(s_swrad, tneed)
     call frc_batch_flush()
+    ! The unit conversions are kernels, stream-ordered after the fill
+    ! kernels and before the step's later readers of these fields (host
+    ! statements on the managed arrays here raced with both). Each is the
+    ! same single IEEE operation as the former host statement.
     call fill_u(s_sustr, tneed, sustr)
     call fill_v(s_svstr, tneed, svstr)
     call fill_r(s_shflx, tneed, stflx(:,:,itemp))
-    sustr = sustr / rho0_case
-    svstr = svstr / rho0_case
-    do j = decomp%js, decomp%je
-      do i = decomp%is, decomp%ie
-        stflx(i, j, itemp) = stflx(i, j, itemp) / (rho0_case * Cp)
-        stflx(i, j, isalt) = 0.0_rp
-      enddo
-    enddo
+    call divide_2d(sustr, rho0_case)
+    call divide_2d(svstr, rho0_case)
+    call divide_2d(stflx(:,:,itemp), rho0_case * Cp)
+    call set_2d(stflx(:,:,isalt), 0.0_rp)
     if (s_swflx%ready) then
       call fill_r(s_swflx, tneed, swflx)
-      swflx = -swflx * cmday2ms
+      call scale_2d(swflx, -cmday2ms)        ! = -swflx * cmday2ms, bitwise
     endif
     if (s_swrad%ready) then
       call fill_r(s_swrad, tneed, srflx)
-      srflx = srflx / (rho0_case * Cp)
+      call divide_2d(srflx, rho0_case * Cp)
     endif
   end subroutine set_forces
 
