@@ -4,10 +4,13 @@ module rivers_mod
   ! River sources (UCLA river_frc), on the device. A river cell is a land
   ! cell with river_index > 0; each of its faces to an ocean cell carries
   ! the fraction river_fraction / (number of such faces) of that river's
-  ! volume flux. The CPU model handles these faces in six places, and the
+  ! volume flux. The CPU model handles these faces in seven places, and the
   ! kernels below repeat its expressions there:
   !   set_HUV     the predictor transport FlxU/FlxV on the faces, from the
   !               river volume at time n (rivers_huv; CPU 2805cbef);
+  !   step2d      the fast loop's transport DUon/DVom on the faces, every
+  !               fast step, before zeta_new and DU/DV_avg2 use it
+  !               (rivers_duon; CPU ad6107f7);
   !   step2d      ubar/vbar(knew) and DU/DV_avg1 on the faces, every fast
   !               step (rivers_ubar);
   !   pre_step3d  u/v(nnew) on the faces, before u3dbc (rivers_uv, RIV_PRE);
@@ -41,7 +44,7 @@ module rivers_mod
   private
   public :: river_on, rivers_set_lists, rivers_set_record, rivers_copy_upper, rivers_set_weights
   public :: rivers_set_map
-  public :: rivers_ubar, rivers_uv, rivers_ts, rivers_tp, rivers_huv
+  public :: rivers_ubar, rivers_uv, rivers_ts, rivers_tp, rivers_huv, rivers_duon
   public :: RIV_S2D, RIV_PRE, RIV_COR, RIV_S2DF, RIV_RNG
   ! for the fast-step override fused into step2d_mid's ubar/vbar kernel
   public :: rf_flx, riv_ufc, riv_vfc
@@ -52,8 +55,8 @@ module rivers_mod
   ! rivers_ubar does: faces within two cells of a physical edge, so that
   ! the open-boundary code still sees them before the override, as the CPU.
   ! RIV_RNG: every face of the river scan (cells 0:nx+1 x 0:ny+1, as the
-  ! CPU's calc_river_flux); rivers_huv tests the ranges of the loop it
-  ! follows (set_HUV's) itself.
+  ! CPU's calc_river_flux); rivers_huv and rivers_duon test the ranges of
+  ! the loops they follow (set_HUV's, step2d's DUon/DVom) themselves.
   integer, parameter :: RIV_S2D = 1, RIV_PRE = 2, RIV_COR = 4, RIV_S2DF = 8, RIV_RNG = 16
 
   logical :: river_on = .false.
@@ -269,6 +272,31 @@ contains
       enddo
     enddo
   end subroutine rivers_huv
+
+  subroutine rivers_duon(iu0, iu1, ju0, ju1, iv0, iv1, jv0, jv1)
+    ! CPU step2d (ad6107f7): river faces carry the river transport itself,
+    ! DUon/DVom = river_flux (n+1/2, as rivers_ubar), into the free surface
+    ! and into DU/DV_avg2 (the transport of the 3D step and of its river
+    ! tracer fluxes). From the extrapolated ubar, DUon would lag a varying
+    ! river and start from the initial file's ubar (often 0). The ranges
+    ! are those of step2d_pre's DUon/DVom (the seam ring's faces included,
+    ! which the neighbour's zeta_new there needs); right after that kernel.
+    integer(ip), intent(in) :: iu0, iu1, ju0, ju1, iv0, iv1, jv0, jv1
+    integer(ip) :: f, i, j, n, a0, a1, b0, b1, c0, c1, d0, d1
+    if (nrf == 0) return
+    n = nrf
+    a0 = iu0; a1 = iu1; b0 = ju0; b1 = ju1; c0 = iv0; c1 = iv1; d0 = jv0; d1 = jv1
+    CUF_DO1
+    do f = 1, n
+      if (iand(rf_s(f), RIV_RNG) == 0) cycle
+      i = rf_i(f); j = rf_j(f)
+      if (rf_t(f) == 1) then
+        if (i >= a0 .and. i <= a1 .and. j >= b0 .and. j <= b1) DUon(i, j) = rf_flx(f)
+      else
+        if (i >= c0 .and. i <= c1 .and. j >= d0 .and. j <= d1) DVom(i, j) = rf_flx(f)
+      endif
+    enddo
+  end subroutine rivers_duon
 
   subroutine rivers_uv(sbit)
     ! CPU pre_step3d (RIV_PRE) and step3d_uv2 (RIV_COR): on every river

@@ -322,8 +322,9 @@ contains
       endif
       ! fast-loop faces two cells or more from every physical edge are done
       ! inside step2d_mid's kernel (RIV_S2DF), the others by rivers_ubar.
-      ! Every face of the scan is listed with RIV_RNG: rivers_huv checks
-      ! the ranges of set_HUV itself.
+      ! Every face of the scan is listed with RIV_RNG: rivers_huv and
+      ! rivers_duon check the ranges of set_HUV and step2d's DUon/DVom (up
+      ! to the faces 0:nx+2 / 0:ny+2 of the seam ring) themselves.
       sb = int(RIV_RNG, ip)
       if (typ == 1) then
         far = (.not. decomp%edge_w .or. ii >= 3) .and. (.not. decomp%edge_e .or. ii <= nx - 1) .and. &

@@ -18,7 +18,7 @@ module step2d_mod
   use halo_mod
   use formulas
   use obc, only: zetabc, uv2dbc, uv2dbc_corners
-  use rivers_mod, only: river_on, rivers_ubar, rf_flx, riv_ufc, riv_vfc, nrf_s2df
+  use rivers_mod, only: river_on, rivers_ubar, rivers_duon, rf_flx, riv_ufc, riv_vfc, nrf_s2df
   use cdr_src_mod, only: cdr_vol_on, cdr_zeta_src
   use comm_mod, only: comm_size
   use arch_mod, only: sync_arch, on_gpu, graph_is_ready, graph_begin, &
@@ -263,6 +263,9 @@ contains
         endif
       enddo
     enddo
+    ! River faces carry the river transport (CPU ad6107f7), in the same
+    ! ranges, before zeta_new and DU_avg2/DV_avg2 use DUon/DVom
+    if (river_on) call rivers_duon(iu_lo, iu_hi, ju0, ju1, iv0, iv1, jv_lo, jv_hi)
 
     ! CDR volume releases: water into zeta(kstp) before zeta_new (CPU step2d)
     if (cdr_vol_on) call cdr_zeta_src()
