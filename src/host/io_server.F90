@@ -14,8 +14,11 @@ module io_server
   ! I/O rank: io_server_run loops on commands (OPEN file, PUT record,
   ! QUIT) and writes with netCDF. File creation (metadata) stays on the
   ! compute rank; the server only opens, appends records and closes.
-  ! Commands for one record travel together, in order, so a file switch
-  ! can never overtake a record that belongs to the previous file.
+  ! Commands from one compute rank arrive in order, but those of different
+  ! ranks interleave freely: a fast rank's OPEN of file n+1 can arrive
+  ! while a slow rank's part of the last record of file n is still on its
+  ! way. The server therefore keys every OPEN by (kind, file number) and
+  ! switches files only when a record of the next file is written.
   !
   ! Writer groups: the writer ranks are split into groups of
   ! ROMS_GPU_IO_GROUP writers (default min(4, max(1, nwriters/2))). File
@@ -133,6 +136,13 @@ module io_server
   ! Server side.
   real(4), allocatable :: rbuf(:)
   integer :: ncid_open(NKIND) = -1
+  integer :: nfile_open(NKIND) = -1                 ! file number open per kind (-1: none)
+  ! Announced files not yet opened: (kind, nfile) and path. A kind has at
+  ! most a few files announced ahead of its writes (each compute rank holds
+  ! at most NSET staged records).
+  integer, parameter :: NANN = 16
+  integer :: ann_key(2, NANN) = -1
+  character(len=PATHLEN) :: ann_path(NANN) = ''
 
   public :: io_init
   public :: io_stage_begin
@@ -677,6 +687,7 @@ contains
     pend(idx)%ohdr = 0
     pend(idx)%ohdr(1) = CMD_OPEN
     pend(idx)%ohdr(2) = pend(idx)%fkind
+    pend(idx)%ohdr(3) = pend(idx)%nfile
     pend(idx)%tmsg = (/real(pend(idx)%time, 8), real(pend(idx)%tavg(1), 8), real(pend(idx)%tavg(2), 8), &
                        real(pend(idx)%tforce, 8)/)
     ! every writer of the group gets the (optional) open command and the header
@@ -1056,8 +1067,6 @@ contains
     integer :: hdr(NHDR), ierr, stat(MPI_STATUS_SIZE), src, sc, comm, iv, off, n, b, k, ntot, nquit, ncompute, isl
     real :: trecv(NSLOT)
     real(8) :: c_start, c_end
-    character(len=PATHLEN) :: open_name(NKIND)
-    logical :: open_pending(NKIND)
     real(8) :: c0, c1, c2, c3
     character(len=PATHLEN) :: path
     character(len=NAMELEN * MAXV) :: namebuf
@@ -1074,8 +1083,6 @@ contains
     c_start = wall_time()
     trecv = 0.0
     nquit = 0
-    open_name = ''
-    open_pending = .false.
     write(*,'(a,i0,a,i0,a,i0,a,i0,a,i0)') 'io_server: ready on world rank ', comm_world_rank(), '  writer ', me_w, ' of ', nserv, &
          '  group ', my_group, ' of ', wgroups
     flush(6)
@@ -1087,15 +1094,14 @@ contains
       select case (hdr(1))
       case (CMD_OPEN)
         call MPI_Recv(path, PATHLEN, MPI_CHARACTER, src, TAG_STR, comm, stat, ierr)
-        k = hdr(2)
-        ! Only remember the path: the (collective) open happens when the
-        ! first record for it is written, so that several writers reach it
-        ! in the same order as the records (an eager open could pair with
-        ! another writer's record write and deadlock).
-        if (trim(path) /= trim(open_name(k))) then
-          open_name(k) = path
-          open_pending(k) = .true.
-        endif
+        ! Only remember the path, under its (kind, file number): the
+        ! (collective) open happens when the first record of that file is
+        ! written, so that several writers reach it in the same order as the
+        ! records (an eager open could pair with another writer's record
+        ! write and deadlock), and a record still due in the previous file
+        ! is written there (the OPEN may arrive from a faster rank before a
+        ! slower rank's part of that record).
+        call announce(hdr(2), hdr(3), path)
       case (CMD_PUT)
         if (.not. allocated(tbuf)) then
           allocate(tbuf(0:ncompute - 1, NSLOT), tmeta(0:ncompute - 1, NSLOT), tfill(0:ncompute - 1, NSLOT))
@@ -1124,7 +1130,7 @@ contains
           write(*,'(a,i0,a,i0,a,i0,a)') 'io_server: WARNING all ', NSLOT, ' record slots busy; writing record ', &
                slot_key(3, isl), ' with ', slot_n(isl), ' of its tiles present (output faster than the writer)'
           if (wgroup_size > 1) error stop 'io_server: record slots overrun with several writers (output faster than the writers): raise NSLOT or lower the output frequency'
-          if (open_pending(tmeta(0, isl)%fkind)) call open_now(tmeta(0, isl)%fkind)
+          call open_for(slot_key(1, isl), slot_key(2, isl))
           call flush_slot_partial(isl)
         endif
         slot_key(:, isl) = (/hdr(2), hdr(6), hdr(3)/)
@@ -1191,8 +1197,7 @@ contains
           k = r%fkind
           write(*,'(a,i0,a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' record complete: kind ', k, ' rec ', r%rec, ' file ', r%nfile
           flush(6)
-          if (open_pending(k)) call open_now(k)
-          if (ncid_open(k) < 0) error stop 'io_server: record before file open'
+          call open_for(k, r%nfile)
           c1 = wall_time()
           call write_assembled(ncid_open(k), isl)
           c3 = wall_time()
@@ -1219,6 +1224,7 @@ contains
             if (wgroup_size > 1) then
               write(*,'(a)') 'io_server: (several writers: the incomplete record is dropped to keep the collective order)'
             else
+              call open_for(slot_key(1, k), slot_key(2, k))
               call flush_slot_partial(k)
             endif
           endif
@@ -1226,6 +1232,7 @@ contains
         do k = 1, NKIND
           if (ncid_open(k) >= 0) call nc_close(ncid_open(k))
           ncid_open(k) = -1
+          nfile_open(k) = -1
         enddo
         c_end = wall_time()
         write(*,'(a,i0,a,f10.2,a)') 'io_server: writer ', me_w, ' done  t = ', &
@@ -1238,18 +1245,50 @@ contains
     enddo
 #endif
   contains
-    subroutine open_now(kind)
-      integer, intent(in) :: kind
+    subroutine announce(kind, nfile, fpath)
+      ! Remember the path of file nfile of this kind (every compute rank
+      ! announces it; keep one entry).
+      integer, intent(in) :: kind, nfile
+      character(len=*), intent(in) :: fpath
+      integer :: a, free
+      if (nfile_open(kind) == nfile) return
+      free = 0
+      do a = 1, NANN
+        if (ann_key(1, a) == kind .and. ann_key(2, a) == nfile) return
+        if (free == 0 .and. ann_key(1, a) < 0) free = a
+      enddo
+      if (free == 0) error stop 'io_server: too many files announced ahead of their records (raise NANN)'
+      ann_key(:, free) = (/kind, nfile/)
+      ann_path(free) = fpath
+    end subroutine announce
+
+    subroutine open_for(kind, nfile)
+      ! Make file nfile of this kind the open one before a record of it is
+      ! written: close the previous file and open the announced path.
+      integer, intent(in) :: kind, nfile
+      integer :: a, hit
+      if (nfile_open(kind) == nfile .and. ncid_open(kind) >= 0) return
+      hit = 0
+      do a = 1, NANN
+        if (ann_key(1, a) == kind .and. ann_key(2, a) == nfile) hit = a
+      enddo
+      if (hit == 0) then
+        write(*,'(a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' record of kind ', kind, &
+             ' for file ', nfile, ' before its open; file open: ', nfile_open(kind)
+        error stop 'io_server: record before file open'
+      endif
       if (ncid_open(kind) >= 0) call nc_close(ncid_open(kind))
       if (wgroup_size > 1) then
-        call nc_open_write_par(trim(open_name(kind)), ncid_open(kind), gcomm)
+        call nc_open_write_par(trim(ann_path(hit)), ncid_open(kind), gcomm)
       else
-        call nc_open_write(trim(open_name(kind)), ncid_open(kind))
+        call nc_open_write(trim(ann_path(hit)), ncid_open(kind))
       endif
-      open_pending(kind) = .false.
-      write(*,'(a,i0,a,a)') 'io_server: writer ', me_w, ' opened ', trim(open_name(kind))
+      nfile_open(kind) = nfile
+      write(*,'(a,i0,a,a)') 'io_server: writer ', me_w, ' opened ', trim(ann_path(hit))
       flush(6)
-    end subroutine open_now
+      ann_key(:, hit) = -1
+      ann_path(hit) = ''
+    end subroutine open_for
   end subroutine io_server_run
 
 end module io_server
