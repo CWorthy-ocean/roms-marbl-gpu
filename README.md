@@ -196,6 +196,15 @@ v0.1.2-beta, bit for bit.
   half-resolution inputs were interpolated without the tile offset (wrong
   on more than one GPU) and not as the CPU model does. All fixed; a field
   of unknown shape now stops the run.
+- The namelist values `zob` (`&bottom_drag_settings`), `akv_bak` and
+  `akt_bak` (`&vertical_mixing_settings`) take effect; before, the GPU
+  model used 0.01, 0 and 0 whatever the namelist said. Runs with other
+  values change and now match UCLA ROMS.
+- `tnu2` (`&tracer_diff2`) is used: each tracer's harmonic diffusivity is
+  its `tnu2` entry plus the sponge ramp, per tracer as in UCLA ROMS (one
+  value per tracer, in UCLA ROMS's tracer order). Before, the GPU model
+  ignored `tnu2` and diffused with the sponge ramp only. Runs with
+  non-zero `tnu2` change and now match UCLA ROMS.
 
 ## Numerics
 

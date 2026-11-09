@@ -65,6 +65,9 @@ module passive_mod
   ! One passive tracer held at a constant value (marbl_gpu: use_constant_Fe):
   ! hold_itr is its index (0: none), hold_value its value at wet points.
   integer(ip), public :: hold_itr = 0
+  ! Background horizontal diffusivity (TS_DIF2 tnu2) of each tracer, set by
+  ! case_io from the namelist (0 by default); passive_t3dmix adds the sponge.
+  real(rp), WORK_ATTR public, allocatable :: tnu2_tp(:)
   real(rp), public :: hold_value = 0.0_rp
 
   public :: read_passive_namelist
@@ -222,9 +225,11 @@ contains
     if (ntp <= 0) return
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je; nz = decomp%nz
     if (allocated(tp)) deallocate(tp)
+    if (allocated(tnu2_tp)) deallocate(tnu2_tp)
     if (.not. allocated(tpcol_h)) error stop 'alloc_passive: build_tp_columns first'
-    allocate(tp(ntp, 0:ntpcol, nz, 3))
+    allocate(tp(ntp, 0:ntpcol, nz, 3), tnu2_tp(ntp))
     tp = 0.0_pp
+    tnu2_tp = 0.0_rp
     if (passive_bry) then
       if (allocated(tb_west)) deallocate(tb_west, tb_east, tb_south, tb_north)
       allocate(tb_west(js:je, nz, ntp), tb_east(js:je, nz, ntp))
@@ -325,10 +330,11 @@ contains
 
   ! ------------------------------------------------ lateral diffusion
   subroutine passive_t3dmix()
-    ! Harmonic diffusion along s-surfaces with the salinity diffusivity
-    ! (t3dmix for tp; one thread per tracer and cell).
+    ! Harmonic diffusion along s-surfaces with each tracer's diffusivity,
+    ! tnu2_tp(itp) plus the sponge ramp (t3dmix for tp; one thread per
+    ! tracer and cell).
     if (ntp <= 0) return
-    call passive_t3dmix_run(tp, ntp, nrhs, nnew, dt)
+    call passive_t3dmix_run(tp, ntp, nrhs, nnew, dt, tnu2_tp)
     ! A held tracer (use_constant_Fe) is reset after its last update of the
     ! step, in every slot, before the exchange below sends it.
     call passive_hold(0_ip)

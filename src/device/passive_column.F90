@@ -419,28 +419,32 @@ contains
 
   ! ------------------------------ lateral diffusion, one thread per (tracer, cell)
   DEVICE_ATTR
-  subroutine t3dmix_point(itr, ci, i, j, k, nr, nn, dtl, isl, ntr, nx, is, ie, js, je, nz, nslot, nd, &
-                          tp_, nbt_, ncl, nwet, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
-    ! Harmonic diffusion along s-surfaces with the salinity diffusivity,
-    ! faces computed inline (same expressions as the former passive_t3dmix).
-    integer(ip), intent(in) :: itr, ci, i, j, k, nr, nn, isl, ntr, nx, is, ie, js, je, nz, nslot, nd
+  subroutine t3dmix_point(itr, ci, i, j, k, nr, nn, dtl, ntr, nx, is, ie, js, je, nz, nslot, &
+                          tp_, nbt_, ncl, nwet, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, sp_, tnu_)
+    ! Harmonic diffusion along s-surfaces, faces computed inline (same
+    ! expressions as the former passive_t3dmix). The diffusivity of tracer
+    ! itr is tnu_(itr) + sp_(i, j), its background tnu2 plus the sponge ramp:
+    ! the CPU's diff2(i, j, itrc), summed in the same order (mixing.F90 then
+    ! set_nudgcof).
+    integer(ip), intent(in) :: itr, ci, i, j, k, nr, nn, ntr, nx, is, ie, js, je, nz, nslot
     real(rp), intent(in) :: dtl
     integer(ip), intent(in) :: ncl, nwet, nbt_(8, nwet)
     real(pp), intent(inout) :: tp_(ntr, 0:ncl, nz, nslot)
     real(rp), intent(in) :: Hz_(is:ie, js:je, nz), pm_(is:ie, js:je), pn_(is:ie, js:je)
     real(rp), intent(in) :: pmon_u_(is:ie, js:je), pnom_v_(is:ie, js:je), umask_(is:ie, js:je), vmask_(is:ie, js:je)
-    real(rp), intent(in) :: diff2_(is:ie, js:je, nd)
-    real(rp) :: fxw, fxe, fes, fen
-    fxw = apply_mask(0.25_rp * (diff2_(i, j, isl) + diff2_(i - 1, j, isl)) * &
+    real(rp), intent(in) :: sp_(is:ie, js:je), tnu_(ntr)
+    real(rp) :: fxw, fxe, fes, fen, bg
+    bg = tnu_(itr)
+    fxw = apply_mask(0.25_rp * ((bg + sp_(i, j)) + (bg + sp_(i - 1, j))) * &
          pmon_u_(i, j) * (Hz_(i, j, k) + Hz_(i - 1, j, k)) * &
          (real(tp_(itr, ci, k, nr), rp) - real(tp_(itr, nbt_(2, ci), k, nr), rp)), umask_(i, j))
-    fxe = apply_mask(0.25_rp * (diff2_(i + 1, j, isl) + diff2_(i, j, isl)) * &
+    fxe = apply_mask(0.25_rp * ((bg + sp_(i + 1, j)) + (bg + sp_(i, j))) * &
          pmon_u_(i + 1, j) * (Hz_(i + 1, j, k) + Hz_(i, j, k)) * &
          (real(tp_(itr, nbt_(3, ci), k, nr), rp) - real(tp_(itr, ci, k, nr), rp)), umask_(i + 1, j))
-    fes = apply_mask(0.25_rp * (diff2_(i, j, isl) + diff2_(i, j - 1, isl)) * &
+    fes = apply_mask(0.25_rp * ((bg + sp_(i, j)) + (bg + sp_(i, j - 1))) * &
          pnom_v_(i, j) * (Hz_(i, j, k) + Hz_(i, j - 1, k)) * &
          (real(tp_(itr, ci, k, nr), rp) - real(tp_(itr, nbt_(6, ci), k, nr), rp)), vmask_(i, j))
-    fen = apply_mask(0.25_rp * (diff2_(i, j + 1, isl) + diff2_(i, j, isl)) * &
+    fen = apply_mask(0.25_rp * ((bg + sp_(i, j + 1)) + (bg + sp_(i, j))) * &
          pnom_v_(i, j + 1) * (Hz_(i, j + 1, k) + Hz_(i, j, k)) * &
          (real(tp_(itr, nbt_(7, ci), k, nr), rp) - real(tp_(itr, ci, k, nr), rp)), vmask_(i, j + 1))
     tp_(itr, ci, k, nn) = real(real(tp_(itr, ci, k, nn), rp) + dtl * pm_(i, j) * pn_(i, j) * &
@@ -682,9 +686,9 @@ contains
                  umask_, vmask_, rmask_)
   end subroutine up3_kernel
 
-  attributes(global) launch_bounds(128, 10) subroutine t3dmix_kernel(nel, nwet, nmx, mixc_, wet_i, wet_j, nr, nn, dtl, isl, ntr, nx, ny, nz, is, ie, js, je, nslot, nd, &
-                                              tp_, nbt_, ncl, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
-    integer(ip), value :: nel, nr, nn, isl, ntr, nx, ny, nz, is, ie, js, je, nslot, nd
+  attributes(global) launch_bounds(128, 10) subroutine t3dmix_kernel(nel, nwet, nmx, mixc_, wet_i, wet_j, nr, nn, dtl, ntr, nx, ny, nz, is, ie, js, je, nslot, &
+                                              tp_, nbt_, ncl, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, sp_, tnu_)
+    integer(ip), value :: nel, nr, nn, ntr, nx, ny, nz, is, ie, js, je, nslot
     integer(ip), value :: nwet, nmx
     integer(ip), device, intent(in) :: wet_i(*), wet_j(*), mixc_(*)
     integer(ip) :: cc
@@ -694,15 +698,15 @@ contains
     real(pp), device, intent(inout) :: tp_(ntr, 0:ncl, nz, nslot)
     real(rp), device, intent(in) :: Hz_(is:ie, js:je, nz), pm_(is:ie, js:je), pn_(is:ie, js:je)
     real(rp), device, intent(in) :: pmon_u_(is:ie, js:je), pnom_v_(is:ie, js:je), umask_(is:ie, js:je), vmask_(is:ie, js:je)
-    real(rp), device, intent(in) :: diff2_(is:ie, js:je, nd)
+    real(rp), device, intent(in) :: sp_(is:ie, js:je), tnu_(ntr)
     integer(ip) :: tid, c, itr, i, j, k
     tid = (blockIdx%x - 1) * blockDim%x + threadIdx%x
     if (tid > nel) return
     itr = mod(tid - 1, ntr) + 1; c = (tid - 1) / ntr
     cc = mixc_(mod(c, nmx) + 1); k = c / nmx + 1
     i = wet_i(cc); j = wet_j(cc)
-    call t3dmix_point(itr, cc, i, j, k, nr, nn, dtl, isl, ntr, nx, is, ie, js, je, nz, nslot, nd, &
-                      tp_, nbt_, ncl, nwet, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
+    call t3dmix_point(itr, cc, i, j, k, nr, nn, dtl, ntr, nx, is, ie, js, je, nz, nslot, &
+                      tp_, nbt_, ncl, nwet, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, sp_, tnu_)
   end subroutine t3dmix_kernel
 
   attributes(global) launch_bounds(128, 7) subroutine column_kernel(nwet, wet_i, wet_j, ctr, dtp, ntr, nz, is, ie, js, je, nts, isl, mir, &
@@ -783,29 +787,30 @@ contains
 #endif
   end subroutine passive_horiz_run
 
-  subroutine passive_t3dmix_run(tp, ntr, nr, nn, dtl)
+  subroutine passive_t3dmix_run(tp, ntr, nr, nn, dtl, tnu)
+    ! tnu(ntr): each tracer's background tnu2 (passive_mod tnu2_tp).
     integer(ip), intent(in) :: ntr, nr, nn
     real(pp), WORK_ATTR intent(inout) :: tp(ntr, 0:ntpcol, decomp%nz, 3)
     real(rp), intent(in) :: dtl
-    integer(ip) :: nx, ny, nz, is, ie, js, je, nel, isl, nd
+    real(rp), WORK_ATTR intent(in) :: tnu(ntr)
+    integer(ip) :: nx, ny, nz, is, ie, js, je, nel
 #ifndef USE_CUDA
     integer(ip) :: itr, i, j, k
 #endif
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
-    nd = int(size(diff2, 3), ip); isl = min(2_ip, nd)
     ! only the wet cells with a nonzero diffusivity within 2 cells (mixc):
     ! elsewhere the update is +-0 (gpu_state build_mix_map)
     nel = ntr * nmix * nz
     if (nel <= 0) return
 #ifdef USE_CUDA
-    call t3dmix_kernel<<<(nel + 127) / 128, 128>>>(nel, nwet, nmix, mixc, wet_i, wet_j, nr, nn, dtl, isl, ntr, nx, ny, nz, is, ie, js, je, 3_ip, nd, &
-         tp, tpnb, ntpcol, Hz, pm, pn, pmon_u, pnom_v, umask, vmask, diff2)
+    call t3dmix_kernel<<<(nel + 127) / 128, 128>>>(nel, nwet, nmix, mixc, wet_i, wet_j, nr, nn, dtl, ntr, nx, ny, nz, is, ie, js, je, 3_ip, &
+         tp, tpnb, ntpcol, Hz, pm, pn, pmon_u, pnom_v, umask, vmask, diff2_sp, tnu)
 #else
     do k = 1, nz; do j = 1, ny; do i = 1, nx; do itr = 1, ntr
       if (tpcol(i, j) == 0) cycle
-      call t3dmix_point(itr, tpcol(i, j), i, j, k, nr, nn, dtl, isl, ntr, nx, is, ie, js, je, nz, 3_ip, nd, &
-                        tp, tpnb, ntpcol, nwet, Hz, pm, pn, pmon_u, pnom_v, umask, vmask, diff2)
+      call t3dmix_point(itr, tpcol(i, j), i, j, k, nr, nn, dtl, ntr, nx, is, ie, js, je, nz, 3_ip, &
+                        tp, tpnb, ntpcol, nwet, Hz, pm, pn, pmon_u, pnom_v, umask, vmask, diff2_sp, tnu)
     enddo; enddo; enddo; enddo
 #endif
   end subroutine passive_t3dmix_run
