@@ -77,10 +77,6 @@ module gpu_state
   logical,  public :: obc_east = .false.
   logical,  public :: obc_south = .false.
   logical,  public :: obc_north = .false.
-  ! Upscaling output (do_upscale): the horizontal tracer flux through the
-  ! faces on the physical edges gets the CPU's UPSCALING term
-  ! 0.5*(t_out - t_in)*inflow (upwind on inflow), predictor and corrector
-  logical,  public :: uscl_obc = .false.
   logical,  public :: have_flux = .false.
   logical,  public :: have_bry = .false.
   logical,  public :: have_bulk = .false.
@@ -211,6 +207,7 @@ module gpu_state
   integer(ip), allocatable, public :: mixact(:,:), mixact3(:,:), mixc(:)
 #endif
   public :: build_mix_map
+  public :: open_edge_codes
 
 
 contains
@@ -348,6 +345,22 @@ contains
     tpnb = nb
     deallocate(nb)
   end subroutine build_tp_columns
+
+  subroutine open_edge_codes(west, east, south, north)
+    ! Edge codes of this tile's sides for the horizontal tracer fluxes:
+    ! 0 interior or periodic seam, 1 physical edge, 2 physical edge of an
+    ! open boundary (obc_*, set by init_bry / init_tides). On code 2 the
+    ! face gets 0.5*(t_ghost - t_in)*inflow, which makes the inflow face
+    ! first-order upwind from the boundary value in the UP3 corrector
+    ! (CPU compute_horiz_tracer_fluxes.h: OBC_<side> on the edge rank,
+    ! outside EW_PERIODIC / NS_PERIODIC, as t3dbc). decomp%edge_* is false
+    ! on a periodic side, so a seam never gets the term.
+    integer(ip), intent(out) :: west, east, south, north
+    west  = merge(1_ip, 0_ip, decomp%edge_w) + merge(1_ip, 0_ip, decomp%edge_w .and. obc_west)
+    east  = merge(1_ip, 0_ip, decomp%edge_e) + merge(1_ip, 0_ip, decomp%edge_e .and. obc_east)
+    south = merge(1_ip, 0_ip, decomp%edge_s) + merge(1_ip, 0_ip, decomp%edge_s .and. obc_south)
+    north = merge(1_ip, 0_ip, decomp%edge_n) + merge(1_ip, 0_ip, decomp%edge_n .and. obc_north)
+  end subroutine open_edge_codes
 
   subroutine build_mix_map(passive_bg)
     ! Called after the mixing coefficients are final (apply_sponge). Host loops.

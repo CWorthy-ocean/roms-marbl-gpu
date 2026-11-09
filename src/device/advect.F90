@@ -51,11 +51,9 @@ contains
     call ensure_wrk3()
     t_slot = tidx
     itr = itrc
-    ! edge codes: 0 interior, 1 physical edge, 2 edge with the UPSCALING term
-    west  = merge(1_ip, 0_ip, decomp%edge_w) + merge(1_ip, 0_ip, decomp%edge_w .and. uscl_obc)
-    east  = merge(1_ip, 0_ip, decomp%edge_e) + merge(1_ip, 0_ip, decomp%edge_e .and. uscl_obc)
-    south = merge(1_ip, 0_ip, decomp%edge_s) + merge(1_ip, 0_ip, decomp%edge_s .and. uscl_obc)
-    north = merge(1_ip, 0_ip, decomp%edge_n) + merge(1_ip, 0_ip, decomp%edge_n .and. uscl_obc)
+    ! edge codes: 0 interior, 1 physical edge (wall), 2 open-boundary edge,
+    ! whose faces get the inflow term (open_edge_codes)
+    call open_edge_codes(west, east, south, north)
 
     call hg_begin()
     call hg_add(F_UMASK)
@@ -171,11 +169,9 @@ contains
     call ensure_wrk3()
     t_slot = tidx
     itr = itrc
-    ! edge codes: 0 interior, 1 physical edge, 2 edge with the UPSCALING term
-    west  = merge(1_ip, 0_ip, decomp%edge_w) + merge(1_ip, 0_ip, decomp%edge_w .and. uscl_obc)
-    east  = merge(1_ip, 0_ip, decomp%edge_e) + merge(1_ip, 0_ip, decomp%edge_e .and. uscl_obc)
-    south = merge(1_ip, 0_ip, decomp%edge_s) + merge(1_ip, 0_ip, decomp%edge_s .and. uscl_obc)
-    north = merge(1_ip, 0_ip, decomp%edge_n) + merge(1_ip, 0_ip, decomp%edge_n .and. uscl_obc)
+    ! edge codes: 0 interior, 1 physical edge (wall), 2 open-boundary edge,
+    ! whose faces get the inflow term (open_edge_codes)
+    call open_edge_codes(west, east, south, north)
 
     call hg_begin()
     call hg_add(F_UMASK)
@@ -633,11 +629,9 @@ contains
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = nt
     ts = tidx; ns = n_stp; nn = n_new; nb = indx
     dtp = dtau; cs = cf_stp; cb = cf_bak
-    ! edge codes: 0 interior, 1 physical edge, 2 edge with the UPSCALING term
-    west  = merge(1_ip, 0_ip, decomp%edge_w) + merge(1_ip, 0_ip, decomp%edge_w .and. uscl_obc)
-    east  = merge(1_ip, 0_ip, decomp%edge_e) + merge(1_ip, 0_ip, decomp%edge_e .and. uscl_obc)
-    south = merge(1_ip, 0_ip, decomp%edge_s) + merge(1_ip, 0_ip, decomp%edge_s .and. uscl_obc)
-    north = merge(1_ip, 0_ip, decomp%edge_n) + merge(1_ip, 0_ip, decomp%edge_n .and. uscl_obc)
+    ! edge codes: 0 interior, 1 physical edge (wall), 2 open-boundary edge,
+    ! whose faces get the inflow term (open_edge_codes)
+    call open_edge_codes(west, east, south, north)
     call tracer_halos(tidx, .true., .false.)
     lim = dry_lim(G_TRC)
 #ifdef USE_CUDA
@@ -761,11 +755,9 @@ contains
 
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = nt
     ts = tidx; nn = n_new; dtl = dt_in
-    ! edge codes: 0 interior, 1 physical edge, 2 edge with the UPSCALING term
-    west  = merge(1_ip, 0_ip, decomp%edge_w) + merge(1_ip, 0_ip, decomp%edge_w .and. uscl_obc)
-    east  = merge(1_ip, 0_ip, decomp%edge_e) + merge(1_ip, 0_ip, decomp%edge_e .and. uscl_obc)
-    south = merge(1_ip, 0_ip, decomp%edge_s) + merge(1_ip, 0_ip, decomp%edge_s .and. uscl_obc)
-    north = merge(1_ip, 0_ip, decomp%edge_n) + merge(1_ip, 0_ip, decomp%edge_n .and. uscl_obc)
+    ! edge codes: 0 interior, 1 physical edge (wall), 2 open-boundary edge,
+    ! whose faces get the inflow term (open_edge_codes)
+    call open_edge_codes(west, east, south, north)
     call tracer_halos(tidx, .true., .true.)
     lim = dry_lim(G_TRC)
     njp = (ny + 1) / 2

@@ -2,13 +2,9 @@
 module upscale_out
   ! Upscaling output (CPU upscale_output.F90, UPSCALING), for runs that write
   ! the open-boundary transects a parent domain's CDR forcing is made from.
-  ! With do_upscale:
-  !  - the horizontal tracer flux through the faces on the physical edges,
-  !    every tracer, predictor and corrector, gets the CPU's term
-  !    0.5*(t_out - t_in)*inflow (upwind on inflow; gpu_state uscl_obc, in
-  !    advect and passive_column). The CPU applies it whenever the key is
-  !    compiled; the reference here gates it by do_upscale, so it is on only
-  !    in runs that write this output;
+  ! The open-boundary inflow term 0.5*(t_out - t_in)*inflow of the
+  ! horizontal tracer fluxes, once the CPU's UPSCALING term, applies in every
+  ! run on the open sides (gpu_state open_edge_codes). With do_upscale:
   !  - every step (after step3d_t) the outward advective flux of ALK, DIC,
   !    their ALT_CO2 twins and the CDR_LITE tracers through each open
   !    boundary face (the corrector's UP3 faces with the term, recomputed
@@ -100,7 +96,6 @@ contains
   subroutine init_upscale_output()
     integer :: is, ie, js, je, nz, m, s
     on = .false.
-    uscl_obc = .false.
     if (.not. do_upscale) return
     if (.not. marbl_on) error stop 'init_upscale_output: upscaling needs MARBL'
     if (nrpf_uscl < 1) error stop 'init_upscale_output: nrpf_uscl must be >= 1'
@@ -128,7 +123,6 @@ contains
     allocate(hbuf(max(nbuf, ncbuf)), gbuf(max(nbuf, ncbuf)))
     ! the CPU's start: a record at the first step
     record = nrpf_uscl; nfile = 0; navg = 0; otime = output_period_uscl
-    uscl_obc = .true.
     on = .true.
     if (comm_rank() == 0) write(*,'(a,es12.4,a,i0,a,4l2)') 'upscale output: period ', output_period_uscl, &
          ' s, ', nrpf_uscl, ' records per file, sides N S E W', side_on
@@ -204,7 +198,7 @@ contains
             endif
             f = 0.0_rp
             if (b1) f = ft * fu - coef_up3 * ((dc - dl) * m0 * m1 * max(fu, 0.0_rp) + (dr - dc) * m1 * m2 * min(fu, 0.0_rp))
-            if (b1) f = f + 0.5_rp * (xm - t0) * max(fu, 0.0_rp)    ! the UPSCALING term
+            if (b1) f = f + 0.5_rp * (xm - t0) * max(fu, 0.0_rp)    ! the open-boundary inflow term
             rw(j, k, q) = -f
           enddo
         enddo
@@ -240,7 +234,7 @@ contains
             endif
             f = 0.0_rp
             if (b2) f = ft * fu - coef_up3 * ((dr - dc) * m1 * m2 * max(fu, 0.0_rp) + (de - dr) * m2 * m3 * min(fu, 0.0_rp))
-            if (b2) f = f + 0.5_rp * (xp - t0) * min(fu, 0.0_rp)    ! the UPSCALING term
+            if (b2) f = f + 0.5_rp * (xp - t0) * min(fu, 0.0_rp)    ! the open-boundary inflow term
             re(j, k, q) = f
           enddo
         enddo
@@ -276,7 +270,7 @@ contains
             endif
             f = 0.0_rp
             if (b1) f = ft * fu - coef_up3 * ((dc - dl) * m0 * m1 * max(fu, 0.0_rp) + (dr - dc) * m1 * m2 * min(fu, 0.0_rp))
-            if (b1) f = f + 0.5_rp * (xm - t0) * max(fu, 0.0_rp)    ! the UPSCALING term
+            if (b1) f = f + 0.5_rp * (xm - t0) * max(fu, 0.0_rp)    ! the open-boundary inflow term
             rs(i, k, q) = -f
           enddo
         enddo
@@ -312,7 +306,7 @@ contains
             endif
             f = 0.0_rp
             if (b2) f = ft * fu - coef_up3 * ((dr - dc) * m1 * m2 * max(fu, 0.0_rp) + (de - dr) * m2 * m3 * min(fu, 0.0_rp))
-            if (b2) f = f + 0.5_rp * (xp - t0) * min(fu, 0.0_rp)    ! the UPSCALING term
+            if (b2) f = f + 0.5_rp * (xp - t0) * min(fu, 0.0_rp)    ! the open-boundary inflow term
             rn(i, k, q) = f
           enddo
         enddo
