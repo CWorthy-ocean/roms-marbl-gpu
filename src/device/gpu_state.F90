@@ -52,6 +52,9 @@ module gpu_state
   real(rp), WORK_ATTR public, allocatable :: Akt(:,:,:,:)
   real(rp), WORK_ATTR public, allocatable :: visc2_r(:,:), visc2_p(:,:)
   real(rp), WORK_ATTR public, allocatable :: diff2(:,:,:)
+  ! The sponge ramp alone (v_sponge * ramp, case_io apply_sponge); the passive
+  ! tracers' diffusivity is their tnu2 plus this field (passive_column).
+  real(rp), WORK_ATTR public, allocatable :: diff2_sp(:,:)
   real(rp), WORK_ATTR public, allocatable :: sustr(:,:), svstr(:,:)
   ! Rho-point surface stress (BULK_FRC); only lmd_kpp uses it, for ustar.
   real(rp), WORK_ATTR public, allocatable :: sustr_r(:,:), svstr_r(:,:)
@@ -346,8 +349,11 @@ contains
     deallocate(nb)
   end subroutine build_tp_columns
 
-  subroutine build_mix_map()
+  subroutine build_mix_map(passive_bg)
     ! Called after the mixing coefficients are final (apply_sponge). Host loops.
+    ! passive_bg: some passive tracer has a nonzero background tnu2, so its
+    ! diffusivity is nonzero everywhere.
+    logical, intent(in) :: passive_bg
     integer(ip) :: i, j, ii, jj, is, ie, js, je, nx, ny, n, c, r
     integer(ip), allocatable :: src(:,:), a2(:,:), a3(:,:), lst(:)
     character(len=16) :: val
@@ -363,6 +369,7 @@ contains
       do i = is, ie
         if (visc2_r(i, j) /= 0.0_rp .or. visc2_p(i, j) /= 0.0_rp) src(i, j) = 1
         if (any(diff2(i, j, :) /= 0.0_rp)) src(i, j) = 1
+        if (diff2_sp(i, j) /= 0.0_rp .or. passive_bg) src(i, j) = 1
       enddo
     enddo
     do r = 2, 3
@@ -466,7 +473,7 @@ contains
     allocate(dndx(is:ie,js:je), dmde(is:ie,js:je))
     allocate(Akv(is:ie,js:je,0:nz), Akt(is:ie,js:je,0:nz,2))
     allocate(visc2_r(is:ie,js:je), visc2_p(is:ie,js:je))
-    allocate(diff2(is:ie,js:je,nt))
+    allocate(diff2(is:ie,js:je,nt), diff2_sp(is:ie,js:je))
     allocate(sustr(is:ie,js:je), svstr(is:ie,js:je), stflx(is:ie,js:je,nt))
     allocate(sustr_r(is:ie,js:je), svstr_r(is:ie,js:je))
     sustr_r = 0.0_rp; svstr_r = 0.0_rp
@@ -526,7 +533,7 @@ contains
     lonr = 0.0_rp; latr = 0.0_rp; angler = 0.0_rp
     swflx = 0.0_rp; tair = 0.0_rp
     Akv = 0.0_rp; Akt = 0.0_rp
-    visc2_r = 0.0_rp; visc2_p = 0.0_rp; diff2 = 0.0_rp
+    visc2_r = 0.0_rp; visc2_p = 0.0_rp; diff2 = 0.0_rp; diff2_sp = 0.0_rp
     sustr = 0.0_rp; svstr = 0.0_rp; stflx = 0.0_rp; r_D = 0.0_rp
     bvf = 0.0_rp
     hbls = 0.0_rp; hbbl = 0.0_rp; srflx = 0.0_rp
@@ -553,7 +560,7 @@ contains
     if (allocated(riv_umask)) deallocate(riv_umask, riv_vmask)
     if (allocated(rmask)) deallocate(rmask, umask, vmask, f, lonr, latr, angler, swflx, tair, &
                                     pmask, dm_p, dn_p, dm_u, dn_v, pmon_u, pnom_v, dndx, dmde, &
-                                    Akv, Akt, visc2_r, visc2_p, diff2, &
+                                    Akv, Akt, visc2_r, visc2_p, diff2, diff2_sp, &
                                     sustr, svstr, sustr_r, svstr_r, stflx, r_D, bvf, &
                                     hbls, hbbl, srflx, ghat, swr_frac)
     if (allocated(rufrc)) deallocate(rufrc, rvfrc, rufrc_bak, rvfrc_bak)

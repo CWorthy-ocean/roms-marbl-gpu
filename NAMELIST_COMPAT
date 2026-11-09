@@ -37,10 +37,13 @@
 # stops the run.
 #
 # Per-tracer lists: &vertical_mixing_settings akt_bak and &tracer_diff2 tnu2
-# accept one value per tracer, as in UCLA ROMS (up to 512). Only akt_bak's T
-# and S entries are used (as on the CPU, the other tracers mix with salinity's
-# diffusivity); tnu2 is read but not used (no background harmonic tracer
-# diffusion, only the v_sponge ramp).
+# accept one value per tracer, as in UCLA ROMS (up to 512), in its tracer
+# order (T, S, nt_passive generic, CDR_LITE, MARBL). Only akt_bak's T and S
+# entries are used (as on the CPU, the other tracers mix with salinity's
+# diffusivity). tnu2 is used per tracer, as UCLA ROMS with TS_DIF2: each
+# tracer's harmonic diffusivity is its tnu2 plus the v_sponge ramp. Generic
+# passives added by the GPU-only &passive_tracers n_passive beyond nt_passive
+# take salinity's tnu2.
 #
 # roms_gpu      UCLA ROMS namelist
 v0.1.0-beta     0.11.0

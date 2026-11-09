@@ -29,7 +29,7 @@ module case_io
   use halo_mod, only: halo_fill_2d, halo_fill_2d_s, halo_fill_3d_s, halo_fill_3d_t, halo_fill_3d_tp
   use formulas, only: rho0_eos => rho0
   use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name, &
-       passive_hold, set_cdr_lite, passive_finish_list, ncdr
+       passive_hold, set_cdr_lite, passive_finish_list, ncdr, tnu2_tp, n_marbl, cdr0, passive_mirror
   use marbl_gpu, only: marbl_gpu_init_diagnostics
   use marbl_gpu, only: marbl_on, read_marbl_namelist, marbl_gpu_setup_tracers, marbl_gpu_init_forcing, &
                        marbl_gpu_load_state
@@ -76,6 +76,13 @@ module case_io
   logical,     public :: case_periodic_x = .false.
   logical,     public :: case_periodic_y = .false.
   real(rp),    public :: case_v_sponge = 0.0_rp
+  ! UCLA ROMS reads akt_bak and tnu2 with one value per tracer (NT long), in
+  ! its tracer order (T, S, nt_passive generic, CDR_LITE, MARBL; tracers.F90),
+  ! and C-Star writes them so. A fixed, generous length accepts any such list
+  ! however the tracers are counted. Entries not given are 0, as on the CPU.
+  integer, parameter :: nml_ntrc_max = 512
+  real(rp) :: case_tnu2(nml_ntrc_max) = 0.0_rp   ! &tracer_diff2 tnu2 (TS_DIF2 background)
+  integer(ip) :: case_nt_passive = 0             ! param_settings nt_passive (the CPU's count)
 
   public :: read_namelist
   public :: load_case
@@ -132,6 +139,7 @@ contains
       error stop 'read_namelist'
     endif
     call set_cdr_lite(nt_cdr_oae, nt_cdr_dor)
+    case_nt_passive = max(nt_passive, 0_ip)
 
     rewind(unit); read(unit, nml=grid_settings, iostat=ios, iomsg=msg)
     if (ios /= 0) then
@@ -247,6 +255,42 @@ contains
     endif
   end subroutine read_tile_settings
 
+  subroutine set_tnu2()
+    ! TS_DIF2 background diffusivity, CPU init_arrays_mixing: diff2 =
+    ! tnu2(itrc) for every tracer; apply_sponge then adds the sponge ramp
+    ! (CPU set_nudgcof). T and S: diff2(:, :, itrc). Passives: tnu2_tp(itp),
+    ! the entry of the CPU tracer each one is (passive.F90 tp layout). The
+    ! generic passives beyond param_settings' nt_passive (the GPU-only
+    ! &passive_tracers n_passive) are not CPU tracers and take salinity's
+    ! tnu2, as does tracer 1 of passive_init = 'mirror_salt', which mirrors
+    ! salinity.
+    integer(ip) :: itrc, itp, k, m
+    do itrc = 1, int(size(diff2, 3), ip)
+      diff2(:, :, itrc) = case_tnu2(itrc)
+    enddo
+    do itp = 1, ntp
+      if (itp > cdr0) then                     ! CDR_LITE
+        k = 2 + case_nt_passive + (itp - cdr0)
+      elseif (itp > n_marbl) then              ! generic
+        m = itp - n_marbl
+        if (m <= case_nt_passive .and. .not. (passive_mirror .and. m == 1)) then
+          k = 2 + m
+        else
+          k = isalt
+        endif
+      else                                     ! MARBL
+        k = 2 + case_nt_passive + ncdr + itp
+      endif
+      if (k <= nml_ntrc_max) tnu2_tp(itp) = case_tnu2(k)
+    enddo
+    if (comm_rank() == 0 .and. (any(case_tnu2 /= 0.0_rp))) then
+      write(*,'(a,2es12.4)') 'tnu2 (T, S) =', case_tnu2(1:2)
+      do itp = 1, ntp
+        write(*,'(a,i0,a,a,a,es12.4)') 'tnu2 passive ', itp, ' (', trim(passive_name(itp)), ') =', tnu2_tp(itp)
+      enddo
+    endif
+  end subroutine set_tnu2
+
   subroutine apply_sponge()
     ! CPU set_nudgcof (SPONGE, UV_VIS2, TS_DIF2, not PACIFIC): linear ramp
     ! over isp = sponge_size+1 points from every open edge (the CPU's
@@ -284,6 +328,7 @@ contains
     do itrc = 1, size(diff2, 3)
       diff2(:, :, itrc) = diff2(:, :, itrc) + case_v_sponge * wrk
     enddo
+    diff2_sp = case_v_sponge * wrk    ! the passives add it to their tnu2
     deallocate(wrk)
     if (comm_rank() == 0) write(*,'(a,i3,a,es12.4)') 'Sponge layer = ', sponge_size, &
          ' interior grid points, v_sponge =', case_v_sponge
@@ -505,14 +550,10 @@ contains
     integer, intent(in) :: unit
     real(rp), intent(inout) :: zob_in, rdrg_in, rdrg2_in, visc2_in, akv_bak_in
     real(rp), intent(inout) :: akt_bak_in(2), rho0_in
-    ! UCLA ROMS reads akt_bak and tnu2 with one value per tracer (NT long),
-    ! and C-Star writes them so. A fixed, generous length accepts any such
-    ! list however the tracers are counted; only akt_bak(1:2) (T, S) is
-    ! kept. Entries beyond T and S are ignored, as on the CPU, where Akt is
-    ! allocated to isalt and the other tracers mix with salinity's
-    ! diffusivity. tnu2 is read and not used (no background harmonic
-    ! tracer diffusion; diff2 is the v_sponge ramp only).
-    integer, parameter :: nml_ntrc_max = 512
+    ! akt_bak and tnu2: one value per tracer (see case_tnu2). Only
+    ! akt_bak(1:2) (T, S) is kept: entries beyond T and S are ignored, as on
+    ! the CPU, where Akt is allocated to isalt and the other tracers mix
+    ! with salinity's diffusivity. tnu2 goes to case_tnu2 (set_tnu2).
     integer :: ios
     character(len=512) :: msg
     real(rp) :: rdrg, rdrg2, zob, visc2, akv_bak, rho0
@@ -538,6 +579,7 @@ contains
     call nml_stop(ios, msg, 'RHO0_SETTINGS')
     zob_in = zob; rdrg_in = rdrg; rdrg2_in = rdrg2; visc2_in = visc2
     akv_bak_in = akv_bak; akt_bak_in = akt_bak(1:2)
+    case_tnu2 = tnu2
     rho0_in = rho0
   end subroutine read_optional_scalars
 
@@ -546,7 +588,7 @@ contains
     integer :: ncid, xi_rho, eta_rho, xi_u, eta_v, s_rho
     integer :: i0, j0, nxi, neta
     integer(ip) :: k
-    logical :: had_f, had_lat
+    logical :: had_f, had_lat, passive_bg
     real(rp), parameter :: deg2rad = 3.14159265358979323846_rp / 180.0_rp
     real(rp), parameter :: omega_earth = 4.0_rp * 3.14159265358979323846_rp / (23.9344699_rp * 3600.0_rp)
 
@@ -625,9 +667,7 @@ contains
          '  deep-land ', ndeep, '  radius ', dry_radius
     visc2_r = visc2
     visc2_p = visc2
-    diff2 = 0.0_rp
-    diff2(:, :, 1) = 0.0_rp
-    if (size(diff2, 3) >= 2) diff2(:, :, 2) = 0.0_rp
+    call set_tnu2()
 
     call nc_open_read(case_inifile, ncid)
     write(*,'(a,a)') 'init file: ', trim(case_inifile)
@@ -674,7 +714,9 @@ contains
     call zero_closed_wall_velocities()
     ! the sponge follows the open sides (obc_*), known from here on
     call apply_sponge()
-    call build_mix_map()
+    passive_bg = .false.
+    if (ntp > 0) passive_bg = any(tnu2_tp /= 0.0_rp)
+    call build_mix_map(passive_bg)
     write(*,'(a,i0,a,i0,a,i0)') 'mixing skip: rank ', comm_rank(), '  active wet cells ', nmix, ' of ', nwet
     ! after the initial state: the river faces add to riv_umask/riv_vmask
     ! as read from the initial file (CPU: get_init, then calc_river_flux);
