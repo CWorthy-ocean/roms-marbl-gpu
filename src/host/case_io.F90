@@ -94,7 +94,7 @@ contains
     integer(ip) :: nsub_x, nsub_e, ndtfast_in, ntimes_in, ninfo, nrrec
     real(rp) :: dt_in, theta_s_in, theta_b_in, hc_in
     real(rp) :: zob_in, rdrg_in, rdrg2_in, visc2_in, akv_bak_in, rho0_in
-    real(rp) :: akt_bak_in(2), tnu2(64)
+    real(rp) :: akt_bak_in(2)
     character(len=512) :: grdname, inifile, ininame, title, output_root_name
 
     namelist /param_settings/ np_xi, np_eta, nsub_x, nsub_e, llm, mmm, nz, n, &
@@ -113,7 +113,7 @@ contains
     dt_in = 100.0_rp; ndtfast_in = 60; ntimes_in = 1; ninfo = 1
     theta_s_in = 6.0_rp; theta_b_in = 6.0_rp; hc_in = 250.0_rp
     zob_in = 0.01_rp; rdrg_in = 0.0_rp; rdrg2_in = 0.0_rp; visc2_in = 0.0_rp
-    akv_bak_in = 0.0_rp; akt_bak_in = 0.0_rp; tnu2 = 0.0_rp; rho0_in = 1025.0_rp
+    akv_bak_in = 0.0_rp; akt_bak_in = 0.0_rp; rho0_in = 1025.0_rp
     grdname = ''; inifile = ''
     title = 'roms_gpu'; output_root_name = './output'
 
@@ -505,16 +505,26 @@ contains
     integer, intent(in) :: unit
     real(rp), intent(inout) :: zob_in, rdrg_in, rdrg2_in, visc2_in, akv_bak_in
     real(rp), intent(inout) :: akt_bak_in(2), rho0_in
+    ! UCLA ROMS reads akt_bak and tnu2 with one value per tracer (NT long),
+    ! and C-Star writes them so. A fixed, generous length accepts any such
+    ! list however the tracers are counted; only akt_bak(1:2) (T, S) is
+    ! kept. Entries beyond T and S are ignored, as on the CPU, where Akt is
+    ! allocated to isalt and the other tracers mix with salinity's
+    ! diffusivity. tnu2 is read and not used (no background harmonic
+    ! tracer diffusion; diff2 is the v_sponge ramp only).
+    integer, parameter :: nml_ntrc_max = 512
     integer :: ios
     character(len=512) :: msg
-    real(rp) :: rdrg, rdrg2, zob, visc2, akv_bak, akt_bak(2), tnu2(64), rho0
+    real(rp) :: rdrg, rdrg2, zob, visc2, akv_bak, rho0
+    real(rp) :: akt_bak(nml_ntrc_max), tnu2(nml_ntrc_max)
     namelist /bottom_drag_settings/ rdrg, rdrg2, zob
     namelist /vertical_mixing_settings/ akv_bak, akt_bak
     namelist /lateral_visc_settings/ visc2
     namelist /tracer_diff2/ tnu2
     namelist /rho0_settings/ rho0
     rdrg = rdrg_in; rdrg2 = rdrg2_in; zob = zob_in
-    visc2 = visc2_in; akv_bak = akv_bak_in; akt_bak = akt_bak_in
+    visc2 = visc2_in; akv_bak = akv_bak_in
+    akt_bak = 0.0_rp; akt_bak(1:2) = akt_bak_in
     tnu2 = 0.0_rp; rho0 = rho0_in
     rewind(unit); read(unit, nml=bottom_drag_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'BOTTOM_DRAG_SETTINGS')
@@ -527,7 +537,7 @@ contains
     rewind(unit); read(unit, nml=rho0_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'RHO0_SETTINGS')
     zob_in = zob; rdrg_in = rdrg; rdrg2_in = rdrg2; visc2_in = visc2
-    akv_bak_in = akv_bak; akt_bak_in = akt_bak
+    akv_bak_in = akv_bak; akt_bak_in = akt_bak(1:2)
     rho0_in = rho0
   end subroutine read_optional_scalars
 

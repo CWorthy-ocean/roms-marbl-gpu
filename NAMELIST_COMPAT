@@ -36,6 +36,12 @@
 # the key on. A field that fits neither the model grid nor these shapes
 # stops the run.
 #
+# Per-tracer lists: &vertical_mixing_settings akt_bak and &tracer_diff2 tnu2
+# accept one value per tracer, as in UCLA ROMS (up to 512). Only akt_bak's T
+# and S entries are used (as on the CPU, the other tracers mix with salinity's
+# diffusivity); tnu2 is read but not used (no background harmonic tracer
+# diffusion, only the v_sponge ramp).
+#
 # roms_gpu      UCLA ROMS namelist
 v0.1.0-beta     0.11.0
 v0.1.1-beta     0.11.0
