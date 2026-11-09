@@ -22,7 +22,7 @@ module passive_mod
   use halo_mod, only: halo_fill_3d_tp, halo_tp_start, halo_tp_mid, halo_tp_finish, tp_overlap_on
   use rivers_mod, only: river_on, rivers_tp, RIV_PRE, RIV_COR
   use cdr_src_mod, only: cdr_on, cdr_apply_tp
-  use cdr_lite_mod, only: cdrl_on, cdrl_psf
+  use cdr_lite_mod, only: cdrl_on, cdrl_psf, psf_cflx
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
 #endif
@@ -313,9 +313,11 @@ contains
     ! CDR releases: the CPU adds them in the corrector after the horizontal
     ! advection (and the river flux it contains), before the vertical pass
     if (cdr_on) call cdr_apply_tp(tp, ntp, nnew, dt_in)
-    ! CDR_LITE DIC tracers: surface flux (cdr_lite_io, set at n+1/2) on the
-    ! top layer after the vertical advection
-    call passive_column_run(tp, ntp, nrhs, nnew, dt_in, 0_ip, .false., passive_mirror, cdrl_on, cdrl_psf)
+    ! CDR_LITE DIC tracers and the CFLX_CORR restoring of DIC/ALK: surface
+    ! flux (cdr_lite_io and frc_io, set at n+1/2) on the top layer after
+    ! the vertical advection
+    call passive_column_run(tp, ntp, nrhs, nnew, dt_in, 0_ip, .false., passive_mirror, cdrl_on .or. psf_cflx, &
+                            cdrl_psf)
     call passive_t3dbc()
     ! No exchange of slot nnew here: MARBL and t3dmix read it at the point
     ! only (t3dmix's stencil is slot nrhs) and passive_t3dmix exchanges it.

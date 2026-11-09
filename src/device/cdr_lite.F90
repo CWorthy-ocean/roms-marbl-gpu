@@ -28,7 +28,7 @@ module cdr_lite_mod
 #endif
   implicit none
   private
-  public :: cdrl_on, cdrl_nd, cdrl_setup, cdrl_ensure, cdrl_sflx
+  public :: cdrl_on, cdrl_nd, cdrl_setup, cdrl_ensure, cdrl_sflx, cdrl_psf_full, psf_cflx
   public :: cdrl_psf, cdrl_ddco2, cdrl_ddalk, cdrl_flx, cdrl_gas, cdrl_dic_h, cdrl_alk_h
   public :: cdrl_out_alloc, cdrl_out_accum, cdrl_out_inst_h, cdrl_out_inst_iz, cdrl_out_zero
   public :: cdrl_out_gather3, cdrl_out_gather2
@@ -43,7 +43,11 @@ module cdr_lite_mod
 #else
   integer(ip), allocatable :: cl_dic(:), cl_alk(:)
 #endif
+  ! cdrl_psf is the passive corrector's one surface-flux array: CDR_LITE
+  ! writes its DIC tracers' fluxes, the CFLX_CORR restoring (frc_io,
+  ! psf_cflx) those of DIC, ALK and their _ALT_CO2 twins; 0 elsewhere.
   real(rp), WORK_ATTR allocatable :: cdrl_psf(:,:)          ! (ntp, nwet)
+  logical :: psf_cflx = .false.
   real(rp), WORK_ATTR allocatable :: cdrl_ddco2(:,:), cdrl_ddalk(:,:)   ! (is:ie, js:je)
   real(rp), WORK_ATTR allocatable :: cdrl_flx(:,:,:), cdrl_gas(:,:,:)   ! (is:ie, js:je, nd)
 
@@ -99,6 +103,18 @@ contains
       cdrl_psf = 0.0_rp
     endif
   end subroutine cdrl_ensure
+
+  subroutine cdrl_psf_full(ntr)
+    ! cdrl_psf at its full size (ntr, nwet), zero, unless it already is
+    ! (CDR_LITE's cdrl_setup); cdrl_ensure leaves a (1, 1) placeholder.
+    integer(ip), intent(in) :: ntr
+    if (allocated(cdrl_psf)) then
+      if (size(cdrl_psf, 1) == max(ntr, 1) .and. size(cdrl_psf, 2) == max(nwet, 1)) return
+      deallocate(cdrl_psf)
+    endif
+    allocate(cdrl_psf(max(ntr, 1), max(nwet, 1)))
+    cdrl_psf = 0.0_rp
+  end subroutine cdrl_psf_full
 
   subroutine cdrl_sflx(tp, ntr, nrs, uw, vw, have_wind)
     ! Surface fluxes of the DIC tracers from slot nrs of T and the passive

@@ -16,6 +16,26 @@
 # &passive_tracers (n_passive, init_mode, write_passive), and in
 # &param_settings the keys n, nsub_x, nsub_e and ntrc_bio.
 #
+# Surface restoring: UCLA ROMS selects it with cpp keys, which the GPU model
+# cannot see; roms_gpu switches it on with GPU-only logical keys in
+# &surf_frc_settings (default .false., bulk forcing only), and reads the
+# coefficient from the same group as UCLA ROMS:
+#   CPU cpp key        roms_gpu &surf_frc_settings   coefficient group (cm/day)
+#   SFLX_CORR          sflx_corr = .true.             &sss_correction dSSSdt
+#   QCORRECTION        qcorrection = .true.           &sst_correction dSSTdt
+#   CFLX_CORR (MARBL)  cflx_corr = .true.             &dic_alk_correction dCdt
+# A forcing file holding the restoring data (sss, sst, sDIC/sALK)
+# while its switch is off gives a start-up warning. The restoring-flux
+# output (&surf_flx_output_settings wrt_rstflx) is not on the GPU.
+#
+# Half-resolution forcing: interp_bulk_frc, interp_flux_frc
+# (&surf_frc_settings) and interp_bgc_frc (&bgc_settings) are read but not
+# used; roms_gpu takes a forcing field as half resolution from its shape
+# ((LLm/2 + 2) x (MMm/2 + 2) at rho points, xi one shorter at u points,
+# eta one shorter at v points) and interpolates it as UCLA ROMS does with
+# the key on. A field that fits neither the model grid nor these shapes
+# stops the run.
+#
 # roms_gpu      UCLA ROMS namelist
 v0.1.0-beta     0.11.0
 v0.1.1-beta     0.11.0

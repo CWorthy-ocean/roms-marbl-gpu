@@ -1,8 +1,9 @@
 #include "mem_attr.inc"
 module bulk_coare
   ! COARE 3.0 bulk fluxes (Fairall et al. 2003), ported from
-  ! roms_bugfix/src/bulk_frc.F90, with SFLX_CORR (namelist) and the
-  ! SEA_ICE_NOFLUX cap. No QCORR / TAU_CORR.
+  ! roms_bugfix/src/bulk_frc.F90, with SFLX_CORR, QCORRECTION and
+  ! CFLX_CORR (namelist switches, frc_io) and the SEA_ICE_NOFLUX cap.
+  ! No TAU_CORRECTION.
   ! All loops are device kernels (pointwise; the COARE iteration stays
   ! serial per point). Inputs must be managed/device arrays.
   use kinds
@@ -32,11 +33,11 @@ module bulk_coare
   real(rp), parameter :: cmday2ms = 0.01_rp / 86400.0_rp
   real(rp), parameter :: Cp = 3985.0_rp
 
-  public :: calc_bulk_coare
+  public :: calc_bulk_coare, calc_cflx_corr
 
 contains
 
-  subroutine calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad, do_sss, dsss, sss)
+  subroutine calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad, do_sss, dsss, sss, do_sst, dsst, sst)
     real(rp), WORK_ATTR intent(in) :: uwnd(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: vwnd(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: tair(decomp%is:decomp%ie, decomp%js:decomp%je)
@@ -46,7 +47,10 @@ contains
     logical,  intent(in) :: do_sss                 ! SFLX_CORR salinity restoring
     real(rp), intent(in) :: dsss                   ! piston velocity, m/s
     real(rp), WORK_ATTR intent(in) :: sss(decomp%is:decomp%ie, decomp%js:decomp%je)
-    integer(ip) :: i, j, iter, itermax, nx, ny, nz, is, ie, js, je, n_rhs, i_fb, j_fb
+    logical,  intent(in) :: do_sst                 ! QCORRECTION heat-flux correction
+    real(rp), intent(in) :: dsst                   ! piston velocity, m/s
+    real(rp), WORK_ATTR intent(in) :: sst(decomp%is:decomp%ie, decomp%js:decomp%je)
+    integer(ip) :: i, j, iter, itermax, nx, ny, nz, is, ie, js, je, n_rhs, i_fb, j_fb, qc
     real(rp) :: rho0i, cpi, TseaC, TseaK, TairC, TairK, Qsea, rhoAir
     real(rp) :: VisAir, Hlv, delW, delT, delQ, u10, Zo10, Cd10, Ch10, Ct10, Cd
     real(rp) :: Ct, CC, Ri, Ribcu, Zetu, L10, Wstar, Tstar, Qstar
@@ -60,6 +64,7 @@ contains
     r0 = rho0_case
     rho0i = 1.0_rp / r0
     cpi = 1.0_rp / Cp
+    qc = merge(1_ip, 0_ip, do_sst)
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
@@ -174,6 +179,9 @@ contains
         hflat = -hflat * rho0i * cpi
         hfsen = -hfsen * rho0i * cpi
         stflx(i, j, itemp) = apply_mask(srflx(i, j) + hflw + hflat + hfsen, rmask(i, j))
+        ! roms_bugfix QCORRECTION: stflx(itemp) -= dSSTdt (T(nz,nrhs) - sst) rmask,
+        ! before the SEA_ICE_NOFLUX cap below
+        if (qc == 1) stflx(i, j, itemp) = stflx(i, j, itemp) - dsst * (TseaC - sst(i, j)) * rmask(i, j)
         evap = -Cp * hflat / Hlv
         swflx(i, j) = apply_mask(prate(i, j) * cmday2ms - evap, rmask(i, j))
         ! roms_bugfix SEA_ICE_NOFLUX (set_global_definitions.h, always on): no
@@ -264,6 +272,40 @@ contains
       enddo
     endif
   end subroutine calc_bulk_coare
+
+  subroutine calc_cflx_corr(tp, ntr, nrs, psf, sdic, salk, dc, idic, idica, ialk, ialka)
+    ! roms_bugfix bulk_frc.F90 CFLX_CORR (MARBL): the surface fluxes of the
+    ! DIC and ALK pairs, from slot nrs of the passive tracers, into the
+    ! passive corrector's surface-flux array psf(itr, wet column):
+    !   DIC, DIC_ALT_CO2: -dCdt (DIC_ALT_CO2(nz) - sDIC) rmask
+    !   ALK, ALK_ALT_CO2: -dCdt (ALK_ALT_CO2(nz) - sALK) rmask
+    ! (both tracers of a pair use the _ALT_CO2 tracer's value, as the CPU).
+    ! One thread per interior wet column; the other tracers' entries are
+    ! not touched.
+    integer(ip), intent(in) :: ntr, nrs, idic, idica, ialk, ialka
+    real(pp), WORK_ATTR intent(in) :: tp(ntr, 0:ntpcol, decomp%nz, 3)
+    real(rp), WORK_ATTR intent(inout) :: psf(:,:)
+    real(rp), WORK_ATTR intent(in) :: sdic(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(in) :: salk(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), intent(in) :: dc
+    integer(ip) :: c, i, j, nz, nr, a1, a2, b1, b2
+    real(rp) :: d, g
+    if (nwet <= 0) return
+    nz = decomp%nz; nr = nrs; d = dc
+    a1 = idic; a2 = idica; b1 = ialk; b2 = ialka
+#ifdef USE_CUDA
+    !$cuf kernel do(1) <<<*,*>>>
+#endif
+    do c = 1, nwet
+      i = wet_i(c); j = wet_j(c)
+      g = -(d * (real(tp(a2, c, nz, nr), rp) - sdic(i, j)) * rmask(i, j))
+      psf(a2, c) = g
+      psf(a1, c) = g
+      g = -(d * (real(tp(b2, c, nz, nr), rp) - salk(i, j)) * rmask(i, j))
+      psf(b2, c) = g
+      psf(b1, c) = g
+    enddo
+  end subroutine calc_cflx_corr
 
 #ifdef USE_CUDA
   attributes(host, device) &

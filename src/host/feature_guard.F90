@@ -51,6 +51,7 @@ contains
     call need_off('frc_output_settings', 'wrt_frc', 'forcing output')
     call need_off('surf_flx_output_settings', 'wrt_smflx', 'surface momentum flux output')
     call need_off('surf_flx_output_settings', 'wrt_stflx', 'surface tracer flux output')
+    call need_off('surf_flx_output_settings', 'wrt_rstflx', 'surface restoring flux output')
     call need_off('basic_output_settings', 'monthly_restarts', 'monthly restarts')
     call need_off('bgc_settings', 'wrt_bgc_dia_avg', 'BGC diagnostic averages output')
     call need_off('tidal_frc_settings', 'ana_tides', 'analytical tides')

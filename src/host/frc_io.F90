@@ -2,14 +2,16 @@
 module frc_io
   ! Flux-file or COARE 3.0 bulk surface forcing; two-level time
   ! interpolation. Records are read on the host into managed buffers;
-  ! the interpolation onto the grid and the bulk fluxes run as device
-  ! kernels (the 2x-coarse upsampling path stays on the host). No rivers / BGC.
+  ! the interpolation onto the grid (also from 2x-coarse inputs, as the
+  ! CPU's interp_*_frc) and the bulk fluxes run as device kernels.
   use kinds
   use decomp_mod
   use gpu_state
   use time_state
   use nc_io
-  use bulk_coare, only: calc_bulk_coare
+  use bulk_coare, only: calc_bulk_coare, calc_cflx_corr
+  use passive_mod, only: ntp, tp, n_marbl, passive_name
+  use cdr_lite_mod, only: cdrl_psf_full, cdrl_psf, psf_cflx
   use arch_mod, only: sync_arch
   use comm_mod, only: comm_rank, comm_size, comm_compute
   use run_timers, only: wall_time
@@ -25,6 +27,7 @@ module frc_io
   private
 
   integer, parameter :: max_frc = 64
+  integer, parameter :: LAY_GRID = 1, LAY_COARSE = 2
   character(len=512), public :: case_frcfiles(max_frc)
   integer,            public :: case_nfrc = 0
   integer, private :: frc_cache(max_frc) = -1   ! read handles kept open during initialization
@@ -35,9 +38,9 @@ module frc_io
   ! costs one seek, so a month of hourly times is thousands of reads.
   integer, parameter :: MAXTC = 1024
   ! Time axes the binders request (frc_io bind_series, bry_io 'bry_time').
-  character(len=16), parameter :: TAXES(12) = [character(len=16) :: 'time', 'sms_time', 'shf_time', &
+  character(len=16), parameter :: TAXES(15) = [character(len=16) :: 'time', 'sms_time', 'shf_time', &
        'swf_time', 'srf_time', 'sss_time', 'dust_time', 'iron_time', 'nox_time', 'nhy_time', &
-       'xco2_time', 'bry_time']
+       'xco2_time', 'bry_time', 'sst_time', 'sDIC_time', 'sALK_time']
   integer, parameter :: AXIS_BLOCK = 8192   ! netCDF block size for the axis reads, bytes
   type :: tc_t
     integer :: ifile = 0, n = 0
@@ -62,6 +65,12 @@ module frc_io
     character(len=1)   :: gtype = 'r'
     integer :: ntot = 0, it1 = 1, it2 = 2, n1 = 0, n2 = 0, time_axis = 3
     integer :: fi0 = 1, fj0 = 1   ! file start of this tile's window (on-grid fields)
+    ! Layout (bind_series, from the file shape): lay = LAY_GRID, a field on
+    ! the model grid, read as this tile's window buf(1:n1, 1:n2), which is
+    ! dest(li0:li0+n1-1, lj0:lj0+n2-1); lay = LAY_COARSE, a 2x-coarse field
+    ! (whole file in buf).
+    integer :: lay = 0, li0 = 1, lj0 = 1
+    integer :: fn1 = 0, fn2 = 0   ! file shape (xi, eta), the same in every file
     logical :: ready = .false.
     ! climatology: cycle_length attribute of the time axis (<= 0: none);
     ! t1e/t2e are the shifted record times of the current bracket
@@ -81,6 +90,8 @@ module frc_io
   type(series2d), target :: s_sustr, s_svstr, s_shflx, s_swflx, s_swrad
   type(series2d), target :: s_uwnd, s_vwnd, s_tair, s_qair, s_prate, s_lwrad, s_bswrad
   type(series2d), target :: s_sss              ! SFLX_CORR: sea-surface salinity restoring data
+  type(series2d), target :: s_sst              ! QCORRECTION: sea-surface temperature restoring data
+  type(series2d), target :: s_sdic, s_salk     ! CFLX_CORR: sea-surface DIC and ALK restoring data
   ! MARBL surface forcing (dust/iron/nox/nhy climatologies, atmospheric xCO2)
   type(series2d), target :: s_dust, s_iron, s_nox, s_nhy, s_xco2, s_xco2a
   ! CDR_LITE surface forcing: carbonate sensitivities and the DIC tracers'
@@ -118,12 +129,23 @@ module frc_io
   public :: frc_prefetch, frc_prefetch_drain, frc_run_ncid_path
   logical, public :: bgc_frc_on = .false.
   real(rp), WORK_ATTR allocatable :: uwnd(:,:), vwnd(:,:), qair(:,:), prate(:,:), lwrad_in(:,:)
-  real(rp), WORK_ATTR allocatable :: sss(:,:)
-  ! SFLX_CORR (roms_bugfix bulk_frc.F90): stflx(isalt) = -dSSSdt (S_surface - sss),
-  ! bulk forcing only. &surf_frc_settings sflx_corr; &sss_correction dsssdt [cm/day].
-  logical,  public :: sflx_corr = .false.
-  real(rp), public :: dsssdt = 7.777_rp
-  real(rp)         :: dsssdt_ms = 0.0_rp       ! piston velocity, m/s
+  real(rp), WORK_ATTR allocatable :: sss(:,:), sst(:,:), sdic(:,:), salk(:,:)
+  ! Surface restoring, bulk forcing only (UCLA ROMS bulk_frc.F90; there cpp
+  ! keys, here GPU-only &surf_frc_settings switches, see NAMELIST_COMPAT):
+  ! SFLX_CORR (sflx_corr): stflx(isalt) = -dSSSdt (S_surface - sss),
+  !   &sss_correction dsssdt [cm/day];
+  ! QCORRECTION (qcorrection): stflx(itemp) -= dSSTdt (T_surface - sst),
+  !   before the SEA_ICE_NOFLUX cap, &sst_correction dsstdt [cm/day];
+  ! CFLX_CORR (cflx_corr, MARBL): the surface fluxes of DIC and DIC_ALT_CO2
+  !   are -dCdt (DIC_ALT_CO2_surface - sDIC), those of ALK and ALK_ALT_CO2
+  !   -dCdt (ALK_ALT_CO2_surface - sALK) (the CPU's expressions: both
+  !   tracers of a pair restore with the _ALT_CO2 tracer's value), applied
+  !   by the passive corrector from the first step on (CPU b49a3e63,
+  !   claude-docs#116), &dic_alk_correction dcdt [cm/day].
+  logical,  public :: sflx_corr = .false., qcorrection = .false., cflx_corr = .false.
+  real(rp), public :: dsssdt = 7.777_rp, dsstdt = 7.777_rp, dcdt = 7.777_rp
+  real(rp)         :: dsssdt_ms = 0.0_rp, dsstdt_ms = 0.0_rp, dcdt_ms = 0.0_rp   ! piston velocities, m/s
+  integer(ip)      :: ic_dic = 0, ic_dica = 0, ic_alk = 0, ic_alka = 0          ! CFLX_CORR passive indices
 
   public :: read_forcing_namelist
   public :: init_forcing
@@ -131,6 +153,7 @@ module frc_io
   public :: init_bgc_forcing
   public :: set_bgc_forces
   public :: init_cdr_lite_forcing, set_cdr_lite_forces
+  public :: init_cflx_corr
   public :: cyc_bracket
   public :: uwnd, vwnd
   public :: write_toy_flux
@@ -146,8 +169,11 @@ contains
     character(len=512) :: frcfiles(max_frc), frcfile(max_frc)
     logical :: interp_bulk_frc, check_bulk_frc_units
     namelist /forcing_files/ frcfiles, frcfile
-    namelist /surf_frc_settings/ interp_flux_frc, interp_bulk_frc, check_bulk_frc_units, sflx_corr
+    namelist /surf_frc_settings/ interp_flux_frc, interp_bulk_frc, check_bulk_frc_units, sflx_corr, &
+                                 qcorrection, cflx_corr
     namelist /sss_correction/ dsssdt
+    namelist /sst_correction/ dsstdt
+    namelist /dic_alk_correction/ dcdt
     namelist /flux_frc_settings/ interp_flux_frc
     namelist /bulk_frc_settings/ interp_bulk_frc, check_bulk_frc_units
     real(rp) :: gamma2
@@ -186,9 +212,24 @@ contains
       write(*,*) 'SSS_CORRECTION: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
+    rewind(unit)
+    read(unit, nml=sst_correction, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'SST_CORRECTION: ', trim(iomsg_text(msg))
+      error stop 'read_forcing_namelist'
+    endif
+    rewind(unit)
+    read(unit, nml=dic_alk_correction, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'DIC_ALK_CORRECTION: ', trim(iomsg_text(msg))
+      error stop 'read_forcing_namelist'
+    endif
     ! In single precision, as the CPU (surf_flux.F90: default-real dSSSdt, read from the
     ! namelist, then dSSSdt / (100.*86400.)): about -3.6e-8 relative to the double value.
+    ! The same for dSSTdt and dCdt.
     dsssdt_ms = real(real(dsssdt, 4) / (100.0_4 * 86400.0_4), rp)
+    dsstdt_ms = real(real(dsstdt, 4) / (100.0_4 * 86400.0_4), rp)
+    dcdt_ms = real(real(dcdt, 4) / (100.0_4 * 86400.0_4), rp)
     ! Closed walls: the GPU has free slip only (obc.F90 gamma2 = 1, as the CPU default).
     gamma2 = 1.0_rp
     rewind(unit)
@@ -245,9 +286,32 @@ contains
         if (.not. s_sss%ready) error stop 'sflx_corr: sss / sss_time not found in the forcing files'
         write(*,'(a,f8.3,a,es12.4,a)') 'SSS restoring on: dSSSdt =', dsssdt, ' cm/day (', dsssdt_ms, ' m/s)'
       endif
+      ! QCORRECTION: sea-surface temperature restoring data
+      if (.not. allocated(sst)) allocate(sst(decomp%is:decomp%ie, decomp%js:decomp%je))
+      sst = 0.0_rp
+      if (qcorrection) then
+        call bind_series(s_sst, 'sst', 'sst_time', 'r')
+        if (.not. s_sst%ready) error stop 'qcorrection: sst / sst_time not found in the forcing files'
+        write(*,'(a,f8.3,a,es12.4,a)') 'SST restoring on: dSSTdt =', dsstdt, ' cm/day (', dsstdt_ms, ' m/s)'
+      endif
+      ! CFLX_CORR: sea-surface DIC and ALK restoring data (the tracers: init_cflx_corr)
+      if (.not. allocated(sdic)) allocate(sdic(decomp%is:decomp%ie, decomp%js:decomp%je), &
+                                          salk(decomp%is:decomp%ie, decomp%js:decomp%je))
+      sdic = 0.0_rp; salk = 0.0_rp
+      if (cflx_corr) then
+        call bind_series(s_sdic, 'sDIC', 'sDIC_time', 'r')
+        call bind_series(s_salk, 'sALK', 'sALK_time', 'r')
+        if (.not. (s_sdic%ready .and. s_salk%ready)) &
+          error stop 'cflx_corr: sDIC / sDIC_time or sALK / sALK_time not found in the forcing files'
+        write(*,'(a,f8.3,a,es12.4,a)') 'DIC/ALK restoring on: dCdt =', dcdt, ' cm/day (', dcdt_ms, ' m/s)'
+      endif
+      call warn_unused_restoring()
       return
     endif
     if (sflx_corr) error stop 'sflx_corr needs bulk forcing (as roms_bugfix SFLX_CORR with BULK_FRC)'
+    if (qcorrection) error stop 'qcorrection needs bulk forcing (as roms_bugfix QCORRECTION with BULK_FRC)'
+    if (cflx_corr) error stop 'cflx_corr needs bulk forcing (as roms_bugfix CFLX_CORR with BULK_FRC)'
+    call warn_unused_restoring()
     nmiss = 0
     if (s_uwnd%ready .or. s_vwnd%ready .or. s_tair%ready .or. s_qair%ready) then
       if (.not. s_uwnd%ready) nmiss = nmiss + 1
@@ -268,7 +332,6 @@ contains
   end subroutine init_forcing
 
   subroutine set_forces()
-    integer(ip) :: i, j
     real(rp) :: tneed
     logical, save :: logged_bulk = .false.
     if (have_bulk) then
@@ -282,6 +345,11 @@ contains
       call advance_series(s_lwrad, tneed)
       call advance_series(s_bswrad, tneed)
       if (sflx_corr) call advance_series(s_sss, tneed)
+      if (qcorrection) call advance_series(s_sst, tneed)
+      if (cflx_corr) then
+        call advance_series(s_sdic, tneed)
+        call advance_series(s_salk, tneed)
+      endif
       call frc_batch_flush()
       call fill_r(s_uwnd, tneed, uwnd)
       call fill_r(s_vwnd, tneed, vwnd)
@@ -305,7 +373,17 @@ contains
         logged_bulk = .true.
       endif
       if (sflx_corr) call fill_r(s_sss, tneed, sss)
-      call calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad_in, sflx_corr, dsssdt_ms, sss)
+      if (qcorrection) call fill_r(s_sst, tneed, sst)
+      call calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad_in, sflx_corr, dsssdt_ms, sss, &
+                           qcorrection, dsstdt_ms, sst)
+      if (cflx_corr) then
+        ! the passive corrector applies them (the one surface-flux array
+        ! with CDR_LITE's, cdrl_psf); from the predicted state at n+1/2,
+        ! as the CPU's set_forces before step3d_t
+        call fill_r(s_sdic, tneed, sdic)
+        call fill_r(s_salk, tneed, salk)
+        call calc_cflx_corr(tp, ntp, nrhs, cdrl_psf, sdic, salk, dcdt_ms, ic_dic, ic_dica, ic_alk, ic_alka)
+      endif
       return
     endif
     if (.not. have_flux) return
@@ -317,24 +395,24 @@ contains
     call advance_series(s_swflx, tneed)
     call advance_series(s_swrad, tneed)
     call frc_batch_flush()
+    ! The unit conversions are kernels, stream-ordered after the fill
+    ! kernels and before the step's later readers of these fields (host
+    ! statements on the managed arrays here raced with both). Each is the
+    ! same single IEEE operation as the former host statement.
     call fill_u(s_sustr, tneed, sustr)
     call fill_v(s_svstr, tneed, svstr)
     call fill_r(s_shflx, tneed, stflx(:,:,itemp))
-    sustr = sustr / rho0_case
-    svstr = svstr / rho0_case
-    do j = decomp%js, decomp%je
-      do i = decomp%is, decomp%ie
-        stflx(i, j, itemp) = stflx(i, j, itemp) / (rho0_case * Cp)
-        stflx(i, j, isalt) = 0.0_rp
-      enddo
-    enddo
+    call divide_2d(sustr, rho0_case)
+    call divide_2d(svstr, rho0_case)
+    call divide_2d(stflx(:,:,itemp), rho0_case * Cp)
+    call set_2d(stflx(:,:,isalt), 0.0_rp)
     if (s_swflx%ready) then
       call fill_r(s_swflx, tneed, swflx)
-      swflx = -swflx * cmday2ms
+      call scale_2d(swflx, -cmday2ms)        ! = -swflx * cmday2ms, bitwise
     endif
     if (s_swrad%ready) then
       call fill_r(s_swrad, tneed, srflx)
-      srflx = srflx / (rho0_case * Cp)
+      call divide_2d(srflx, rho0_case * Cp)
     endif
   end subroutine set_forces
 
@@ -488,16 +566,12 @@ contains
         call nc_forcing_layout(ncid, vname, tname, nxi, neta, nrec, tax)
         ntot = ntot + max(nrec, 1)
         if (s%n1 == 0) then
-          s%n1 = nxi; s%n2 = neta; s%time_axis = tax
-          ! a field on the global model grid: this tile reads only its window
-          if ((gtype == 'r' .and. nxi == decomp%gnx + 2 .and. neta == decomp%gny + 2) .or. &
-              (gtype == 'u' .and. nxi == decomp%gnx + 1 .and. neta == decomp%gny) .or. &
-              (gtype == 'v' .and. nxi == decomp%gnx .and. neta == decomp%gny + 1) .or. &
-              (gtype == 'r' .and. nxi == decomp%gnx .and. neta == decomp%gny)) then
-            s%n1 = nxi - int(decomp%gnx) + int(decomp%nx)
-            s%n2 = neta - int(decomp%gny) + int(decomp%ny)
-            s%fi0 = int(decomp%i0); s%fj0 = int(decomp%j0)
-          endif
+          s%time_axis = tax
+          call classify_layout(s, gtype, nxi, neta, case_frcfiles(i))
+        elseif (nxi /= s%fn1 .or. neta /= s%fn2) then
+          write(*,'(3a,2(i0,a),2a,2(i0,a))') 'bind_series: ', trim(vname), ' is ', nxi, ' x ', neta, &
+               ' (xi x eta) in ', trim(case_frcfiles(i)), ' but ', s%fn1, ' x ', s%fn2, ' in an earlier file'
+          error stop 'bind_series: forcing variable with different shapes in different files'
         endif
       endif
     enddo
@@ -569,6 +643,59 @@ contains
     if (first_bind) call wall_stamp('bound '//trim(vname))
     first_bind = .false.
   end subroutine bind_series
+
+  subroutine classify_layout(s, gtype, nxi, neta, path)
+    ! The layout of a forcing field from its file shape (xi x eta), as the
+    ! CPU reads it (roms_read_write fill_frc_slice_surf):
+    !   on the model grid, read window by window:
+    !     r: xi_rho x eta_rho = (gnx+2) x (gny+2), or the interior gnx x gny
+    !     u: xi_u x eta_rho   = (gnx+1) x (gny+2), or (gnx+1) x gny
+    !     v: xi_rho x eta_v   = (gnx+2) x (gny+1), or gnx x (gny+1)
+    !   2x coarse (the CPU's interp_*_frc inputs; gxc = gnx/2, gyc = gny/2):
+    !     r: (gxc+2) x (gyc+2), u: (gxc+1) x (gyc+2), v: (gxc+2) x (gyc+1)
+    ! Any other shape stops the run.
+    type(series2d),   intent(inout) :: s
+    character(len=*), intent(in)    :: gtype, path
+    integer,          intent(in)    :: nxi, neta
+    integer :: gx, gy, gxc, gyc
+    gx = int(decomp%gnx); gy = int(decomp%gny)
+    gxc = gx / 2; gyc = gy / 2
+    s%fn1 = nxi; s%fn2 = neta
+    s%lay = LAY_GRID
+    s%fi0 = int(decomp%i0); s%fj0 = int(decomp%j0)
+    if (gtype == 'r' .and. nxi == gx + 2 .and. neta == gy + 2) then
+      s%li0 = 0; s%lj0 = 0
+    elseif (gtype == 'r' .and. nxi == gx .and. neta == gy) then
+      s%li0 = 1; s%lj0 = 1
+    elseif (gtype == 'u' .and. nxi == gx + 1 .and. neta == gy + 2) then
+      s%li0 = 1; s%lj0 = 0
+    elseif (gtype == 'u' .and. nxi == gx + 1 .and. neta == gy) then
+      s%li0 = 1; s%lj0 = 1
+    elseif (gtype == 'v' .and. nxi == gx + 2 .and. neta == gy + 1) then
+      s%li0 = 0; s%lj0 = 1
+    elseif (gtype == 'v' .and. nxi == gx .and. neta == gy + 1) then
+      s%li0 = 1; s%lj0 = 1
+    elseif ((gtype == 'r' .and. nxi == gxc + 2 .and. neta == gyc + 2) .or. &
+            (gtype == 'u' .and. nxi == gxc + 1 .and. neta == gyc + 2) .or. &
+            (gtype == 'v' .and. nxi == gxc + 2 .and. neta == gyc + 1)) then
+      s%lay = LAY_COARSE
+      s%fi0 = 1; s%fj0 = 1
+      s%n1 = nxi; s%n2 = neta
+      if (comm_rank() == 0) write(*,'(3a,2(i0,a))') 'forcing ', trim(s%vname), ': 2x-coarse input (', nxi, ' x ', &
+           neta, '), interpolated to the model grid'
+      return
+    else
+      write(*,'(5a,2(i0,a))') 'bind_series: ', trim(s%vname), ' (', gtype, '-point) has the shape ', nxi, ' x ', neta, &
+           ' (xi x eta) in '//trim(path)
+      write(*,'(a,2(i0,a))') '  the model grid is LLm x MMm = ', gx, ' x ', gy, '; accepted shapes:'
+      write(*,'(a,6(i0,a))') '  rho: ', gx + 2, ' x ', gy + 2, ' or ', gx, ' x ', gy, ', 2x coarse ', gxc + 2, ' x ', gyc + 2
+      write(*,'(a,6(i0,a))') '  u:   ', gx + 1, ' x ', gy + 2, ' or ', gx + 1, ' x ', gy, ', 2x coarse ', gxc + 1, ' x ', gyc + 2
+      write(*,'(a,6(i0,a))') '  v:   ', gx + 2, ' x ', gy + 1, ' or ', gx, ' x ', gy + 1, ', 2x coarse ', gxc + 2, ' x ', gyc + 1
+      error stop 'bind_series: forcing field shape matches neither the model grid nor the 2x-coarse grid'
+    endif
+    s%n1 = nxi - gx + int(decomp%nx)
+    s%n2 = neta - gy + int(decomp%ny)
+  end subroutine classify_layout
 
   subroutine sort_catalog(s)
     type(series2d), intent(inout) :: s
@@ -882,6 +1009,9 @@ contains
     call pf_add(s_lwrad, 6, cand, n)
     call pf_add(s_bswrad, 7, cand, n)
     call pf_add(s_sss, 8, cand, n)
+    call pf_add(s_sst, 20, cand, n)
+    call pf_add(s_sdic, 21, cand, n)
+    call pf_add(s_salk, 22, cand, n)
     call pf_add(s_sustr, 9, cand, n)
     call pf_add(s_svstr, 10, cand, n)
     call pf_add(s_shflx, 11, cand, n)
@@ -956,8 +1086,60 @@ contains
     call pf_drain(s_svstr); call pf_drain(s_shflx); call pf_drain(s_swflx)
     call pf_drain(s_swrad); call pf_drain(s_dust);  call pf_drain(s_iron)
     call pf_drain(s_nox);   call pf_drain(s_nhy);   call pf_drain(s_xco2)
-    call pf_drain(s_xco2a)
+    call pf_drain(s_xco2a); call pf_drain(s_sst);   call pf_drain(s_sdic)
+    call pf_drain(s_salk)
   end subroutine frc_prefetch_drain
+
+  subroutine init_cflx_corr()
+    ! CFLX_CORR: the passive indices of DIC, DIC_ALT_CO2, ALK and
+    ! ALK_ALT_CO2 (MARBL), and the passive surface-flux array at full size.
+    ! After init_cdr_lite (which sizes cdrl_psf for CDR_LITE).
+    integer(ip) :: m
+    if (.not. cflx_corr) return
+    ic_dic = 0; ic_dica = 0; ic_alk = 0; ic_alka = 0
+    do m = 1, n_marbl
+      select case (trim(passive_name(m)))
+      case ('DIC'); ic_dic = m
+      case ('DIC_ALT_CO2'); ic_dica = m
+      case ('ALK'); ic_alk = m
+      case ('ALK_ALT_CO2'); ic_alka = m
+      end select
+    enddo
+    if (ic_dic == 0 .or. ic_dica == 0 .or. ic_alk == 0 .or. ic_alka == 0) &
+      error stop 'cflx_corr needs the MARBL tracers DIC, DIC_ALT_CO2, ALK and ALK_ALT_CO2 (as roms_bugfix CFLX_CORR with MARBL)'
+    call cdrl_psf_full(ntp)
+    psf_cflx = .true.
+    if (comm_rank() == 0) write(*,'(a,4(1x,i0))') 'cflx_corr: passive DIC, DIC_ALT_CO2, ALK, ALK_ALT_CO2 =', &
+         ic_dic, ic_dica, ic_alk, ic_alka
+  end subroutine init_cflx_corr
+
+  subroutine warn_unused_restoring()
+    ! Restoring data in the forcing files with its switch off: a CPU case
+    ! built with the cpp key would restore, the GPU would not (the GPU
+    ! cannot see cpp keys). Warn, as the data alone do not prove the key.
+    ! The variable names are the CPU's (surf_flux.F90; a flux file's
+    ! upper-case SST/SSS are not restoring data).
+    if (comm_rank() /= 0) return
+    if (.not. sflx_corr .and. frc_has_var('sss')) write(*,'(a)') &
+      'WARNING: the forcing files hold sss (SSS restoring data) but &surf_frc_settings sflx_corr is off'
+    if (.not. qcorrection .and. frc_has_var('sst')) write(*,'(a)') &
+      'WARNING: the forcing files hold sst (SST restoring data) but &surf_frc_settings qcorrection is off'
+    if (.not. cflx_corr .and. (frc_has_var('sDIC') .or. frc_has_var('sALK'))) write(*,'(a)') &
+      'WARNING: the forcing files hold sDIC/sALK (DIC/ALK restoring data) but &surf_frc_settings cflx_corr is off'
+  end subroutine warn_unused_restoring
+
+  logical function frc_has_var(name)
+    ! Whether any forcing file has the variable (handles of the init cache).
+    character(len=*), intent(in) :: name
+    integer :: i
+    frc_has_var = .false.
+    do i = 1, case_nfrc
+      if (nc_has_var(frc_file_ncid(i), name)) then
+        frc_has_var = .true.
+        return
+      endif
+    enddo
+  end function frc_has_var
 
   subroutine pf_drain(s)
     type(series2d), intent(inout) :: s
@@ -1086,96 +1268,126 @@ contains
     real(rp),       intent(in)    :: tneed
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
     logical, optional, intent(in) :: keep_nan
-    real(rp) :: c1, c2
-    real(rp), allocatable :: tmp(:,:)
-    integer :: i0, j0
     logical :: kn
-    if (.not. s%ready) return
     kn = .false.
     if (present(keep_nan)) kn = keep_nan
-    call advance_series(s, tneed)
-    call weights(s, tneed, c1, c2)
-    if (on_grid(s%n1, s%n2, 'r', i0, j0)) then
-      if (kn) then
-        call interp_on_grid_nan(s%buf, s%n1, s%n2, c1, c2, dest, i0, j0)
-      else
-        call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, i0, j0)
-      endif
-    else
-      allocate(tmp(s%n1, s%n2))
-      call sync_arch()
-      tmp = c1 * s%buf(:,:,1) + c2 * s%buf(:,:,2)
-      if (.not. kn) where (is_nan(tmp)) tmp = 0.0_rp
-      call map_field(tmp, s%n1, s%n2, dest, 'r')
-    endif
+    call fill_any(s, tneed, dest, 'r', kn)
   end subroutine fill_r
 
   subroutine fill_u(s, tneed, dest)
     type(series2d), intent(inout), target :: s
     real(rp),       intent(in)    :: tneed
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
-    real(rp) :: c1, c2
-    real(rp), allocatable :: tmp(:,:)
-    integer :: i0, j0
-    if (.not. s%ready) return
-    call advance_series(s, tneed)
-    call weights(s, tneed, c1, c2)
-    if (on_grid(s%n1, s%n2, 'u', i0, j0)) then
-      call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, i0, j0)
-    else
-      allocate(tmp(s%n1, s%n2))
-      call sync_arch()
-      tmp = c1 * s%buf(:,:,1) + c2 * s%buf(:,:,2)
-      where (is_nan(tmp)) tmp = 0.0_rp
-      call map_field(tmp, s%n1, s%n2, dest, 'u')
-    endif
+    call fill_any(s, tneed, dest, 'u', .false.)
   end subroutine fill_u
 
   subroutine fill_v(s, tneed, dest)
     type(series2d), intent(inout), target :: s
     real(rp),       intent(in)    :: tneed
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
+    call fill_any(s, tneed, dest, 'v', .false.)
+  end subroutine fill_v
+
+  subroutine fill_any(s, tneed, dest, gtype, kn)
+    ! The field at tneed on the model grid, by a device kernel: a field on
+    ! the grid (any of the layouts of classify_layout) over this tile's
+    ! window; a 2x-coarse field interpolated to every point of the tile.
+    type(series2d), intent(inout), target :: s
+    real(rp),       intent(in)    :: tneed
+    real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
+    character(len=1), intent(in)  :: gtype
+    logical,        intent(in)    :: kn
     real(rp) :: c1, c2
-    real(rp), allocatable :: tmp(:,:)
-    integer :: i0, j0
     if (.not. s%ready) return
     call advance_series(s, tneed)
     call weights(s, tneed, c1, c2)
-    if (on_grid(s%n1, s%n2, 'v', i0, j0)) then
-      call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, i0, j0)
+    if (s%lay == LAY_GRID) then
+      if (kn) then
+        call interp_on_grid_nan(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0)
+      else
+        call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0)
+      endif
     else
-      allocate(tmp(s%n1, s%n2))
-      call sync_arch()
-      tmp = c1 * s%buf(:,:,1) + c2 * s%buf(:,:,2)
-      where (is_nan(tmp)) tmp = 0.0_rp
-      call map_field(tmp, s%n1, s%n2, dest, 'v')
+      call interp_coarse(s%buf, s%n1, s%n2, c1, c2, dest, gtype, kn)
     endif
-  end subroutine fill_v
+  end subroutine fill_any
 
-  logical function on_grid(n1, n2, gtype, i0, j0)
-    ! The file field is on the model stencil (the direct-copy cases of
-    ! map_field): dest(i0+i-1, j0+j-1) = src(i, j).
-    integer,          intent(in)  :: n1, n2
-    character(len=*), intent(in)  :: gtype
-    integer,          intent(out) :: i0, j0
-    on_grid = .true.
-    i0 = 1; j0 = 1
-    if (gtype == 'r' .and. n1 == decomp%nx + 2 .and. n2 == decomp%ny + 2) then
-      i0 = 0; j0 = 0
-    elseif (gtype == 'r' .and. n1 == decomp%nx .and. n2 == decomp%ny) then
-      continue
-    elseif (gtype == 'u' .and. n1 == decomp%nx + 1 .and. n2 == decomp%ny) then
-      continue
-    elseif (gtype == 'v' .and. n1 == decomp%nx .and. n2 == decomp%ny + 1) then
-      continue
-    else
-      on_grid = .false.
+  subroutine interp_coarse(b, n1, n2, c1, c2, dest, gtype, kn)
+    ! A 2x-coarse field (two buffered records b(:,:,1:2), the whole file
+    ! extent) on this tile, as the CPU (roms_read_write coarse2fine, then
+    ! set_frc_data's time interpolation): each record is interpolated
+    ! bilinearly to the fine point from its GLOBAL index, then the two are
+    ! combined in time. With gi the global fine index (local i + i0 - 1):
+    !   rho: coarse index 0.5 gi + 0.25 (file index 1 = coarse rho 0)
+    !   u (xi) / v (eta): 0.5 gi + 0.5 (file index 1 = coarse u/v 1)
+    ! The weights are exact (multiples of 1/4), so the result does not
+    ! depend on the tiling. Coarse points beyond the file extent (the last
+    ! fine row of an odd LLm / MMm, and the u/v end faces) count as 0, as
+    ! the CPU's zero-initialized coarse buffer; NaN propagates as on the
+    ! CPU and becomes 0 at the end unless kn (keep NaN).
+    ! Filled: rho i = 0:nx+1, j = 0:ny+1; u i = 1:nx+1, j = 0:ny+1;
+    ! v i = 0:nx+1, j = 1:ny+1 (the standard on-grid windows).
+    integer,          intent(in) :: n1, n2
+    real(rp), WORK_ATTR intent(in) :: b(n1, n2, 2)
+    real(rp),         intent(in) :: c1, c2
+    real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
+    character(len=1), intent(in) :: gtype
+    logical,          intent(in) :: kn
+    integer :: i, j, ib, jb, ie, je, gi0, gj0, ox, oy, ic, jc
+    real(rp) :: xo, yo, xg, yg, xl, yl
+    real(rp) :: a00, a10, a01, a11, q00, q10, q01, q11, f1, f2, x
+    logical :: in0, in1, jn0, jn1
+    ib = 0; jb = 0; xo = 0.25_rp; yo = 0.25_rp; ox = 1; oy = 1
+    if (gtype == 'u') then
+      ib = 1; xo = 0.5_rp; ox = 0
+    elseif (gtype == 'v') then
+      jb = 1; yo = 0.5_rp; oy = 0
     endif
-  end function on_grid
+    ie = int(decomp%nx) + 1; je = int(decomp%ny) + 1
+    gi0 = int(decomp%i0) - 1; gj0 = int(decomp%j0) - 1
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = jb, je
+      do i = ib, ie
+        xg = 0.5_rp * real(i + gi0, rp) + xo
+        yg = 0.5_rp * real(j + gj0, rp) + yo
+        ic = floor(xg)
+        jc = floor(yg)
+        xl = xg - real(ic, rp)
+        yl = yg - real(jc, rp)
+        ic = ic + ox
+        jc = jc + oy
+        in0 = (ic >= 1 .and. ic <= n1)
+        in1 = (ic + 1 >= 1 .and. ic + 1 <= n1)
+        jn0 = (jc >= 1 .and. jc <= n2)
+        jn1 = (jc + 1 >= 1 .and. jc + 1 <= n2)
+        a00 = 0.0_rp; a10 = 0.0_rp; a01 = 0.0_rp; a11 = 0.0_rp
+        q00 = 0.0_rp; q10 = 0.0_rp; q01 = 0.0_rp; q11 = 0.0_rp
+        if (in0 .and. jn0) then
+          a00 = b(ic, jc, 1); q00 = b(ic, jc, 2)
+        endif
+        if (in1 .and. jn0) then
+          a10 = b(ic + 1, jc, 1); q10 = b(ic + 1, jc, 2)
+        endif
+        if (in0 .and. jn1) then
+          a01 = b(ic, jc + 1, 1); q01 = b(ic, jc + 1, 2)
+        endif
+        if (in1 .and. jn1) then
+          a11 = b(ic + 1, jc + 1, 1); q11 = b(ic + 1, jc + 1, 2)
+        endif
+        f1 = (1.0_rp - yl) * ((1.0_rp - xl) * a00 + xl * a10) + yl * ((1.0_rp - xl) * a01 + xl * a11)
+        f2 = (1.0_rp - yl) * ((1.0_rp - xl) * q00 + xl * q10) + yl * ((1.0_rp - xl) * q01 + xl * q11)
+        x = c1 * f1 + c2 * f2
+        if (.not. kn .and. x /= x) x = 0.0_rp
+        dest(i, j) = x
+      enddo
+    enddo
+  end subroutine interp_coarse
 
   subroutine interp_on_grid(b, n1, n2, c1, c2, dest, i0, j0)
     ! Device time interpolation of two buffered records onto the grid,
-    ! NaN (missing) -> 0, as the host tmp/where/map_field path.
+    ! NaN (missing) -> 0.
     integer,  intent(in) :: n1, n2, i0, j0
     real(rp), WORK_ATTR intent(in) :: b(n1, n2, 2)
     real(rp), intent(in) :: c1, c2
@@ -1372,101 +1584,6 @@ contains
       enddo
     enddo
   end subroutine divide_2d
-
-  subroutine map_field(src, n1, n2, dest, gtype)
-    integer,          intent(in)    :: n1, n2
-    real(rp),         intent(in)    :: src(n1, n2)
-    real(rp),         intent(inout) :: dest(decomp%is:, decomp%js:)
-    character(len=*), intent(in)    :: gtype
-    integer :: i0, j0, nxi, neta, i, j
-    real(rp), allocatable :: fine(:,:)
-
-    if (gtype == 'u') then
-      nxi = decomp%nx + 1; neta = decomp%ny
-    elseif (gtype == 'v') then
-      nxi = decomp%nx; neta = decomp%ny + 1
-    else
-      nxi = decomp%nx + 2; neta = decomp%ny + 2
-    endif
-
-    ! File on the LLm+2 rho / matching u,v stencil.
-    if (gtype == 'r' .and. n1 == decomp%nx + 2 .and. n2 == decomp%ny + 2) then
-      dest(0:decomp%nx+1, 0:decomp%ny+1) = src
-      return
-    endif
-    if (gtype == 'r' .and. n1 == decomp%nx .and. n2 == decomp%ny) then
-      dest(1:decomp%nx, 1:decomp%ny) = src
-      return
-    endif
-    if (gtype == 'u' .and. n1 == decomp%nx + 1 .and. n2 == decomp%ny) then
-      dest(1:decomp%nx+1, 1:decomp%ny) = src
-      return
-    endif
-    if (gtype == 'v' .and. n1 == decomp%nx .and. n2 == decomp%ny + 1) then
-      dest(1:decomp%nx, 1:decomp%ny+1) = src
-      return
-    endif
-
-    ! 2x coarse (standalone flux file).
-    allocate(fine(nxi, neta))
-    call upsample2(src, n1, n2, fine, nxi, neta, gtype)
-    if (gtype == 'r') then
-      i0 = 0; j0 = 0
-      if (nxi == decomp%nx) then
-        i0 = 1; j0 = 1
-      endif
-      do j = 1, neta
-        do i = 1, nxi
-          dest(i0 + i - 1, j0 + j - 1) = fine(i, j)
-        enddo
-      enddo
-    elseif (gtype == 'u') then
-      dest(1:nxi, 1:neta) = fine
-    else
-      dest(1:nxi, 1:neta) = fine
-    endif
-    deallocate(fine)
-  end subroutine map_field
-
-  subroutine upsample2(c, ncx, ncy, f, nfx, nfy, gtype)
-    integer,          intent(in)  :: ncx, ncy, nfx, nfy
-    real(rp),         intent(in)  :: c(ncx, ncy)
-    real(rp),         intent(out) :: f(nfx, nfy)
-    character(len=*), intent(in)  :: gtype
-    integer :: i, j, ic, jc
-    real(rp) :: xl, yl, xi, yj
-    do j = 1, nfy
-      do i = 1, nfx
-        if (gtype == 'u') then
-          xi = 0.5_rp * real(i, rp) + 0.5_rp
-          yj = 0.5_rp * real(j, rp) + 0.25_rp
-        elseif (gtype == 'v') then
-          xi = 0.5_rp * real(i, rp) + 0.25_rp
-          yj = 0.5_rp * real(j, rp) + 0.5_rp
-        else
-          xi = 0.5_rp * real(i, rp) + 0.25_rp
-          yj = 0.5_rp * real(j, rp) + 0.25_rp
-        endif
-        ic = max(1, min(ncx - 1, int(floor(xi))))
-        jc = max(1, min(ncy - 1, int(floor(yj))))
-        xl = xi - real(ic, rp)
-        yl = yj - real(jc, rp)
-        xl = min(1.0_rp, max(0.0_rp, xl))
-        yl = min(1.0_rp, max(0.0_rp, yl))
-        f(i, j) = (1.0_rp - yl) * ((1.0_rp - xl) * nan0(c(ic, jc)) + xl * nan0(c(ic + 1, jc))) + &
-                  yl * ((1.0_rp - xl) * nan0(c(ic, jc + 1)) + xl * nan0(c(ic + 1, jc + 1)))
-      enddo
-    enddo
-  end subroutine upsample2
-
-  real(rp) function nan0(x)
-    real(rp), intent(in) :: x
-    if (is_nan(x)) then
-      nan0 = 0.0_rp
-    else
-      nan0 = x
-    endif
-  end function nan0
 
   function find_var_file(vname, tname) result(path)
     character(len=*), intent(in) :: vname

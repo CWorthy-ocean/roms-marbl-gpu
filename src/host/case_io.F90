@@ -9,10 +9,10 @@ module case_io
   use nc_io
   use host_buf, only: host_read_2d, host_read_3d
   use par_read, only: pr_begin, pr_flush, pr_take, pr_end, pr_taking, pr_store_2d, pr_store_3d, pr_store_3d_pt
-  use frc_io, only: read_forcing_namelist, init_forcing, set_forces, close_frc_cache
+  use frc_io, only: read_forcing_namelist, init_forcing, set_forces, close_frc_cache, init_cflx_corr
   use bry_io, only: init_bry, set_bry_all
   use tide_io, only: read_tide_namelist, init_tides, set_tides
-  use river_io, only: read_river_namelist, init_rivers
+  use river_io, only: read_river_namelist, init_rivers, set_rivers
   use cdr_io, only: read_cdr_namelist, init_cdr
   use cdr_lite_io, only: read_cdr_lite_namelist, init_cdr_lite
   use cdr_lite_out, only: read_cdr_lite_output_namelist, set_cdr_lite_output_root, init_cdr_lite_output
@@ -24,6 +24,7 @@ module case_io
   use avg_out, only: read_avg_namelist, set_avg_root, init_avg_output
   use extract_out, only: read_extract_namelist, init_extract
   use comm_mod, only: comm_rank, comm_size, comm_min_real
+  use arch_mod, only: sync_arch
   use tile_balance, only: balance_cuts, uniform_cuts
   use halo_mod, only: halo_fill_2d, halo_fill_2d_s, halo_fill_3d_s, halo_fill_3d_t, halo_fill_3d_tp
   use formulas, only: rho0_eos => rho0
@@ -596,6 +597,10 @@ contains
     call sanitize_land()
     call pad_physical_halo()
     call fill_static_halos()
+    ! setup_metrics, the mask builders and build_tp_columns are host loops
+    ! over pm/pn/h/rmask: wait for the sanitize/pad kernels (on one tile
+    ! without neighbours no halo exchange synchronizes them).
+    call sync_arch()
     call setup_metrics()
     call fill_metric_halos()
     call build_wet_list()
@@ -669,10 +674,12 @@ contains
     call init_cdr(case_grdname)       ! CDR releases (passive list and columns final)
     call wall_stamp('cdr init')
     call init_cdr_lite()              ! CDR_LITE surface forcing (binds forcing series)
+    call init_cflx_corr()             ! CFLX_CORR tracers (after init_cdr_lite sizes cdrl_psf)
     call wall_stamp('cdr_lite init')
     call close_frc_cache()
     frc_slot = 0
     call set_forces()
+    call set_rivers(0)                ! river volume at time n for set_HUV (CPU: set_forces)
     call set_bry_all()
     call set_tides()
     ! The CPU's start-up diagnostics before its initial history record

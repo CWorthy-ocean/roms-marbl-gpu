@@ -10,6 +10,7 @@ module geom
   use halo_mod
   use arch_mod, only: sync_arch
   use cdr_src_mod, only: cdr_vol_on, cdr_cmap, cd_vol, cq_w, cc_p0, cq_rel
+  use rivers_mod, only: river_on, rivers_huv
   implicit none
   private
 
@@ -125,6 +126,8 @@ contains
         enddo
       enddo
     enddo
+    ! river faces: the river transport at time n (CPU 2805cbef)
+    if (river_on) call rivers_huv(1_ip, nx + 1, j_u0, j_u1, i_v0, i_v1, 1_ip, ny + 1)
     call hg_begin()
     call hg_add(F_FLXU)
     call hg_add(F_FLXV)
