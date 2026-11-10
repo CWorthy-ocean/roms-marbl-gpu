@@ -28,6 +28,16 @@
 # while its switch is off gives a start-up warning. The restoring-flux
 # output (&surf_flx_output_settings wrt_rstflx) is not on the GPU.
 #
+# Pressure fluxes for nesting: &calc_pflx_settings calc_pflx and
+# pflx_timescale as UCLA ROMS (the group is optional here; absent means
+# off). UCLA ROMS computes up/vp only when built with the DIAGNOSTICS cpp
+# key; roms_gpu computes them whenever calc_pflx = .true., with the
+# internal-tide pressure of ucla-roms eae883ee, writes up_<side>/vp_<side>
+# to the child boundary file for objects whose output_vars name them, and
+# keeps u_slow, v_slow, p_slow in the restart. pflx_timescale must be > 0
+# when calc_pflx is on (the run stops otherwise). The child side
+# (&sponge_tune_settings ub_tune, SPONGE_TUNE) is not on the GPU.
+#
 # Half-resolution forcing: interp_bulk_frc, interp_flux_frc
 # (&surf_frc_settings) and interp_bgc_frc (&bgc_settings) are read but not
 # used; roms_gpu takes a forcing field as half resolution from its shape

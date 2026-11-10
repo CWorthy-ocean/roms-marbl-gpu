@@ -215,6 +215,17 @@ v0.1.2-beta, bit for bit.
   with an open boundary (first next to the boundary); closed and periodic
   runs are unchanged.
 
+## Changes after v0.1.3-beta
+
+- Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
+  depth-integrated internal-tide energy flux `up`/`vp` of the parent,
+  written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS
+  writes it, with the running means `u_slow`, `v_slow`, `p_slow` in the
+  restart. The pressure is the internal-tide pressure of Kelly, Nash and
+  Kunze (2010) (ucla-roms eae883ee), and the boundary values are taken by
+  index (ucla-roms 4b07d30e). The child-side sponge tuning (`ub_tune`) is
+  not ported.
+
 ## Numerics
 
 The GPU model implements one configuration of UCLA ROMS, the one in common
