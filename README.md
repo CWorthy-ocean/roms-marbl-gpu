@@ -9,7 +9,7 @@ model routine by routine, and the GPU model reads the same namelists and
 input files as [C]Worthy UCLA ROMS fork (v0.11.0). It is suitable for any standard application
 of the ROMS modeling system, as well as for the CDR applications.
 
-> **Experimental.** This is a beta release (v0.1.1-beta, October 2026). It
+> **Experimental.** This is a beta release (v0.1.3-beta, November 2026). It
 > has been checked carefully against the CPU model (see Validation below),
 > but it has had few users so far. It is not yet part of
 > [C-Star](https://github.com/CWorthy-ocean/C-Star), so it cannot yet be
@@ -174,7 +174,7 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
 script): 3 days of MiniPac, a small coarse Pacific test domain, with MARBL on one 4-GPU node. The input data are
 not included; its README lists the files.
 
-## Changes after v0.1.2-beta
+## Changes in v0.1.3-beta (since v0.1.2-beta)
 
 Ports of recent UCLA ROMS fixes and features, and fixes of GPU-only
 defects. Runs that use none of the items below give the same results as
