@@ -205,6 +205,15 @@ v0.1.2-beta, bit for bit.
   value per tracer, in UCLA ROMS's tracer order). Before, the GPU model
   ignored `tnu2` and diffused with the sponge ramp only. Runs with
   non-zero `tnu2` change and now match UCLA ROMS.
+- Open-boundary inflow: tracers entering through an open boundary carry
+  the boundary data. The horizontal tracer flux of an inflow face on an
+  open side gets the term 0.5*(t_boundary - t_interior)*inflow (before,
+  only upscaling runs had it), which makes the corrector's flux
+  first-order upwind from the boundary value; every tracer, predictor and
+  corrector, never at a periodic seam or a wall. This matches the same
+  change in UCLA ROMS (upwind-inflow-default). Answers change in every run
+  with an open boundary (first next to the boundary); closed and periodic
+  runs are unchanged.
 
 ## Numerics
 
