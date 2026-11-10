@@ -63,6 +63,7 @@ module his_io
   public :: read_output_namelist
   public :: read_refdate_namelist
   public :: output_fname
+  public :: output_period_rst   ! sponge_out: the CPU's file-length check
   public :: set_output_root
   public :: init_output
   public :: wrt_his

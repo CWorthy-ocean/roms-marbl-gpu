@@ -45,9 +45,11 @@
 # output_period_sponge (nrpf_sponge records per file): the child and parent
 # fluxes and the coefficient of every open side, averaged over the period
 # (sponge_avg) or of the output step, as UCLA ROMS with its fixes of
-# 2026-11 (sponge-tune-pio-fixes). The coefficients ub_west, ub_east,
-# ub_south, ub_north are restart fields, written after the step's tuning
-# (exact restarts), as in that version of UCLA ROMS.
+# 2026-11 (sponge-tune-pio-fixes). As UCLA ROMS's precheck, with restarts
+# and wrt_sponge on, nrpf_sponge * output_period_sponge must be positive
+# and divide output_period_rst (the run stops otherwise). The coefficients
+# ub_west, ub_east, ub_south, ub_north are restart fields, written after
+# the step's tuning (exact restarts), as in that version of UCLA ROMS.
 #
 # Half-resolution forcing: interp_bulk_frc, interp_flux_frc
 # (&surf_frc_settings) and interp_bgc_frc (&bgc_settings) are read but not

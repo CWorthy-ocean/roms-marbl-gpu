@@ -17,7 +17,7 @@ module sponge_out
   use gpu_state
   use time_state
   use nc_io
-  use his_io, only: output_fname, refdatestr
+  use his_io, only: output_fname, refdatestr, wrt_file_rst, output_period_rst
   use comm_mod, only: comm_rank, comm_reduce_sum
   use arch_mod, only: sync_arch
   use pflx_mod, only: ub_tune, wrt_sponge, nrpf_sponge, output_period_sponge
@@ -41,6 +41,7 @@ contains
   end subroutine set_spn_root
 
   subroutine init_spn_output()
+    call check_spn_divides_rst()
     on = ub_tune .and. wrt_sponge
     if (.not. on) return
     if (output_period_sponge <= 0.0_rp) error stop 'sponge_out: output_period_sponge must be > 0'
@@ -48,6 +49,35 @@ contains
     gx = int(decomp%gnx) + 2; gy = int(decomp%gny) + 2
     record = nrpf_sponge; output_time = 0.0_rp
   end subroutine init_spn_output
+
+  subroutine check_spn_divides_rst()
+    ! The CPU's precheck check_output_divides_rst for the sponge file: with
+    ! restarts and wrt_sponge on, nrpf_sponge * output_period_sponge must be
+    ! positive and evenly divide output_period_rst (a restart then never
+    ! leaves a partial _spn file). Same condition and message; stops.
+    real(8) :: newfile_freq
+    character(len=1024) :: info
+    if (.not. wrt_file_rst) return
+    if (.not. wrt_sponge) return
+    newfile_freq = real(nrpf_sponge, 8) * real(output_period_sponge, 8)
+    if (newfile_freq <= 0.0d0) then
+      write(info,*) 'sponge frequency = ', newfile_freq, '. Restart frequency = ', real(output_period_rst, 8), &
+           '. The frequency of writing the sponge file must be positive and evenly divide the restart frequency', &
+           ' (this prevents writing partial sponge files).'
+    elseif (mod(real(output_period_rst, 8), newfile_freq) /= 0.0d0) then
+      write(info,*) 'sponge frequency = ', newfile_freq, '. Restart frequency = ', real(output_period_rst, 8), &
+           '. The frequency of writing the sponge file must evenly divide the restart frequency', &
+           ' (this prevents writing partial sponge files).'
+    else
+      return
+    endif
+    if (comm_rank() == 0) then
+      write(*,'(a)') 'ERROR [precheck/check_output_divides_rst]:'
+      write(*,'(a)') trim(info)
+      flush(6)
+    endif
+    error stop 'sponge_out: nrpf_sponge * output_period_sponge must divide output_period_rst (see above)'
+  end subroutine check_spn_divides_rst
 
   logical function side_open(s)
     integer, intent(in) :: s
