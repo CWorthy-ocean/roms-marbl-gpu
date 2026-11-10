@@ -10,8 +10,9 @@ module feature_guard
   ! stop together; world rank 0 prints the report.
   !
   ! Switches that act on the CPU only together with a cpp key the GPU cannot
-  ! see (DIAGNOSTICS, SPONGE_TUNE) print a warning instead of stopping.
-  ! (&calc_pflx_settings calc_pflx is on the GPU: pflx_mod.)
+  ! see (DIAGNOSTICS) print a warning instead of stopping.
+  ! (&calc_pflx_settings calc_pflx is on the GPU: pflx_mod; &sponge_tune_settings
+  ! ub_tune: sponge_io.)
   use comm_mod, only: comm_world_rank
   implicit none
   private
@@ -62,10 +63,8 @@ contains
                  'momentum budget diagnostics (DIAGNOSTICS cpp key on the CPU) are not on the GPU')
     call warn_on('diagnostics_settings', 'diag_trc', &
                  'tracer budget diagnostics (DIAGNOSTICS cpp key on the CPU) are not on the GPU')
-    call warn_on('sponge_tune_settings', 'ub_tune', &
-                 'sponge tuning (SPONGE_TUNE cpp key on the CPU) is not on the GPU')
-    call warn_on('sponge_tune_settings', 'wrt_sponge', &
-                 'sponge tuning output (SPONGE_TUNE cpp key on the CPU) is not on the GPU')
+    ! sponge tuning (ub_tune) is on the GPU (sponge_io); its output is not
+    call need_off('sponge_tune_settings', 'wrt_sponge', 'sponge tuning output (_spn file)')
 
     if (talk .and. nerr + nwarn > 0) flush(6)
     deallocate(txt)

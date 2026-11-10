@@ -223,8 +223,14 @@ v0.1.2-beta, bit for bit.
   writes it, with the running means `u_slow`, `v_slow`, `p_slow` in the
   restart. The pressure is the internal-tide pressure of Kelly, Nash and
   Kunze (2010) (ucla-roms eae883ee), and the boundary values are taken by
-  index (ucla-roms 4b07d30e). The child-side sponge tuning (`ub_tune`) is
-  not ported.
+  index (ucla-roms 4b07d30e).
+- Sponge tuning for nested children (`&sponge_tune_settings ub_tune`, the
+  CPU's SPONGE_TUNE): the inflow nudging of the 3-D open boundary
+  conditions (velocity and every tracer) is tuned every step so that the
+  child's internal-tide energy flux next to each side follows the parent's
+  `up`/`vp` from the boundary files; needs `calc_pflx`. The coefficients
+  `ub_west`, `ub_east`, `ub_south`, `ub_north` are kept in the restart.
+  The tuning output (`wrt_sponge`) is not available.
 
 ## Numerics
 

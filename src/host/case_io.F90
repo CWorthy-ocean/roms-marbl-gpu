@@ -29,6 +29,9 @@ module case_io
   use halo_mod, only: halo_fill_2d, halo_fill_2d_s, halo_fill_3d_s, halo_fill_3d_t, halo_fill_3d_tp
   use formulas, only: rho0_eos => rho0
   use pflx_mod, only: calc_pflx, pflx_timescale, init_pflx, pflx_fill_slow_halos, u_slow, v_slow, p_slow
+  use pflx_mod, only: ub_tune, sponge_timescale, nrpf_sponge, output_period_sponge, wrt_sponge, sponge_avg, &
+                      init_sponge_tune
+  use sponge_io, only: load_rst_ub
   use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name, &
        passive_hold, set_cdr_lite, passive_finish_list, ncdr, tnu2_tp, n_marbl, cdr0, passive_mirror
   use marbl_gpu, only: marbl_gpu_init_diagnostics
@@ -115,6 +118,8 @@ contains
     real(rp) :: v_sponge
     namelist /v_sponge_settings/ v_sponge
     namelist /calc_pflx_settings/ calc_pflx, pflx_timescale
+    namelist /sponge_tune_settings/ sponge_timescale, nrpf_sponge, output_period_sponge, ub_tune, wrt_sponge, &
+                                    sponge_avg
 
     llm = 32; mmm = 32; nz = 0; n = 0
     np_xi = 1; np_eta = 1; nsub_x = 1; nsub_e = 1
@@ -173,6 +178,11 @@ contains
     rewind(unit); read(unit, nml=calc_pflx_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'CALC_PFLX_SETTINGS')
     if (ios /= 0) calc_pflx = .false.
+    ! child side: sponge tuning (optional group; absent: off)
+    ub_tune = .false.; wrt_sponge = .false.; sponge_avg = .false.
+    rewind(unit); read(unit, nml=sponge_tune_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'SPONGE_TUNE_SETTINGS')
+    if (ios /= 0) ub_tune = .false.
     call read_forcing_namelist(unit, nml_dir)
     call read_tide_namelist(unit)
     call read_refdate_namelist(unit)
@@ -603,6 +613,7 @@ contains
     call read_namelist(nml_path)
     call alloc_state(nt)
     call init_pflx()                    ! calc_pflx: running means (restart fields) and fluxes
+    call init_sponge_tune()             ! ub_tune: boundary tuning coefficients (0 until read)
     if (marbl_on) call marbl_gpu_setup_tracers()
     call passive_finish_list()          ! without MARBL: generic + CDR_LITE tracers
 
@@ -689,6 +700,7 @@ contains
       error stop 'load_case'
     endif
     call load_init_records(ncid, i0, j0, nxi, neta, xi_u, eta_v)
+    call load_rst_ub(ncid, int(case_record))   ! ub_tune: the CPU's get_init_ub
     call nc_close(ncid)
     call mask_loaded_velocities()
     call fill_masked_velocity_halos()

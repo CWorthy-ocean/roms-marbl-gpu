@@ -35,8 +35,17 @@
 # internal-tide pressure of ucla-roms eae883ee, writes up_<side>/vp_<side>
 # to the child boundary file for objects whose output_vars name them, and
 # keeps u_slow, v_slow, p_slow in the restart. pflx_timescale must be > 0
-# when calc_pflx is on (the run stops otherwise). The child side
-# (&sponge_tune_settings ub_tune, SPONGE_TUNE) is not on the GPU.
+# when calc_pflx is on (the run stops otherwise).
+#
+# Sponge tuning for nested children: &sponge_tune_settings ub_tune (the CPU
+# needs the SPONGE_TUNE cpp key as well; the GPU only the switch) tunes the
+# inflow nudging of the open boundaries to the parent's up/vp of the
+# boundary files; it needs calc_pflx = .true. (the run stops otherwise), as
+# UCLA ROMS. sponge_timescale is used; wrt_sponge (the _spn file) is not on
+# the GPU (the run stops); nrpf_sponge, output_period_sponge and
+# sponge_avg are read for it only. The coefficients ub_west, ub_east,
+# ub_south, ub_north are restart fields; the GPU writes them after the
+# step's tuning, so restarts are exact (UCLA ROMS writes them before it).
 #
 # Half-resolution forcing: interp_bulk_frc, interp_flux_frc
 # (&surf_frc_settings) and interp_bgc_frc (&bgc_settings) are read but not

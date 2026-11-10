@@ -16,6 +16,7 @@ module his_io
   use passive_mod, only: ntp, tp, wrt_passive, passive_name
   use rivers_mod, only: river_on
   use pflx_mod, only: calc_pflx, u_slow, v_slow, p_slow
+  use sponge_io, only: def_rst_ub, stage_rst_ub, put_rst_ub
   use wvlcty_mod, only: wvlcty_compute
   use marbl_gpu, only: marbl_on, marbl_gpu_nhis, marbl_gpu_nhis3, marbl_gpu_define_his, marbl_gpu_stage_his, &
                        marbl_gpu_define_rst, marbl_gpu_write_rst, marbl_gpu_stage_rst8
@@ -331,6 +332,7 @@ contains
         call io_stage8_3d('v_slow', v_slow(is, js, 1), 1, nz, ir0, ir1, jv0, jv1, ir0, 0)
         call io_stage8_3d('p_slow', p_slow(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
       endif
+      call stage_rst_ub()   ! ub_tune: ub_west, ub_east, ub_south, ub_north
       call io_stage8_end()
       call wall_stamp('restart staged')
       if (comm_rank() == 0) write(*,'(a,es14.6,a,i0,a,i0)') 'staged restart t = ', twrite, &
@@ -373,6 +375,7 @@ contains
       call put_v3(ncid, 'v_slow', v_slow, rec_rst)
       call put_r3(ncid, 'p_slow', p_slow, rec_rst)
     endif
+    call put_rst_ub(ncid, rec_rst)
     call nc_close(ncid)
     endif
     call compute_barrier()
@@ -479,6 +482,7 @@ contains
       call nc_put_att_text(ncid, 'p_slow', 'long_name', 'time filtered pressure')
       call nc_put_att_text(ncid, 'p_slow', 'units', 'Pa??')
     endif
+    call def_rst_ub(ncid, d_xi, d_eta, d_t)
     call nc_put_att_text(ncid, '', 'title', output_title)
     call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
@@ -502,7 +506,8 @@ contains
     cap_field = nxy * nhw
     if (wrt_file_his .or. wrt_file_rst) call io_init(cap_rec, cap_field)
     ! double-precision capacity for one restart record of this tile
-    if (wrt_file_rst) call io_init8((15 + 2) * nxy + (4 + ntp + 2 + merge(3, 0, calc_pflx)) * nxy * nh, nxy * nh)
+    if (wrt_file_rst) call io_init8((15 + 2) * nxy + (4 + ntp + 2 + merge(3, 0, calc_pflx)) * nxy * nh &
+         + 4 * (max(nxi, neta) + 2), nxy * nh)
   end subroutine init_staging
 
   subroutine set_write_bounds()

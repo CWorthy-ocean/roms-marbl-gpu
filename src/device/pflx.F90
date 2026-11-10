@@ -36,6 +36,9 @@ module pflx_mod
   private
   public :: calc_pflx, pflx_timescale, init_pflx, calc_pressure_flux, pflx_fill_slow_halos
   public :: up, vp, u_slow, v_slow, p_slow
+  ! child side: SPONGE_TUNE (CPU sponge_tune.F90)
+  public :: ub_tune, sponge_timescale, nrpf_sponge, output_period_sponge, wrt_sponge, sponge_avg
+  public :: ub_w, ub_e, ub_s, ub_n, pf_w, pf_e, pf_s, pf_n, init_sponge_tune
 
   ! &calc_pflx_settings (the CPU's group)
   logical :: calc_pflx = .false.
@@ -47,6 +50,21 @@ module pflx_mod
   ! depth mean of p'
   real(rp), WORK_ATTR allocatable :: p_fast(:,:,:), p_int(:,:)
   real(rp) :: alpha = 0.0_rp, beta = 1.0_rp
+
+  ! &sponge_tune_settings (the CPU's group and defaults). With ub_tune, the
+  ! inflow nudging coefficient of the 3-D Orlanski boundary conditions
+  ! (u, v, tracers) is raised to min(ub, 1) at every boundary point, where
+  ! ub is tuned every step by the difference between the parent's
+  ! baroclinic energy flux (up/vp of the boundary file) and the child's
+  ! own flux one point inside (sponge_io adjust_orlanski).
+  logical :: ub_tune = .false., wrt_sponge = .false., sponge_avg = .false.
+  real(rp) :: sponge_timescale = 24 * 3600.0_rp, output_period_sponge = 24 * 3600.0_rp
+  integer :: nrpf_sponge = 7
+  ! ub_<side>(j|i) and the parent flux pf_<side> at this tile's points along
+  ! each physical edge (local index, allocated on every tile: the boundary
+  ! kernels index them only on edge tiles with ub_tune on)
+  real(rp), WORK_ATTR allocatable :: ub_w(:), ub_e(:), ub_s(:), ub_n(:)
+  real(rp), WORK_ATTR allocatable :: pf_w(:), pf_e(:), pf_s(:), pf_n(:)
 
 contains
 
@@ -65,6 +83,21 @@ contains
     up = 0.0_rp; vp = 0.0_rp; p_int = 0.0_rp
     u_slow = 0.0_rp; v_slow = 0.0_rp; p_slow = 0.0_rp; p_fast = 0.0_rp
   end subroutine init_pflx
+
+  subroutine init_sponge_tune()
+    ! After alloc_state. ub = 0 until a restart provides it (CPU
+    ! init_orlanski_tune / get_init_ub).
+    integer(ip) :: is, ie, js, je
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    if (ub_tune .and. .not. calc_pflx) &
+      error stop 'sponge_tune: ub_tune needs &calc_pflx_settings calc_pflx = .true. (as UCLA ROMS)'
+    if (ub_tune .and. sponge_timescale <= 0.0_rp) error stop 'sponge_tune: sponge_timescale must be > 0'
+    if (allocated(ub_w)) return
+    allocate(ub_w(js:je), ub_e(js:je), ub_s(is:ie), ub_n(is:ie))
+    allocate(pf_w(js:je), pf_e(js:je), pf_s(is:ie), pf_n(is:ie))
+    ub_w = 0.0_rp; ub_e = 0.0_rp; ub_s = 0.0_rp; ub_n = 0.0_rp
+    pf_w = 0.0_rp; pf_e = 0.0_rp; pf_s = 0.0_rp; pf_n = 0.0_rp
+  end subroutine init_sponge_tune
 
   subroutine pflx_fill_slow_halos()
     ! After the restart read: the CPU exchanges p_slow (get_init_slow), whose

@@ -147,6 +147,7 @@ module io_server
   public :: io_init
   public :: io_stage_begin
   public :: io_init8, io_stage8_begin, io_stage8_2d, io_stage8_3d, io_stage8_3d_pt, io_stage8_end
+  public :: io_stage8_line
   public :: io_stage_2d
   public :: io_stage_3d
   public :: io_stage_3d_p, io_stage_3d_pt
@@ -937,6 +938,28 @@ contains
     enddo
     call copy_to_host8(off, ni * nj)
   end subroutine io_stage8_2d
+
+  subroutine io_stage8_line(name, a, lb, ub, l0, l1, fpos)
+    ! A line along one edge, a(l0:l1) of a(lb:ub), into a (n, time) file
+    ! variable at file position fpos (staged as a (n, 1) block at (fpos, 1);
+    ! nc_put_2d_rec_d writes it as a line). Every tile stages every
+    ! variable: a tile without a part passes l1 < l0 (an empty block).
+    character(len=*), intent(in) :: name
+    integer, intent(in) :: lb, ub, l0, l1, fpos
+    real(rp), WORK_ATTR intent(in) :: a(lb:ub)
+    integer :: l, n, off, f0
+    n = max(l1 - l0 + 1, 0)
+    f0 = merge(fpos, 1, n > 0)
+    call add_var8(name, n, 1, 1, 2, off, f0 - int(decomp%i0), 1 - int(decomp%j0))
+    if (n == 0) return
+#ifdef USE_CUDA
+    !$cuf kernel do(1) <<<*,*,0,work_stream>>>
+#endif
+    do l = l0, l1
+      dstage8(l - l0 + 1) = real(a(l), 8)
+    enddo
+    call copy_to_host8(off, n)
+  end subroutine io_stage8_line
 
   subroutine io_stage8_3d(name, a, k0, k1, i0, i1, j0, j1, di, dj)
     character(len=*), intent(in) :: name

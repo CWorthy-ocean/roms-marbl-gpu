@@ -12,6 +12,7 @@ program roms_gpu
   use cdr_out, only: wrt_cdr
   use avg_out, only: wrt_avg, step_bgc_avg
   use extract_out, only: wrt_extract
+  use sponge_io, only: adjust_orlanski
   use upscale_out, only: wrt_upscale_final
   use arch_mod, only: init_arch, arch_name, select_device
   use comm_mod, only: init_comm, finalize_comm, comm_rank, comm_size, is_io_rank, comm_node_rank, comm_world_rank
@@ -86,6 +87,9 @@ program roms_gpu
         iic = ntstart + istep - 1
         call rt_step_begin()
         call run_baroclinic_step()
+        ! ub_tune: the CPU's adjust_orlanski, before the outputs here, so that a
+        ! restart holds the coefficients the next step uses (exact restart)
+        call adjust_orlanski()
         call rt_tic(RT_OUTPUT)
         call maybe_wrt_output()
         call wrt_avg()
