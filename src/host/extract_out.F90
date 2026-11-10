@@ -13,7 +13,9 @@ module extract_out
   ! findstr: zeta, ubar, vbar, u, v, temp, salt, passive, cdr_oae, cdr_dor,
   ! bgc, up, vp; w is not supported). The child's sizes come from the
   ! dimensions child_xi_rho and child_eta_rho; N_chd, theta_s_chd,
-  ! theta_b_chd and hc_chd give the child's vertical grid.
+  ! theta_b_chd and hc_chd give the child's vertical grid (as the CPU, the
+  ! dimensions <prefix>_xi_rho / <prefix>_eta_rho are taken first, <prefix>
+  ! the set name of the first object).
   !
   ! As the CPU: each tile takes the points inside it (the first contiguous
   ! run); the interpolation is bilinear with the mask in the weights,
@@ -161,7 +163,7 @@ contains
   subroutine init_extract()
     ! The CPU's init_extract_data and read_extraction_objects.
     integer :: ncid, io, dimids(2), n1, n2, cxr, cer, s, l, i, np, p, k
-    character(len=60) :: oname
+    character(len=60) :: oname, pfx
     character(len=150) :: vars
     real(rp), allocatable :: ob(:,:)
     on = do_extract
@@ -171,8 +173,16 @@ contains
     if (N_chd < 1) error stop 'init_extract: N_chd must be >= 1'
     call ex_check(nf90_open(trim(extract_file), nf90_nowrite, ncid), 'open '//trim(extract_file))
     call ex_check(nf90_inquire(ncid, nVariables=nobj), 'inquire')
-    call ex_check(nf90_inq_dimid(ncid, 'child_xi_rho', cxr), 'child_xi_rho')
-    call ex_check(nf90_inq_dimid(ncid, 'child_eta_rho', cer), 'child_eta_rho')
+    ! The CPU's child size: <prefix>_xi_rho / <prefix>_eta_rho, <prefix> the
+    ! set name of the first object (roms-tools make_nesting_info prefix),
+    ! else child_xi_rho / child_eta_rho.
+    call ex_check(nf90_inquire_variable(ncid, 1, name=oname), 'inquire variable')
+    pfx = oname
+    if (index(oname, '_') > 0) pfx = oname(1:index(oname, '_') - 1)
+    if (nf90_inq_dimid(ncid, trim(pfx)//'_xi_rho', cxr) /= nf90_noerr) &
+      call ex_check(nf90_inq_dimid(ncid, 'child_xi_rho', cxr), trim(pfx)//'_xi_rho (or child_xi_rho)')
+    if (nf90_inq_dimid(ncid, trim(pfx)//'_eta_rho', cer) /= nf90_noerr) &
+      call ex_check(nf90_inq_dimid(ncid, 'child_eta_rho', cer), trim(pfx)//'_eta_rho (or child_eta_rho)')
     call ex_check(nf90_inquire_dimension(ncid, cxr, len=LLm_chd), 'child_xi_rho')
     call ex_check(nf90_inquire_dimension(ncid, cer, len=MMm_chd), 'child_eta_rho')
     allocate(obj(nobj))
