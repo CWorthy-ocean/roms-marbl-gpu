@@ -229,8 +229,9 @@ v0.1.2-beta, bit for bit.
   conditions (velocity and every tracer) is tuned every step so that the
   child's internal-tide energy flux next to each side follows the parent's
   `up`/`vp` from the boundary files; needs `calc_pflx`. The coefficients
-  `ub_west`, `ub_east`, `ub_south`, `ub_north` are kept in the restart.
-  The tuning output (`wrt_sponge`) is not available.
+  `ub_west`, `ub_east`, `ub_south`, `ub_north` are kept in the restart,
+  and `wrt_sponge` writes the fluxes and coefficients of every open side to
+  the `_spn` file.
 
 ## Numerics
 

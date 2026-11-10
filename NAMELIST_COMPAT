@@ -41,11 +41,13 @@
 # needs the SPONGE_TUNE cpp key as well; the GPU only the switch) tunes the
 # inflow nudging of the open boundaries to the parent's up/vp of the
 # boundary files; it needs calc_pflx = .true. (the run stops otherwise), as
-# UCLA ROMS. sponge_timescale is used; wrt_sponge (the _spn file) is not on
-# the GPU (the run stops); nrpf_sponge, output_period_sponge and
-# sponge_avg are read for it only. The coefficients ub_west, ub_east,
-# ub_south, ub_north are restart fields; the GPU writes them after the
-# step's tuning, so restarts are exact (UCLA ROMS writes them before it).
+# UCLA ROMS. wrt_sponge writes <output_root_name>_spn.<date>.nc every
+# output_period_sponge (nrpf_sponge records per file): the child and parent
+# fluxes and the coefficient of every open side, averaged over the period
+# (sponge_avg) or of the output step, as UCLA ROMS with its fixes of
+# 2026-11 (sponge-tune-pio-fixes). The coefficients ub_west, ub_east,
+# ub_south, ub_north are restart fields, written after the step's tuning
+# (exact restarts), as in that version of UCLA ROMS.
 #
 # Half-resolution forcing: interp_bulk_frc, interp_flux_frc
 # (&surf_frc_settings) and interp_bgc_frc (&bgc_settings) are read but not

@@ -22,30 +22,65 @@ module sponge_io
   use nc_io
   use io_server, only: io_stage8_line
   use bry_io, only: set_pflx_bry
-  use pflx_mod, only: ub_tune, sponge_timescale, up, vp, ub_w, ub_e, ub_s, ub_n, pf_w, pf_e, pf_s, pf_n
+  use pflx_mod, only: ub_tune, sponge_timescale, up, vp, ub_w, ub_e, ub_s, ub_n, pf_w, pf_e, pf_s, pf_n, &
+                      wrt_sponge, sponge_avg
   use arch_mod, only: sync_arch
   use comm_mod, only: comm_rank
   implicit none
   private
-  public :: adjust_orlanski, def_rst_ub, stage_rst_ub, put_rst_ub, load_rst_ub
+  public :: adjust_orlanski, def_rst_ub, stage_rst_ub, put_rst_ub, load_rst_ub, init_spn_arrays
+  ! for sponge_out (the _spn file): the child flux of the step, the averages
+  ! (or the step's values without sponge_avg) and the average counter
+  public :: cf_w, cf_e, cf_s, cf_n, cfa_w, cfa_e, cfa_s, cfa_n, pfa_w, pfa_e, pfa_s, pfa_n
+  public :: uba_w, uba_e, uba_s, uba_n, navg_spn
+  real(rp), WORK_ATTR allocatable :: cf_w(:), cf_e(:), cf_s(:), cf_n(:)
+  real(rp), WORK_ATTR allocatable :: cfa_w(:), cfa_e(:), cfa_s(:), cfa_n(:)
+  real(rp), WORK_ATTR allocatable :: pfa_w(:), pfa_e(:), pfa_s(:), pfa_n(:)
+  real(rp), WORK_ATTR allocatable :: uba_w(:), uba_e(:), uba_s(:), uba_n(:)
+  real(rp) :: navg_spn = 0.0_rp
 
   real(rp), parameter :: ub_mx = 2.0_rp, ub_mn = -1.0_rp   ! the CPU's clipping range
   character(len=8), parameter :: ub_name(4) = (/'ub_west ', 'ub_east ', 'ub_south', 'ub_north'/)
 
 contains
 
+  subroutine init_spn_arrays()
+    ! After alloc_state; zero (the corners and the off-edge parts stay 0).
+    integer(ip) :: is, ie, js, je
+    if (.not. ub_tune .or. allocated(cf_w)) return
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    allocate(cf_w(js:je), cf_e(js:je), cf_s(is:ie), cf_n(is:ie))
+    allocate(cfa_w(js:je), cfa_e(js:je), cfa_s(is:ie), cfa_n(is:ie))
+    allocate(pfa_w(js:je), pfa_e(js:je), pfa_s(is:ie), pfa_n(is:ie))
+    allocate(uba_w(js:je), uba_e(js:je), uba_s(is:ie), uba_n(is:ie))
+    cf_w = 0; cf_e = 0; cf_s = 0; cf_n = 0
+    cfa_w = 0; cfa_e = 0; cfa_s = 0; cfa_n = 0
+    pfa_w = 0; pfa_e = 0; pfa_s = 0; pfa_n = 0
+    uba_w = 0; uba_e = 0; uba_s = 0; uba_n = 0
+  end subroutine init_spn_arrays
+
   subroutine adjust_orlanski()
-    ! The CPU's adjust_orlanski (set_pflx, comp_cflx, the ub update), after
-    ! the step. All on the device (one small kernel per open side; the host
-    ! touching up/vp would migrate their managed pages every step).
+    ! The CPU's adjust_orlanski (set_pflx, comp_cflx, the ub update) and
+    ! calc_spn_avg, before the step's outputs (ucla-roms sponge-tune-pio-fixes
+    ! order). All on the device (one small kernel per open side; the host
+    ! touching up/vp would migrate their managed pages every step). The
+    ! clamped parent flux and the child flux are kept in pf_<side> /
+    ! cf_<side>; with wrt_sponge their running means (sponge_avg) or the
+    ! step's values (coef 1) go to cfa/pfa/uba_<side> for sponge_out.
     integer(ip) :: i, j, nx, ny
-    real(rp) :: tneed, a, pf
+    real(rp) :: tneed, a, pf, cf, c
+    logical :: av
     if (.not. ub_tune) return
     nx = decomp%nx; ny = decomp%ny
     ! the CPU's set_frc_data time here: tdays = t(n+1), frc_time '1/2 fwd'
     tneed = (start_time + dt * real(iic - ntstart, rp) + dt) * sec2day + 0.5_rp * dt * sec2day
     call set_pflx_bry(tneed)
     a = 0.5_rp * ub_mx * dt / sponge_timescale
+    ! the CPU's calc_spn_avg counter (reset by the output)
+    navg_spn = navg_spn + 1.0_rp
+    c = 1.0_rp / navg_spn
+    if (.not. sponge_avg) c = 1.0_rp
+    av = wrt_sponge
     if (decomp%edge_s .and. obc_south) then
 #ifdef USE_CUDA
       !$cuf kernel do(1) <<<*,*>>>
@@ -53,9 +88,17 @@ contains
       do i = 1, nx
         pf = pf_s(i)
         if (abs(pf) > 100.0_rp) pf = 0.0_rp
-        ub_s(i) = ub_s(i) + a * (pf - vp(i, 2))
+        cf = vp(i, 2)
+        pf_s(i) = pf
+        cf_s(i) = cf
+        ub_s(i) = ub_s(i) + a * (pf - cf)
         ub_s(i) = max(ub_mn, ub_s(i))
         ub_s(i) = min(ub_mx, ub_s(i))
+        if (av) then
+          cfa_s(i) = cfa_s(i) * (1.0_rp - c) + cf * c
+          pfa_s(i) = pfa_s(i) * (1.0_rp - c) + pf * c
+          uba_s(i) = uba_s(i) * (1.0_rp - c) + ub_s(i) * c
+        endif
       enddo
     endif
     if (decomp%edge_n .and. obc_north) then
@@ -66,9 +109,17 @@ contains
         pf = pf_n(i)
         if (rmask(i, ny + 1) < 1.0_rp) pf = 0.0_rp
         if (abs(pf) > 100.0_rp) pf = 0.0_rp
-        ub_n(i) = ub_n(i) - a * (pf - vp(i, ny - 1))
+        cf = vp(i, ny - 1)
+        pf_n(i) = pf
+        cf_n(i) = cf
+        ub_n(i) = ub_n(i) - a * (pf - cf)
         ub_n(i) = max(ub_mn, ub_n(i))
         ub_n(i) = min(ub_mx, ub_n(i))
+        if (av) then
+          cfa_n(i) = cfa_n(i) * (1.0_rp - c) + cf * c
+          pfa_n(i) = pfa_n(i) * (1.0_rp - c) + pf * c
+          uba_n(i) = uba_n(i) * (1.0_rp - c) + ub_n(i) * c
+        endif
       enddo
     endif
     if (decomp%edge_w .and. obc_west) then
@@ -78,9 +129,17 @@ contains
       do j = 1, ny
         pf = pf_w(j)
         if (abs(pf) > 100.0_rp) pf = 0.0_rp
-        ub_w(j) = ub_w(j) + a * (pf - up(2, j))
+        cf = up(2, j)
+        pf_w(j) = pf
+        cf_w(j) = cf
+        ub_w(j) = ub_w(j) + a * (pf - cf)
         ub_w(j) = max(ub_mn, ub_w(j))
         ub_w(j) = min(ub_mx, ub_w(j))
+        if (av) then
+          cfa_w(j) = cfa_w(j) * (1.0_rp - c) + cf * c
+          pfa_w(j) = pfa_w(j) * (1.0_rp - c) + pf * c
+          uba_w(j) = uba_w(j) * (1.0_rp - c) + ub_w(j) * c
+        endif
       enddo
     endif
     if (decomp%edge_e .and. obc_east) then
@@ -90,9 +149,17 @@ contains
       do j = 1, ny
         pf = pf_e(j)
         if (abs(pf) > 100.0_rp) pf = 0.0_rp
-        ub_e(j) = ub_e(j) - a * (pf - up(nx - 1, j))
+        cf = up(nx - 1, j)
+        pf_e(j) = pf
+        cf_e(j) = cf
+        ub_e(j) = ub_e(j) - a * (pf - cf)
         ub_e(j) = max(ub_mn, ub_e(j))
         ub_e(j) = min(ub_mx, ub_e(j))
+        if (av) then
+          cfa_e(j) = cfa_e(j) * (1.0_rp - c) + cf * c
+          pfa_e(j) = pfa_e(j) * (1.0_rp - c) + pf * c
+          uba_e(j) = uba_e(j) * (1.0_rp - c) + ub_e(j) * c
+        endif
       enddo
     endif
   end subroutine adjust_orlanski

@@ -31,7 +31,8 @@ module case_io
   use pflx_mod, only: calc_pflx, pflx_timescale, init_pflx, pflx_fill_slow_halos, u_slow, v_slow, p_slow
   use pflx_mod, only: ub_tune, sponge_timescale, nrpf_sponge, output_period_sponge, wrt_sponge, sponge_avg, &
                       init_sponge_tune
-  use sponge_io, only: load_rst_ub
+  use sponge_io, only: load_rst_ub, init_spn_arrays
+  use sponge_out, only: set_spn_root, init_spn_output
   use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name, &
        passive_hold, set_cdr_lite, passive_finish_list, ncdr, tnu2_tp, n_marbl, cdr0, passive_mirror
   use marbl_gpu, only: marbl_gpu_init_diagnostics
@@ -614,6 +615,7 @@ contains
     call alloc_state(nt)
     call init_pflx()                    ! calc_pflx: running means (restart fields) and fluxes
     call init_sponge_tune()             ! ub_tune: boundary tuning coefficients (0 until read)
+    call init_spn_arrays()              ! ub_tune: fluxes and averages for the _spn output
     if (marbl_on) call marbl_gpu_setup_tracers()
     call passive_finish_list()          ! without MARBL: generic + CDR_LITE tracers
 
@@ -777,6 +779,8 @@ contains
     call init_cdr_output()
     call init_upscale_output()        ! after init_bry (open sides)
     call init_extract()               ! child-grid boundary extraction
+    call set_spn_root(case_output_root)
+    call init_spn_output()            ! ub_tune + wrt_sponge: the _spn file (after init_bry: open sides)
     call wall_stamp('output init')
   end subroutine load_case
 

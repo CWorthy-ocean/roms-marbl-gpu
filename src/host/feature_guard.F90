@@ -63,8 +63,6 @@ contains
                  'momentum budget diagnostics (DIAGNOSTICS cpp key on the CPU) are not on the GPU')
     call warn_on('diagnostics_settings', 'diag_trc', &
                  'tracer budget diagnostics (DIAGNOSTICS cpp key on the CPU) are not on the GPU')
-    ! sponge tuning (ub_tune) is on the GPU (sponge_io); its output is not
-    call need_off('sponge_tune_settings', 'wrt_sponge', 'sponge tuning output (_spn file)')
 
     if (talk .and. nerr + nwarn > 0) flush(6)
     deallocate(txt)
