@@ -1165,12 +1165,20 @@ contains
   ! PCG (FS_SPEC 4)
   !======================================================================
   subroutine fs_pcg(its, resid, conv)
+    ! Multigrid (CPU 519365ab): the kernel of <p,q> also writes the area-weighted partials of <r,q>
+    ! and <q,q> (slots 2, 3, reduced with <p,q>), which give the new residual norm |r - alpha q|^2 =
+    ! |r|^2 - 2 alpha <r,q> + alpha^2 <q,q> before the preconditioner. When that estimate is at most
+    ! 4 tol2, the update kernel also writes the residual norm's partials (precond's expression), they
+    ! are summed and reduced, and a converged solve ends without the V-cycle of the final residual,
+    ! which would not be used. The stopping test uses the directly summed norm as before (each slot is
+    ! summed by its own fixed-order tree): same iterates, same iteration count, one V-cycle less.
     integer, intent(out) :: its
     real(rp), intent(out) :: resid
     logical, intent(out) :: conv
     integer(ip) :: i, j, nx, ny
     integer :: it
-    real(rp) :: loc(4), glob(4), rz, rznew, alpha, beta, pq, tol2, bn2
+    real(rp) :: loc(4), glob(4), rz, rznew, alpha, beta, pq, tol2, bn2, rn2
+    logical :: chk
     nx = decomp%nx; ny = decomp%ny
     conv = .true.; its = 0; resid = 0.0_rp
     call ring(1, xx, fdum, fdum, fdum, fdum, fdum, .true.)
@@ -1205,6 +1213,7 @@ contains
     tol2 = fs_tol * fs_tol * bn2
     resid = sqrt(glob(2) / bn2)
     if (glob(2) <= tol2) return
+    rn2 = glob(2)
     conv = .false.
     do it = 1, fs_maxit
       its = it
@@ -1212,21 +1221,33 @@ contains
       call tq(T_PEX)
       call fs_apply(pd, qq, .true.)
       call tq(T_OP)
-      call fs_sum(1, loc)
-      call comm_allreduce_sum(1, loc(1:1), glob(1:1))
+      call fs_sum(merge(3, 1, mg_on), loc)
+      call comm_allreduce_sum(merge(3, 1, mg_on), loc(1:3), glob(1:3))
       call tq(T_RED)
       pq = glob(1)
       if (.not. fs_finite(pq)) call fs_nan_stop('<p,q>', it)
       alpha = rz / pq
       if (mg_on) then
+        chk = (rn2 - 2.0_rp * alpha * glob(2) + alpha * alpha * glob(3) <= 4.0_rp * tol2)
         CUF_DO2
         do j = 1, ny
           do i = 1, nx
             xx(i, j) = xx(i, j) + alpha * pd(i, j)
             rr(i, j) = rr(i, j) - alpha * qq(i, j)
+            if (chk) fs_part(i + (j - 1) * nx, 1) = act(i, j) * rr(i, j) * rr(i, j) * pm(i, j) * pn(i, j)
           enddo
         enddo
         call tq(T_VEC)
+        if (chk) then                       ! the norm of the new residual, summed as precond's slot 2
+          call fs_sum(1, loc)
+          call comm_allreduce_sum(1, loc(1:1), glob(1:1))
+          call tq(T_RED)
+          if (.not. fs_finite(glob(1))) call fs_nan_stop('residual norm', it)
+          if (glob(1) <= tol2) then
+            resid = sqrt(glob(1) / bn2)
+            conv = .true.; exit
+          endif
+        endif
         call precond()
       else
         CUF_DO2
@@ -1246,6 +1267,7 @@ contains
       call tq(T_RED)
       rznew = glob(1)
       if (.not. fs_finite(glob(2))) call fs_nan_stop('residual norm', it)
+      rn2 = glob(2)
       resid = sqrt(glob(2) / bn2)
       if (glob(2) <= tol2) then
         conv = .true.; exit
@@ -1296,13 +1318,15 @@ contains
   end subroutine fs_nan_stop
 
   subroutine fs_apply(x, y, dot)
-    ! y = A x on the interior (FS_SPEC 3.6); dot: partial sums x y in slot 1
+    ! y = A x on the interior (FS_SPEC 3.6); dot: partial sums x y in slot 1 and, with multigrid,
+    ! act pm pn r y and act pm pn y y in slots 2, 3 (fs_pcg: the estimate of the new residual norm)
     real(rp), FSD intent(in) :: x(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), FSD intent(inout) :: y(decomp%is:decomp%ie, decomp%js:decomp%je)
     logical, intent(in) :: dot
     integer(ip) :: i, j, nx, ny
-    logical :: dt_
-    nx = decomp%nx; ny = decomp%ny; dt_ = dot
+    logical :: dt_, est
+    real(rp) :: w
+    nx = decomp%nx; ny = decomp%ny; dt_ = dot; est = dot .and. mg_on
     CUF_DO2
     do j = 1, ny
       do i = 1, nx
@@ -1310,6 +1334,11 @@ contains
              + cu(i + 1, j) * (x(i, j) - x(i + 1, j)) + cu(i, j) * (x(i, j) - x(i - 1, j)) &
              + cv(i, j + 1) * (x(i, j) - x(i, j + 1)) + cv(i, j) * (x(i, j) - x(i, j - 1)))
         if (dt_) fs_part(i + (j - 1) * nx, 1) = x(i, j) * y(i, j)
+        if (est) then
+          w = act(i, j) * pm(i, j) * pn(i, j)
+          fs_part(i + (j - 1) * nx, 2) = w * rr(i, j) * y(i, j)
+          fs_part(i + (j - 1) * nx, 3) = w * y(i, j) * y(i, j)
+        endif
       enddo
     enddo
   end subroutine fs_apply
