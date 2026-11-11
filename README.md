@@ -232,6 +232,8 @@ v0.1.2-beta, bit for bit.
   `ub_west`, `ub_east`, `ub_south`, `ub_north` are kept in the restart,
   and `wrt_sponge` writes the fluxes and coefficients of every open side to
   the `_spn` file.
+- CDR_LITE: where one of two bracketing carbonate-sensitivity records is
+  missing (0), the gas flux now ramps linearly to zero instead of spiking.
 
 ## Numerics
 

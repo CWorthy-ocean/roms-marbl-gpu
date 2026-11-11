@@ -1471,11 +1471,172 @@ contains
     call cover_check(s_ddalk, tneed)
     if (s_ddco2%ready) call fill_r(s_ddco2, tneed, ddco2, keep_nan=.true.)
     if (s_ddalk%ready) call fill_r(s_ddalk, tneed, ddalk, keep_nan=.true.)
+    if (s_ddco2%ready .and. s_ddalk%ready) call missing_sensitivity(tneed, ddco2, ddalk)
     do d = 1, nd
       call cover_check(s_cflx(d), tneed)
       if (s_cflx(d)%ready) call fill_r(s_cflx(d), tneed, cflx(:, :, d))
     enddo
   end subroutine set_cdr_lite_forces
+
+  subroutine missing_sensitivity(tneed, ddco2, ddalk)
+    ! The CPU's surf_flux interp_missing_sensitivity: where exactly one of
+    ! the two bracketing beta (ddic_dco2) records is missing (not > 0, NaN
+    ! included: the writers put 0 where the carbonate solve failed, and the
+    ! gas flux treats beta <= 0 as no exchange), the flux coefficients
+    ! 1/beta and eta/beta are interpolated in time with 0 for the missing
+    ! record instead of beta and eta themselves: beta = beta_valid/w_valid,
+    ! eta = eta_valid (w_valid = the valid record's weight; w_valid = 0:
+    ! beta = 0), so the gas flux ramps linearly to zero toward the missing
+    ! record (interpolating beta shrank it to w_valid*beta_valid, k/beta up
+    ! to 1/w_valid times too large). Cells where both records are valid (or
+    ! both missing) keep fill_r's values. eta's records are taken by time;
+    ! if its bracket is not beta's (the writers give both the same times)
+    ! or its layout differs, eta keeps its interpolated value. A 2x-coarse
+    ! field (a GPU-only layout for the sensitivities: the CPU reads them on
+    ! the grid) is judged per fine point after the spatial interpolation of
+    ! each record, in the order of interp_coarse.
+    real(rp), intent(in) :: tneed
+    real(rp), WORK_ATTR intent(inout) :: ddco2(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(inout) :: ddalk(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp) :: c1, c2, t1b, t2b, t1e, t2e
+    logical :: es
+    if (s_ddco2%ntot < 2) return
+    call weights(s_ddco2, tneed, c1, c2)
+    call bracket_times(s_ddco2, t1b, t2b)
+    call bracket_times(s_ddalk, t1e, t2e)
+    es = s_ddalk%ntot >= 2 .and. t1e == t1b .and. t2e == t2b .and. s_ddalk%lay == s_ddco2%lay &
+         .and. s_ddalk%n1 == s_ddco2%n1 .and. s_ddalk%n2 == s_ddco2%n2 &
+         .and. s_ddalk%li0 == s_ddco2%li0 .and. s_ddalk%lj0 == s_ddco2%lj0
+    if (s_ddco2%lay == LAY_GRID) then
+      call missing_on_grid(s_ddco2%buf, s_ddalk%buf, s_ddco2%n1, s_ddco2%n2, size(s_ddalk%buf, 1), &
+                           size(s_ddalk%buf, 2), c1, c2, es, ddco2, ddalk, s_ddco2%li0, s_ddco2%lj0)
+    else
+      call missing_coarse(s_ddco2%buf, s_ddalk%buf, s_ddco2%n1, s_ddco2%n2, size(s_ddalk%buf, 1), &
+                          size(s_ddalk%buf, 2), c1, c2, es, ddco2, ddalk)
+    endif
+  end subroutine missing_sensitivity
+
+  subroutine bracket_times(s, t1, t2)
+    ! The times of the current record bracket (shifted for a climatology).
+    type(series2d), intent(in)  :: s
+    real(rp),       intent(out) :: t1, t2
+    if (s%cycle > 0.0_rp) then
+      t1 = s%t1e; t2 = s%t2e
+    else
+      t1 = s%times(max(s%it1, 1)); t2 = s%times(max(s%it2, 1))
+    endif
+  end subroutine bracket_times
+
+  subroutine missing_on_grid(bb, be, n1, n2, m1, m2, c1, c2, es, ddco2, ddalk, i0, j0)
+    ! missing_sensitivity on this tile's window of an on-grid field.
+    integer,  intent(in) :: n1, n2, m1, m2, i0, j0
+    real(rp), WORK_ATTR intent(in) :: bb(n1, n2, 2), be(m1, m2, 2)
+    real(rp), intent(in) :: c1, c2
+    logical,  intent(in) :: es
+    real(rp), WORK_ATTR intent(inout) :: ddco2(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(inout) :: ddalk(decomp%is:decomp%ie, decomp%js:decomp%je)
+    integer :: i, j, m
+    real(rp) :: w
+    logical :: v1, v2
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, n2
+      do i = 1, n1
+        v1 = bb(i, j, 1) > 0.0_rp
+        v2 = bb(i, j, 2) > 0.0_rp
+        if (v1 .neqv. v2) then
+          m = 2
+          w = c2
+          if (v1) then
+            m = 1
+            w = c1
+          endif
+          if (w > 0.0_rp) then
+            ddco2(i0 + i - 1, j0 + j - 1) = bb(i, j, m) / w
+            if (es) ddalk(i0 + i - 1, j0 + j - 1) = be(i, j, m)
+          else
+            ddco2(i0 + i - 1, j0 + j - 1) = 0.0_rp
+          endif
+        endif
+      enddo
+    enddo
+  end subroutine missing_on_grid
+
+  subroutine missing_coarse(bb, be, n1, n2, m1, m2, c1, c2, es, ddco2, ddalk)
+    ! missing_sensitivity for 2x-coarse rho fields: each record at the fine
+    ! point exactly as interp_coarse (gtype 'r') computes it, then the rule.
+    integer,  intent(in) :: n1, n2, m1, m2
+    real(rp), WORK_ATTR intent(in) :: bb(n1, n2, 2), be(m1, m2, 2)
+    real(rp), intent(in) :: c1, c2
+    logical,  intent(in) :: es
+    real(rp), WORK_ATTR intent(inout) :: ddco2(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(inout) :: ddalk(decomp%is:decomp%ie, decomp%js:decomp%je)
+    integer :: i, j, ie, je, gi0, gj0, ic, jc, m
+    real(rp) :: xg, yg, xl, yl, w, f1, f2, a00, a10, a01, a11, q00, q10, q01, q11
+    logical :: in0, in1, jn0, jn1, v1, v2
+    ie = int(decomp%nx) + 1; je = int(decomp%ny) + 1
+    gi0 = int(decomp%i0) - 1; gj0 = int(decomp%j0) - 1
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 0, je
+      do i = 0, ie
+        xg = 0.5_rp * real(i + gi0, rp) + 0.25_rp
+        yg = 0.5_rp * real(j + gj0, rp) + 0.25_rp
+        ic = floor(xg)
+        jc = floor(yg)
+        xl = xg - real(ic, rp)
+        yl = yg - real(jc, rp)
+        ic = ic + 1
+        jc = jc + 1
+        in0 = (ic >= 1 .and. ic <= n1)
+        in1 = (ic + 1 >= 1 .and. ic + 1 <= n1)
+        jn0 = (jc >= 1 .and. jc <= n2)
+        jn1 = (jc + 1 >= 1 .and. jc + 1 <= n2)
+        a00 = 0.0_rp; a10 = 0.0_rp; a01 = 0.0_rp; a11 = 0.0_rp
+        q00 = 0.0_rp; q10 = 0.0_rp; q01 = 0.0_rp; q11 = 0.0_rp
+        if (in0 .and. jn0) then
+          a00 = bb(ic, jc, 1); q00 = bb(ic, jc, 2)
+        endif
+        if (in1 .and. jn0) then
+          a10 = bb(ic + 1, jc, 1); q10 = bb(ic + 1, jc, 2)
+        endif
+        if (in0 .and. jn1) then
+          a01 = bb(ic, jc + 1, 1); q01 = bb(ic, jc + 1, 2)
+        endif
+        if (in1 .and. jn1) then
+          a11 = bb(ic + 1, jc + 1, 1); q11 = bb(ic + 1, jc + 1, 2)
+        endif
+        f1 = (1.0_rp - yl) * ((1.0_rp - xl) * a00 + xl * a10) + yl * ((1.0_rp - xl) * a01 + xl * a11)
+        f2 = (1.0_rp - yl) * ((1.0_rp - xl) * q00 + xl * q10) + yl * ((1.0_rp - xl) * q01 + xl * q11)
+        v1 = f1 > 0.0_rp
+        v2 = f2 > 0.0_rp
+        if (v1 .neqv. v2) then
+          m = 2                    ! the valid record: index, weight, value (f2)
+          w = c2
+          if (v1) then
+            m = 1
+            w = c1
+            f2 = f1
+          endif
+          if (w > 0.0_rp) then
+            ddco2(i, j) = f2 / w
+            if (es) then           ! eta's record m at the fine point
+              a00 = 0.0_rp; a10 = 0.0_rp; a01 = 0.0_rp; a11 = 0.0_rp
+              if (in0 .and. jn0) a00 = be(ic, jc, m)
+              if (in1 .and. jn0) a10 = be(ic + 1, jc, m)
+              if (in0 .and. jn1) a01 = be(ic, jc + 1, m)
+              if (in1 .and. jn1) a11 = be(ic + 1, jc + 1, m)
+              ddalk(i, j) = (1.0_rp - yl) * ((1.0_rp - xl) * a00 + xl * a10) + yl * ((1.0_rp - xl) * a01 + xl * a11)
+            endif
+          else
+            ddco2(i, j) = 0.0_rp
+          endif
+        endif
+      enddo
+    enddo
+  end subroutine missing_coarse
 
   subroutine cover_check(s, tneed)
     type(series2d), intent(in) :: s
