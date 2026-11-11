@@ -1201,6 +1201,7 @@ contains
       call zero2(xx)
       return
     endif
+    if (.not. fs_finite(glob(2))) call fs_nan_stop('residual norm', 0)
     tol2 = fs_tol * fs_tol * bn2
     resid = sqrt(glob(2) / bn2)
     if (glob(2) <= tol2) return
@@ -1215,6 +1216,7 @@ contains
       call comm_allreduce_sum(1, loc(1:1), glob(1:1))
       call tq(T_RED)
       pq = glob(1)
+      if (.not. fs_finite(pq)) call fs_nan_stop('<p,q>', it)
       alpha = rz / pq
       if (mg_on) then
         CUF_DO2
@@ -1243,6 +1245,7 @@ contains
       call comm_allreduce_sum(merge(3, 2, mg_on), loc(1:3), glob(1:3))
       call tq(T_RED)
       rznew = glob(1)
+      if (.not. fs_finite(glob(2))) call fs_nan_stop('residual norm', it)
       resid = sqrt(glob(2) / bn2)
       if (glob(2) <= tol2) then
         conv = .true.; exit
@@ -1263,6 +1266,34 @@ contains
     enddo
     its = min(its, fs_maxit)
   end subroutine fs_pcg
+
+  logical function fs_finite(x)
+    ! x is neither NaN nor +-Inf (exponent bits, not a comparison, so that no optimisation that
+    ! assumes finite values can remove the test)
+    real(rp), intent(in) :: x
+    fs_finite = (ibits(transfer(x, 0_8), 52, 11) /= 2047)
+  end function fs_finite
+
+  subroutine fs_nan_stop(what, it)
+    ! A non-finite <p,q> or residual norm in fs_pcg (the reduced values are the same on every
+    ! compute rank, so every rank comes here): the run is unstable. Stop it instead of iterating
+    ! to fs_maxit with NaNs (the same test and message as the CPU's fs_pcg): rank 0 writes the
+    ! message, every compute rank meets the others once more (so the message is out before any
+    ! rank aborts) and stops all ranks, writers included, by comm_abort (MPI_Abort).
+    character(len=*), intent(in) :: what
+    integer, intent(in) :: it
+    character(len=200) :: msg
+    real(rp) :: x(1), y(1)
+    write(msg, '(A,A,A,I0,A,I0,A)') 'IMPLICIT_FS: non-finite ', what, ' in the free-surface solve (step ', &
+         iic, ', iteration ', it, '): the run is unstable, stopping'
+    if (talk) then
+      write(*,'(1x,A)') trim(msg)
+      flush(6)
+    endif
+    x = 0.0_rp
+    call comm_allreduce_max(1, x, y)
+    call comm_abort(1)
+  end subroutine fs_nan_stop
 
   subroutine fs_apply(x, y, dot)
     ! y = A x on the interior (FS_SPEC 3.6); dot: partial sums x y in slot 1
