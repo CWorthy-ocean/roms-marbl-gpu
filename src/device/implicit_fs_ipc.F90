@@ -23,14 +23,16 @@ module fs_ipc
   use iso_c_binding
   implicit none
   private
-  public :: ipc_init, ipc_on, ipc_ring_fine, ipc_ring_plane, ipc_gather_init, ipcg_on, ipc_gather
+  public :: ipc_init, ipc_on, ipc_ring_fine, ipc_ring_plane, ipc_gather_init, ipcg_on, ipc_gather, ipc_gather_v
 
   logical :: ipc_on = .false.
   ! the multigrid's vector gather (fs_mgg) by IPC, when all compute ranks (at most 4) share the node:
   ! every rank puts its block into every rank's gathered-vector buffer (2 slots) and raises its flag
-  ! (one per source rank); a wait kernel spins on the flags and copies the slot to the caller's array
+  ! (one per source rank); a wait kernel spins on the flags and copies the slot to the caller's array.
+  ! gld: the buffer's length per slot (gtot, or more when the coarse coefficients are gathered through
+  ! the same buffers, fs_gpu_opt 2048: ipc_gather_v; the gathers share the sequence counter)
   logical :: ipcg_on = .false.
-  integer :: gnp = 0, gme = 0, gtot = 0, go = 0, gnpeer = 0, gpr(3) = 0
+  integer :: gnp = 0, gme = 0, gtot = 0, go = 0, gnpeer = 0, gpr(3) = 0, gld = 0
   integer :: mv = 0                  ! values per direction and slot
   logical :: has(4) = .false.        ! W, E, S, N neighbour (an MPI rank on this node)
   integer :: g_nx = 0, g_ny = 0, g_is = 0, g_ie = 0, g_js = 0, g_je = 0, g_j0 = 0, g_j1 = 0, g_i0 = 0, g_i1 = 0
@@ -182,9 +184,10 @@ contains
 #endif
   end subroutine ipc_init
 
-  subroutine ipc_gather_init(np, me, tot, o)
-    ! collective: the gathered vector's buffers (tot values; this rank's block at offset o)
-    integer, intent(in) :: np, me, tot, o
+  subroutine ipc_gather_init(np, me, tot, o, ld)
+    ! collective: the gathered vector's buffers (tot values; this rank's block at offset o; ld >= tot
+    ! values per slot, the same on every rank)
+    integer, intent(in) :: np, me, tot, o, ld
 #ifdef USE_CUDA
     integer :: ierr, k, n, nop, ferr
     logical :: same
@@ -197,12 +200,12 @@ contains
     integer(c_intptr_t) :: addr
     ipcg_on = .false.
     if (.not. ipc_on .or. np < 2 .or. np > 4) return
-    gnp = np; gme = me; gtot = tot; go = o
-    ierr = cudaMalloc(gbuf_p, int(tot, 8) * 2_8 * 8_8)
+    gnp = np; gme = me; gtot = tot; go = o; gld = max(ld, tot)
+    ierr = cudaMalloc(gbuf_p, int(gld, 8) * 2_8 * 8_8)
     if (ierr /= 0) error stop 'implicit_fs: ipc_gather_init cudaMalloc'
     ierr = cudaMalloc(gfl_p, 4_8 * 4_8)
     if (ierr /= 0) error stop 'implicit_fs: ipc_gather_init cudaMalloc'
-    call c_f_pointer(gbuf_p, gbuf, [tot, 2]); call c_f_pointer(gfl_p, gfl, [4])
+    call c_f_pointer(gbuf_p, gbuf, [gld, 2]); call c_f_pointer(gfl_p, gfl, [4])
     allocate(gqc(1)); gbuf = 0; gfl = 0; gqc = 0
     ok = 1
     ierr = c_ipc_get(hb, transfer(gbuf_p, addr)); if (ierr /= 0) ok = 0
@@ -227,9 +230,9 @@ contains
       nop = nop + 1; opened(nop) = addr
       dp = transfer(addr, dp)
       select case (gnpeer)
-      case (1); call c_f_pointer(dp, gq1, [tot, 2])
-      case (2); call c_f_pointer(dp, gq2, [tot, 2])
-      case (3); call c_f_pointer(dp, gq3, [tot, 2])
+      case (1); call c_f_pointer(dp, gq1, [gld, 2])
+      case (2); call c_f_pointer(dp, gq2, [gld, 2])
+      case (3); call c_f_pointer(dp, gq3, [gld, 2])
       end select
       h = transfer(crhf(k + 1), h)
       ierr = c_ipc_open(addr, h, 1)
@@ -312,16 +315,35 @@ contains
     real(8), device :: x(0:mgx + 1, 0:mgy + 1, *)
     real(8), device :: out(*)
     integer :: ierr
-    call kgput<<<1, IPC_NT, 0, ist>>>(x, mgx, mgy, l, nxd, nyd, gtot, go, gme, gnpeer, gpr(1), gpr(2), gpr(3), &
+    call kgput<<<1, IPC_NT, 0, ist>>>(x, mgx, mgy, l, nxd, nyd, gld, go, gme, gnpeer, gpr(1), gpr(2), gpr(3), &
          gbuf, gq1, gq2, gq3, gf1, gf2, gf3, gqc)
     call kgwait<<<1, 32, 0, ist>>>(gnpeer, gpr(1), gpr(2), gpr(3), gfl, gqc)
-    call kgcopy<<<(gtot + 255) / 256, 256, 0, ist>>>(gtot, gbuf, gqc, out)
+    call kgcopy<<<(gtot + 255) / 256, 256, 0, ist>>>(gtot, gld, gbuf, gqc, out)
     ierr = cudaGetLastError()
     if (ierr /= 0) error stop 'implicit_fs: ipc_gather launch'
 #else
     real(8) :: x(0:mgx + 1, 0:mgy + 1, *), out(*)
 #endif
   end subroutine ipc_gather
+
+  subroutine ipc_gather_v(xv, n, o, cnt, out)
+    ! fs_gpu_opt 2048, fs_mgg's coarse-coefficient gather: this rank's packed values xv(1:n) into every
+    ! rank's gathered buffer at offset o (the same buffers and sequence as ipc_gather; cnt <= gld
+    ! values in all); out(1:cnt) = the gathered values
+    integer, intent(in) :: n, o, cnt
+#ifdef USE_CUDA
+    real(8), device :: xv(*), out(*)
+    integer :: ierr
+    if (cnt > gld) error stop 'implicit_fs: ipc_gather_v: buffer too short'
+    call kgput_v<<<1, IPC_NT, 0, ist>>>(xv, n, gld, o, gme, gnpeer, gbuf, gq1, gq2, gq3, gf1, gf2, gf3, gqc)
+    call kgwait<<<1, 32, 0, ist>>>(gnpeer, gpr(1), gpr(2), gpr(3), gfl, gqc)
+    call kgcopy<<<(cnt + 255) / 256, 256, 0, ist>>>(cnt, gld, gbuf, gqc, out)
+    ierr = cudaGetLastError()
+    if (ierr /= 0) error stop 'implicit_fs: ipc_gather_v launch'
+#else
+    real(8) :: xv(*), out(*)
+#endif
+  end subroutine ipc_gather_v
 
   subroutine ipc_ring_fine(nf, a1, a2, a3, a4, a5, a6)
     ! fs_data's ring of nf fine-level fields (the same strips and halo cells)
@@ -388,6 +410,32 @@ contains
     endif
   end subroutine kgput
 
+  attributes(global) subroutine kgput_v(xv, n, ld, o, me, npeer, gb, q1, q2, q3, f1, f2, f3, qc)
+    ! kgput for a packed vector xv(1:n)
+    integer, value :: n, ld, o, me, npeer
+    real(8), device :: xv(n)
+    real(8), device :: gb(ld, 2), q1(ld, 2), q2(ld, 2), q3(ld, 2)
+    integer, device, volatile :: f1(4), f2(4), f3(4)
+    integer, device :: qc(1)
+    integer :: q, s, k
+    real(8) :: v
+    q = qc(1) + 1; s = mod(q, 2) + 1
+    do k = threadIdx%x, n, blockDim%x
+      v = xv(k)
+      gb(o + k, s) = v
+      if (npeer >= 1) q1(o + k, s) = v
+      if (npeer >= 2) q2(o + k, s) = v
+      if (npeer >= 3) q3(o + k, s) = v
+    enddo
+    call threadfence_system()
+    call syncthreads()
+    if (threadIdx%x == 1) then
+      if (npeer >= 1) f1(me + 1) = q
+      if (npeer >= 2) f2(me + 1) = q
+      if (npeer >= 3) f3(me + 1) = q
+    endif
+  end subroutine kgput_v
+
   attributes(global) subroutine kgwait(npeer, p1, p2, p3, fl, qc)
     integer, value :: npeer, p1, p2, p3
     integer, device, volatile :: fl(4)
@@ -403,9 +451,9 @@ contains
     endif
   end subroutine kgwait
 
-  attributes(global) subroutine kgcopy(tot, gb, qc, out)
-    integer, value :: tot
-    real(8), device, volatile :: gb(tot, 2)
+  attributes(global) subroutine kgcopy(tot, ld, gb, qc, out)
+    integer, value :: tot, ld
+    real(8), device, volatile :: gb(ld, 2)
     integer, device :: qc(1)
     real(8), device :: out(tot)
     integer :: k, s

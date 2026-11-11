@@ -106,6 +106,9 @@ module fs_data
   ! 1024 the host factor of the coarsest level (fs_mgg, after each rebuild of the coarse operators) made
   !     in the first coarsest solve after the rebuild, while the device runs the PCG start and the
   !     first down leg, instead of at the end of the rebuild with the device idle
+  ! 2048 with 256 and the vector gather by IPC: the coarse coefficients' gather of each rebuild
+  !     (fs_mgg) through the same IPC buffers (device-initiated, no host synchronisation) instead of
+  !     GPU-aware MPI
   ! Default 471 = all but 8 and 32, which were slower (sargasso and Pac FS window: 8 +0.2 / +0.15 ms,
   ! 32 +0.2 / +0.3 ms with 128 on: graph-launched kernels beat the cooperative kernels' grid syncs).
   ! fs_gpu_timers 2: the FS window (device synchronised at entry and exit of fs_step) only.
@@ -185,7 +188,7 @@ module fs_data
 #endif
   logical :: o_ring = .false., o_red = .false., o_cvec = .false., o_gath = .false., o_chol = .false.
   logical :: o_fleg = .false., o_cc = .false., o_vgr = .false., o_ipc = .false., o_shm = .false.
-  logical :: o_fac = .false.
+  logical :: o_fac = .false., o_cgi = .false.
   ! fs_gpu_opt 128: a V-cycle recording is open (the host actions go through vg_point_p, which
   ! closes the stretch's graph, launches it, does the action and opens the next stretch)
   logical :: vg_rec = .false.
@@ -274,7 +277,7 @@ contains
     o_gath = iand(fs_gpu_opt, 8) /= 0; o_chol = iand(fs_gpu_opt, 16) /= 0
     o_fleg = iand(fs_gpu_opt, 32) /= 0; o_cc = iand(fs_gpu_opt, 64) /= 0; o_vgr = iand(fs_gpu_opt, 128) /= 0
     o_ipc = iand(fs_gpu_opt, 256) /= 0; o_shm = iand(fs_gpu_opt, 512) /= 0
-    o_fac = iand(fs_gpu_opt, 1024) /= 0
+    o_fac = iand(fs_gpu_opt, 1024) /= 0; o_cgi = iand(fs_gpu_opt, 2048) /= 0
     if (fs_gpu_timers == 1) o_vgr = .false.
 #ifndef USE_CUDA
     o_ring = .false.; o_red = .false.; o_cvec = .false.; o_gath = .false.; o_fleg = .false.; o_vgr = .false.

@@ -22,7 +22,7 @@ module fs_mgg
   use comm_mod, only: comm_allgatherv_dev, comm_allgatherv_h8, comm_rank, comm_size
   use fs_host, only: fsh_get_layout, fsh_factor_from, fsh_direct_vec
   use fs_mgk, only: mgk_init, mgk_down, mgk_up
-  use fs_ipc, only: ipc_gather_init, ipcg_on, ipc_gather
+  use fs_ipc, only: ipc_gather_init, ipcg_on, ipc_gather, ipc_gather_v
 #ifdef USE_CUDA
   use cudafor
   use arch_mod, only: work_stream
@@ -135,7 +135,8 @@ contains
     endif
     if (o_fleg) call mgk_init(glx, gly)
     if (o_ipc) then
-      call ipc_gather_init(np, me, sum(gcnt), gdsp(me + 1))
+      ! (fs_gpu_opt 2048: the buffers also hold the coarse coefficients, ipc_gather_v)
+      call ipc_gather_init(np, me, sum(gcnt), gdsp(me + 1), merge(sum(ccnt), sum(gcnt), o_cgi))
       if (talk) write(*,'(1x,A,L1)') 'IMPLICIT_FS: fs_gpu_opt 256: multigrid gather by CUDA IPC: ', ipcg_on
     endif
     if (o_gath .and. np > 1) then
@@ -198,10 +199,15 @@ contains
     enddo
     endif
     if (np > 1 .and. .not. o_gath) then
+      if (o_cgi .and. ipcg_on) then
+        ! fs_gpu_opt 2048: device-initiated gather on one node (fs_ipc), no host synchronisation
+        call ipc_gather_v(dcs, ncd, int(o), sum(ccnt), dca)
+      else
 #ifdef USE_CUDA
-      ierr = cudaStreamSynchronize(work_stream)
+        ierr = cudaStreamSynchronize(work_stream)
 #endif
-      call comm_allgatherv_dev(ncd, dcs, dca, ccnt, cdsp)
+        call comm_allgatherv_dev(ncd, dcs, dca, ccnt, cdsp)
+      endif
     endif
     a = gx1; b = gy1
     CUF_DO2
