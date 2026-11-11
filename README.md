@@ -234,6 +234,17 @@ v0.1.2-beta, bit for bit.
   the `_spn` file.
 - CDR_LITE: where one of two bracketing carbonate-sensitivity records is
   missing (0), the gas flux now ramps linearly to zero instead of spiking.
+- Implicit free surface (`&implicit_fs fs_mode = 'implicit'`, the port of
+  ucla-roms' implicit free surface with its defaults): one generalized-alpha
+  barotropic step per baroclinic step (two sub-steps of dt/2 by default),
+  reduced to a symmetric positive-definite Helmholtz problem for the
+  sea-level change and solved by multigrid-preconditioned conjugate
+  gradients, replaces the split-explicit fast loop. Without the group, or
+  with `fs_mode = 'split'`, the model is unchanged. The keys are those of
+  UCLA ROMS (`fs_rho_inf`, `fs_nsub`, `fs_pg_rho`, `fs_flather_zghost`,
+  solver and multigrid keys); the GPU adds layout and latency keys
+  (`fs_gpu_gather`, `fs_gpu_coarse`, `fs_gpu_graph`, `fs_gpu_opt`). The
+  restart file holds the scheme's state, so a restart is exact.
 
 ## Numerics
 
@@ -242,7 +253,7 @@ use with MARBL; other CPU options are not available. In ROMS terms:
 
 - SM09 s-coordinate, Shchepetkin pressure-gradient scheme
 - LF-AM3 predictor / corrector time stepping
-- Split-explicit barotropic mode (FB AB3-AM4) with the `weight(1:2,1:nfast)` filter
+- Split-explicit barotropic mode (FB AB3-AM4) with the `weight(1:2,1:nfast)` filter, or the implicit free surface (`&implicit_fs`)
 - Thickness-aware C4 predictor / U3 corrector vertical advection
 - UPSTREAM_TS horizontal tracer advection (`UPSTREAM_TS_LAND_CURV` always on)
 - LMD94 interior mixing and KPP surface and bottom boundary layers (SMOOTH_RIG, INT_AT_RHO_POINTS, SMOOTH_HBL, Jwt=1)

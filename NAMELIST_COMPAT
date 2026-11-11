@@ -52,8 +52,10 @@
 # the step's tuning (exact restarts), as in that version of UCLA ROMS.
 #
 # Implicit free surface (&implicit_fs, fs_mode = 'implicit'; absent or
-# 'split': the split-explicit fast loop): the keys of ucla-roms
-# implicit-fs-defaults. The CPU's MPI-layout keys fs_mg_gather,
+# 'split': the split-explicit fast loop): the keys and defaults of
+# ucla-roms implicit-fs-defaults (fs_rho_inf 0.5, fs_nsub 2, fs_pg_rho and
+# fs_flather_zghost .true.; fs_rho_inf = 0, fs_nsub = 1 and both keys
+# .false. give the earlier single step). The CPU's MPI-layout keys fs_mg_gather,
 # fs_mg_global_on and fs_exch_thin are read and not used (the GPU's layout
 # keys are fs_gpu_gather, fs_gpu_coarse, fs_gpu_graph, fs_gpu_opt;
 # fs_gpu_timers for timing runs); fs_selftest is read and ignored. The

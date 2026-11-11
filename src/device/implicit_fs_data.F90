@@ -25,7 +25,9 @@ module fs_data
 
   ! Namelist &implicit_fs (FS_SPEC 6; same keys and defaults as the CPU)
   character(len=8) :: fs_mode = 'split'
-  real(rp) :: fs_rho_inf = 0.0_rp
+  ! Defaults of ucla-roms implicit-fs-defaults (864969bd): two sub-steps at fs_rho_inf 0.5 with fs_pg_rho and
+  ! fs_flather_zghost (the previous behaviour: fs_rho_inf = 0, fs_nsub = 1, both keys .false.)
+  real(rp) :: fs_rho_inf = 0.5_rp
   real(rp) :: fs_theta = 0.5_rp
   real(rp) :: fs_theta_div = 0.5_rp
   real(rp) :: fs_tol = 1.e-8_rp
@@ -116,13 +118,13 @@ module fs_data
   ! (tidal potential 'af', stress 'af') is taken at n + sft dt, sft = (alpha_f + (fs_nsub-1)/2)/fs_nsub
   ! (= alpha_f for one step), the boundary tidal harmonics at n + fs_bry_phase dt, fs_bry_phase =
   ! (fs_nsub+1)/(2 fs_nsub) (1 for one step). dts = dt/fs_nsub, the (sub-)step length.
-  integer :: fs_nsub = 1
+  integer :: fs_nsub = 2
   real(rp) :: sft = 1.0_rp, fs_bry_phase = 1.0_rp, dts = 0.0_rp
   ! fs_pg_rho (CPU 7ffc3990): the implicit pressure-gradient operator carries the density weighting of
   ! the depth-integrated 3-D pressure gradient (rhoS, rhoA of rho_eos, as step2d's rubar). roms_gpu
   ! always computes rhoS and rhoA (its step2d always uses them, the CPU's VAR_RHO_2D), so the CPU's
   ! fallback for builds without VAR_RHO_2D (b582aa94) has no GPU counterpart.
-  logical :: fs_pg_rho = .false.
+  logical :: fs_pg_rho = .true.
   ! fs_flather_zghost (CPU 7be4fafe): open (Flather) faces take the sea level of the condition as the mean
   ! of the first interior and the boundary rho point, as the split's u2dbc (zx); the boundary value follows
   ! the radiation condition of the zeta boundary kernel and is eliminated: a diagonal Robin term with
@@ -130,7 +132,7 @@ module fs_data
   ! pm sqrt(g h) at the first interior point. .false.: the first interior value alone (the boundary-forced
   ! tide later than the split's by about dx/(2 sqrt(g h))). cbu, cbv hold cb; the products cb w1 are formed
   ! where they are used (the same rounded values as the CPU's stored cbu = cb w1).
-  logical :: fs_flather_zghost = .false.
+  logical :: fs_flather_zghost = .true.
   namelist /implicit_fs/ fs_mode, fs_rho_inf, fs_theta, fs_theta_div, fs_tol, fs_maxit, fs_precond, &
        fs_mg_levels, fs_mg_nu, fs_mg_smoother, fs_mg_lag, fs_drag_implicit, &
        fs_warm, fs_verbose, fs_selftest, fs_tang_nudge, &
