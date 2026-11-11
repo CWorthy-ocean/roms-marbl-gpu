@@ -50,7 +50,8 @@ module implicit_fs_gpu
   use formulas, only: g
   use halo_mod, only: halo_fill_zuv_n
   use geom, only: set_depth
-  use comm_mod, only: comm_allreduce_sum, comm_allreduce_max, comm_world_rank, comm_abort
+  use comm_mod, only: comm_allreduce_sum, comm_allreduce_max, comm_world_rank, comm_abort, comm_shm_init, comm_fs_sum, &
+       comm_fs_sum_stats
   use rivers_mod, only: river_on, rf_flx, rivers_fs_map
   use cdr_src_mod, only: cdr_vol_on, cdr_fs_src
   use run_timers, only: wall_time
@@ -132,7 +133,7 @@ contains
     if (trim(fs_gpu_coarse) /= 'device' .and. trim(fs_gpu_coarse) /= 'host') &
          error stop "IMPLICIT_FS: fs_gpu_coarse must be 'device' or 'host'"
     dev_glob = (trim(fs_gpu_coarse) == 'device')
-    if (fs_gpu_opt < 0 .or. fs_gpu_opt > 511) error stop 'IMPLICIT_FS: fs_gpu_opt must lie in [0, 511]'
+    if (fs_gpu_opt < 0 .or. fs_gpu_opt > 1023) error stop 'IMPLICIT_FS: fs_gpu_opt must lie in [0, 1023]'
     if (fs_gpu_timers < 0 .or. fs_gpu_timers > 2) error stop 'IMPLICIT_FS: fs_gpu_timers must be 0, 1 or 2'
     call fs_opt_flags()
     if (talk) then
@@ -199,6 +200,7 @@ contains
   subroutine fs_init()
     integer(ip) :: is, ie, js, je, nx, ny
     integer :: m
+    logical :: shm_ok
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     nx = decomp%nx; ny = decomp%ny
     allocate(unu(is:ie, js:je), unv(is:ie, js:je), usu(is:ie, js:je), usv(is:ie, js:je), &
@@ -236,6 +238,11 @@ contains
            int(nx), int(ny), int(is), int(ie), int(js), int(je), &
            [decomp%edge_w, decomp%edge_e, decomp%edge_s, decomp%edge_n], work_stream)
       if (talk) write(*,'(1x,A,L1)') 'IMPLICIT_FS: fs_gpu_opt 256: rings by CUDA IPC: ', ipc_on
+    endif
+    if (o_shm) then
+      ! fs_gpu_opt 512: the PCG's reductions through shared memory when all compute ranks share a node
+      call comm_shm_init(shm_ok)
+      if (talk) write(*,'(1x,A,L1)') 'IMPLICIT_FS: fs_gpu_opt 512: PCG reductions through shared memory: ', shm_ok
     endif
     if (mg_on) call mg_build_layout()
     ready = .true.
@@ -1202,7 +1209,7 @@ contains
     enddo
     call tq(T_START)
     call fs_sum(4, loc)
-    call comm_allreduce_sum(4, loc, glob)
+    call comm_fs_sum(4, loc, glob)
     call tq(T_RED)
     rz = glob(1); bn2 = glob(4)
     if (bn2 <= 0.0_rp) then
@@ -1222,7 +1229,7 @@ contains
       call fs_apply(pd, qq, .true.)
       call tq(T_OP)
       call fs_sum(merge(3, 1, mg_on), loc)
-      call comm_allreduce_sum(merge(3, 1, mg_on), loc(1:3), glob(1:3))
+      call comm_fs_sum(merge(3, 1, mg_on), loc(1:3), glob(1:3))
       call tq(T_RED)
       pq = glob(1)
       if (.not. fs_finite(pq)) call fs_nan_stop('<p,q>', it)
@@ -1240,7 +1247,7 @@ contains
         call tq(T_VEC)
         if (chk) then                       ! the norm of the new residual, summed as precond's slot 2
           call fs_sum(1, loc)
-          call comm_allreduce_sum(1, loc(1:1), glob(1:1))
+          call comm_fs_sum(1, loc(1:1), glob(1:1))
           call tq(T_RED)
           if (.not. fs_finite(glob(1))) call fs_nan_stop('residual norm', it)
           if (glob(1) <= tol2) then
@@ -1263,7 +1270,7 @@ contains
         call tq(T_PC)
       endif
       call fs_sum(merge(3, 2, mg_on), loc)
-      call comm_allreduce_sum(merge(3, 2, mg_on), loc(1:3), glob(1:3))
+      call comm_fs_sum(merge(3, 2, mg_on), loc(1:3), glob(1:3))
       call tq(T_RED)
       rznew = glob(1)
       if (.not. fs_finite(glob(2))) call fs_nan_stop('residual norm', it)
@@ -1492,10 +1499,13 @@ contains
 
   subroutine fs_cost_print()
     ! end of the run: FS_STAT (as the CPU, always); with fs_verbose >= 1 also the GPU's communication
-    ! counts per solve (FS_STAT per solve); with fs_gpu_timers 1 the FS_COST pieces, with 2 FS_WIN
-    ! (their reductions only then)
-    real(8) :: gm(ntm), lm(ntm), x(2), y(2)
+    ! counts per solve (FS_STAT per solve); with ROMS_GPU_FS_SHM_CMP and the shared-memory sums on, their
+    ! comparison with MPI_Allreduce; with fs_gpu_timers 1 the FS_COST pieces, with 2 FS_WIN (their
+    ! reductions only then)
+    real(8) :: gm(ntm), lm(ntm), x(2), y(2), c(2), cg(2)
     integer :: i
+    logical :: son, scmp
+    integer(8) :: sn, sd
     if (talk) then
       write(*,'(1x,A,I7,A,F9.2,A,I6)') 'FS_STAT solves', n_solve, ' mean its', real(n_its, 8) / max(n_solve, 1), &
            ' unconverged', n_unconv
@@ -1503,6 +1513,13 @@ contains
       if (fs_verbose >= 1) write(*,'(1x,A,4(A,F9.2))') 'FS_STAT per solve:', ' ring rounds', &
            real(n_ring, 8) / max(n_solve, 1), ' reductions', real(n_red, 8) / max(n_solve, 1), &
            ' V-cycles', real(n_vc, 8) / max(n_solve, 1), ' host gathers', real(n_gath, 8) / max(n_solve, 1)
+    endif
+    call comm_fs_sum_stats(son, scmp, sn, sd)    ! son, scmp: the same on every compute rank
+    if (son .and. scmp) then
+      c(1) = real(sn, 8); c(2) = real(sd, 8)
+      call comm_allreduce_max(2, c, cg)
+      if (talk) write(*,'(1x,A,I12,A,I10,A)') 'FS_STAT shared-memory sums (ROMS_GPU_FS_SHM_CMP):', &
+           nint(cg(1), 8), ' reductions, ', nint(cg(2), 8), ' values differing from MPI_Allreduce (max over ranks)'
     endif
     if (fs_gpu_timers < 1) return
     lm = tm

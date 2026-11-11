@@ -19,6 +19,7 @@ module comm_mod
   ! (>= 0) go through host-staged MPI_Sendrecv of the same pack buffers.
   ! CUDA graphs stay off when comm_size > 1 because deliver is host MPI.
   use kinds
+  use iso_c_binding, only: c_ptr, c_f_pointer
   implicit none
 #ifdef USE_MPI
   include 'mpif.h'
@@ -39,6 +40,16 @@ module comm_mod
   integer, allocatable :: writer_world(:)     ! (0:io_nserv-1) world rank of each writer
   integer, allocatable :: compute_of_world(:) ! (0:world_size-1) compute rank, -1 on writers
   logical :: ready = .false.
+  ! comm_fs_sum (the implicit free surface's PCG reductions, fs_gpu_opt 512): when all compute ranks
+  ! (1, 2 or 4) share one node, the sums go through an MPI-3 shared-memory window instead of
+  ! MPI_Allreduce. Per rank one column of SHM_SEG doubles: two slots of 8 values (1:8, 9:16) and the
+  ! sequence counter (17). shm_cmp (ROMS_GPU_FS_SHM_CMP=1): every sum is also made by MPI_Allreduce
+  ! and the bit differences counted (shm_ndiff), the shared-memory result is used.
+  integer, parameter :: SHM_SEG = 32
+  logical :: shm_on = .false., shm_cmp = .false.
+  integer :: shm_win = 0, shm_np = 0, shm_me = 0
+  integer(8) :: shm_q = 0, shm_ncall = 0, shm_ndiff = 0
+  real(8), pointer, volatile :: shm(:,:) => null()
 
   public :: init_comm
   public :: finalize_comm
@@ -54,6 +65,7 @@ module comm_mod
   public :: comm_reduce_maxsum
   public :: comm_reduce_sum
   public :: comm_allreduce_sum, comm_allreduce_max, comm_allreduce_min
+  public :: comm_shm_init, comm_fs_sum, comm_fs_sum_stats
   public :: comm_allgather_i4, comm_allgatherv_r8, comm_allgatherv_dev, comm_allgatherv_h8
   public :: comm_gpu_direct
   public :: comm_exchange3
@@ -583,6 +595,114 @@ contains
     xsum = x
 #endif
   end subroutine comm_allreduce_sum
+
+  subroutine comm_shm_init(on)
+    ! Collective over the compute ranks (fs_gpu_opt 512): set up comm_fs_sum's shared-memory window.
+    ! on: in use on every rank (1 rank; or 2 or 4 ranks, all on one node, window made on every rank);
+    ! otherwise comm_fs_sum is MPI_Allreduce. The decision is the same on every rank.
+    logical, intent(out) :: on
+#ifdef USE_MPI
+    integer :: ncomm, nsz, ierr, du, ok(1), gok(1)
+    integer(kind=MPI_ADDRESS_KIND) :: sz, base
+    type(c_ptr) :: cp
+    character(len=8) :: val
+    integer :: st
+    if (.not. ready) call init_comm()
+    on = .false.
+    val = ''
+    call get_environment_variable('ROMS_GPU_FS_SHM_CMP', val, status=st)
+    shm_cmp = (st == 0 .and. val(1:1) == '1')
+    if (nproc == 1) then
+      shm_np = 1; shm_me = 0; shm_on = .true.; on = .true.
+      return
+    endif
+    if (nproc /= 2 .and. nproc /= 4) return
+    call MPI_Comm_split_type(compute_comm, MPI_COMM_TYPE_SHARED, int(my_rank), MPI_INFO_NULL, ncomm, ierr)
+    ok(1) = 0
+    if (ierr == MPI_SUCCESS) then
+      call MPI_Comm_size(ncomm, nsz, ierr)
+      if (nsz == nproc) ok(1) = 1
+    endif
+    call MPI_Allreduce(ok, gok, 1, MPI_INTEGER, MPI_MIN, compute_comm, ierr)
+    if (gok(1) == 0) return
+    ! one segment, allocated by rank 0 of the node communicator (= compute rank 0: key my_rank)
+    sz = 0
+    if (my_rank == 0) sz = int(SHM_SEG, MPI_ADDRESS_KIND) * 8 * int(nproc, MPI_ADDRESS_KIND)
+    call MPI_Win_allocate_shared(sz, 8, MPI_INFO_NULL, ncomm, base, shm_win, ierr)
+    ok(1) = merge(1, 0, ierr == MPI_SUCCESS)
+    if (ok(1) == 1) then
+      call MPI_Win_shared_query(shm_win, 0, sz, du, base, ierr)
+      if (ierr /= MPI_SUCCESS .or. sz < int(SHM_SEG, MPI_ADDRESS_KIND) * 8 * int(nproc, MPI_ADDRESS_KIND)) ok(1) = 0
+    endif
+    call MPI_Allreduce(ok, gok, 1, MPI_INTEGER, MPI_MIN, compute_comm, ierr)
+    if (gok(1) == 0) return
+    cp = transfer(base, cp)
+    call c_f_pointer(cp, shm, [SHM_SEG, int(nproc)])
+    call MPI_Win_lock_all(MPI_MODE_NOCHECK, shm_win, ierr)
+    shm(:, my_rank + 1) = 0.0d0
+    call MPI_Win_sync(shm_win, ierr)
+    call MPI_Barrier(compute_comm, ierr)
+    shm_np = int(nproc); shm_me = int(my_rank); shm_q = 0; shm_on = .true.; on = .true.
+#else
+    shm_np = 1; shm_on = .true.; on = .true.
+#endif
+  end subroutine comm_shm_init
+
+  subroutine comm_fs_sum(n, x, xsum)
+    ! Sum of x(1:n) (n <= 8) over the compute ranks, on every compute rank. With the shared-memory
+    ! window (comm_shm_init): this rank's values into slot mod(q, 2) of its column, its counter
+    ! raised to q, a spin until every counter has reached q, then the pairwise sum in compute-rank
+    ! order, x0 + x1 or (x0 + x1) + (x2 + x3), on every rank. Two slots suffice: a rank writes
+    ! slot mod(q, 2) again only in reduction q + 2, after every other rank has raised its counter
+    ! to q + 1, i.e. has finished reading reduction q. Otherwise MPI_Allreduce.
+    integer, intent(in) :: n
+    real(8), intent(in) :: x(n)
+    real(8), intent(out) :: xsum(n)
+#ifdef USE_MPI
+    integer :: k, o, ierr
+    real(8) :: q, ref(8)
+    if (.not. shm_on) then
+      call comm_allreduce_sum(n, x, xsum)
+      return
+    endif
+    shm_ncall = shm_ncall + 1
+    if (shm_np == 1) then
+      xsum(1:n) = x(1:n)
+    else
+      shm_q = shm_q + 1; q = real(shm_q, 8); o = 8 * int(mod(shm_q, 2_8))
+      shm(o + 1:o + n, shm_me + 1) = x(1:n)
+      call MPI_Win_sync(shm_win, ierr)
+      shm(17, shm_me + 1) = q
+      do k = 1, shm_np
+        do while (shm(17, k) < q)
+          call MPI_Win_sync(shm_win, ierr)     ! (memory barrier; shm is volatile as well)
+        enddo
+      enddo
+      call MPI_Win_sync(shm_win, ierr)
+      if (shm_np == 2) then
+        xsum(1:n) = shm(o + 1:o + n, 1) + shm(o + 1:o + n, 2)
+      else
+        xsum(1:n) = (shm(o + 1:o + n, 1) + shm(o + 1:o + n, 2)) + (shm(o + 1:o + n, 3) + shm(o + 1:o + n, 4))
+      endif
+    endif
+    if (shm_cmp) then
+      call MPI_Allreduce(x, ref, n, MPI_DOUBLE_PRECISION, MPI_SUM, compute_comm, ierr)
+      do k = 1, n
+        if (transfer(ref(k), 0_8) /= transfer(xsum(k), 0_8)) shm_ndiff = shm_ndiff + 1
+      enddo
+    endif
+#else
+    xsum = x
+#endif
+  end subroutine comm_fs_sum
+
+  subroutine comm_fs_sum_stats(on, cmp, ncall, ndiff)
+    ! comm_fs_sum: in use, compare mode, calls through the window and bit differences against
+    ! MPI_Allreduce (this rank)
+    logical, intent(out) :: on, cmp
+    integer(8), intent(out) :: ncall, ndiff
+    on = shm_on; cmp = shm_cmp; ncall = shm_ncall; ndiff = shm_ndiff
+  end subroutine comm_fs_sum_stats
 
   subroutine comm_allreduce_max(n, x, xmax)
     ! Max of x(1:n) over the compute ranks, on every compute rank.
