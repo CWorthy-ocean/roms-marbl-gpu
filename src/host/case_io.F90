@@ -28,6 +28,11 @@ module case_io
   use tile_balance, only: balance_cuts, uniform_cuts
   use halo_mod, only: halo_fill_2d, halo_fill_2d_s, halo_fill_3d_s, halo_fill_3d_t, halo_fill_3d_tp
   use formulas, only: rho0_eos => rho0
+  use pflx_mod, only: calc_pflx, pflx_timescale, init_pflx, pflx_fill_slow_halos, u_slow, v_slow, p_slow
+  use pflx_mod, only: ub_tune, sponge_timescale, nrpf_sponge, output_period_sponge, wrt_sponge, sponge_avg, &
+                      init_sponge_tune
+  use sponge_io, only: load_rst_ub, init_spn_arrays
+  use sponge_out, only: set_spn_root, init_spn_output
   use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name, &
        passive_hold, set_cdr_lite, passive_finish_list, ncdr, tnu2_tp, n_marbl, cdr0, passive_mirror
   use marbl_gpu, only: marbl_gpu_init_diagnostics
@@ -72,6 +77,7 @@ module case_io
   integer(ip), public :: case_record = 1
   integer(ip), public :: case_nrrec = -1
   logical,     public :: case_exact_restart = .false.
+  logical :: ncid_has_uslow = .false., ncid_has_vslow = .false.   ! calc_pflx restart fields present
   logical :: case_have_prev = .false.
   logical,     public :: case_periodic_x = .false.
   logical,     public :: case_periodic_y = .false.
@@ -112,6 +118,9 @@ contains
     namelist /ubind_settings/ ubind
     real(rp) :: v_sponge
     namelist /v_sponge_settings/ v_sponge
+    namelist /calc_pflx_settings/ calc_pflx, pflx_timescale
+    namelist /sponge_tune_settings/ sponge_timescale, nrpf_sponge, output_period_sponge, ub_tune, wrt_sponge, &
+                                    sponge_avg
 
     llm = 32; mmm = 32; nz = 0; n = 0
     np_xi = 1; np_eta = 1; nsub_x = 1; nsub_e = 1
@@ -165,6 +174,16 @@ contains
     call nml_stop(ios, msg, 'V_SPONGE_SETTINGS')
     if (ios /= 0) v_sponge = 0.0_rp
     case_v_sponge = v_sponge
+    ! pressure fluxes for nesting (optional group; absent: off)
+    calc_pflx = .false.; pflx_timescale = 0.0_rp
+    rewind(unit); read(unit, nml=calc_pflx_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'CALC_PFLX_SETTINGS')
+    if (ios /= 0) calc_pflx = .false.
+    ! child side: sponge tuning (optional group; absent: off)
+    ub_tune = .false.; wrt_sponge = .false.; sponge_avg = .false.
+    rewind(unit); read(unit, nml=sponge_tune_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'SPONGE_TUNE_SETTINGS')
+    if (ios /= 0) ub_tune = .false.
     call read_forcing_namelist(unit, nml_dir)
     call read_tide_namelist(unit)
     call read_refdate_namelist(unit)
@@ -594,6 +613,9 @@ contains
 
     call read_namelist(nml_path)
     call alloc_state(nt)
+    call init_pflx()                    ! calc_pflx: running means (restart fields) and fluxes
+    call init_sponge_tune()             ! ub_tune: boundary tuning coefficients (0 until read)
+    call init_spn_arrays()              ! ub_tune: fluxes and averages for the _spn output
     if (marbl_on) call marbl_gpu_setup_tracers()
     call passive_finish_list()          ! without MARBL: generic + CDR_LITE tracers
 
@@ -680,9 +702,11 @@ contains
       error stop 'load_case'
     endif
     call load_init_records(ncid, i0, j0, nxi, neta, xi_u, eta_v)
+    call load_rst_ub(ncid, int(case_record))   ! ub_tune: the CPU's get_init_ub
     call nc_close(ncid)
     call mask_loaded_velocities()
     call fill_masked_velocity_halos()
+    if (calc_pflx) call init_pflx_slow(ncid_has_uslow, ncid_has_vslow)
     call wall_stamp('initial state read')
 
     call sanitize_land()
@@ -755,6 +779,8 @@ contains
     call init_cdr_output()
     call init_upscale_output()        ! after init_bry (open sides)
     call init_extract()               ! child-grid boundary extraction
+    call set_spn_root(case_output_root)
+    call init_spn_output()            ! ub_tune + wrt_sponge: the _spn file (after init_bry: open sides)
     call wall_stamp('output init')
   end subroutine load_case
 
@@ -867,6 +893,7 @@ contains
       if (have_coup .or. has_coupling_fields(ncid)) then
         call load_coupling_fields(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
       endif
+      if (calc_pflx) call load_pflx_slow(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
       if (ld_phase == 1) then
         call wall_stamp('ini queued')
         call pr_flush(ncid)
@@ -969,6 +996,64 @@ contains
     DU_avg_bak = DU_avg_bak * (umask + riv_umask)
     DV_avg_bak = DV_avg_bak * (vmask + riv_vmask)
   end subroutine load_coupling_fields
+
+  subroutine load_pflx_slow(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
+    ! The CPU's get_init_slow: the running means of calc_pflx from the
+    ! current record, masked; u_slow and v_slow absent: the velocity
+    ! (init_pflx_slow, after the velocities are loaded and masked); p_slow
+    ! absent: 0 (init_pflx).
+    integer, intent(in) :: ncid, rec, i0, j0, nxi, neta, xi_u, eta_v
+    ncid_has_uslow = nc_has_var(ncid, 'u_slow')
+    ncid_has_vslow = nc_has_var(ncid, 'v_slow')
+    if (ncid_has_uslow) then
+      call pr_store_3d(ncid, 'u_slow', u_slow(decomp%is, decomp%js, 1), i0+1, j0, xi_u, neta, decomp%nz, rec, &
+                       i0f=tile_fi0, j0f=tile_fj0)
+    endif
+    if (ncid_has_vslow) then
+      call pr_store_3d(ncid, 'v_slow', v_slow(decomp%is, decomp%js, 1), i0, j0+1, nxi, eta_v, decomp%nz, rec, &
+                       i0f=tile_fi0, j0f=tile_fj0)
+    endif
+    if (nc_has_var(ncid, 'p_slow')) then
+      call pr_store_3d(ncid, 'p_slow', p_slow(decomp%is, decomp%js, 1), i0, j0, nxi, neta, decomp%nz, rec, &
+                       i0f=tile_fi0, j0f=tile_fj0)
+    elseif (pr_taking() .and. comm_rank() == 0) then
+      write(*,'(a)') ' --- WARNING: p_slow not in initial file.  Initialized to 0.0'
+    endif
+  end subroutine load_pflx_slow
+
+  subroutine init_pflx_slow(have_u, have_v)
+    ! After the restart read: mask the running means read from the file, or
+    ! start them from the (masked) velocity of the current record as the
+    ! CPU does (the full velocity, owned faces 1:i1 x j0:j1 / i0:i1 x 1:j1);
+    ! exchange p_slow.
+    logical, intent(in) :: have_u, have_v
+    integer(ip) :: k, ia, ib, ja, jb
+    call sync_arch()
+    if (have_u) then
+      do k = 1, decomp%nz
+        u_slow(:, :, k) = u_slow(:, :, k) * umask
+      enddo
+    else
+      ia = 1; ib = merge(decomp%nx + 1, decomp%nx, decomp%edge_e)
+      ja = merge(0, 1, decomp%edge_s); jb = merge(decomp%ny + 1, decomp%ny, decomp%edge_n)
+      u_slow(ia:ib, ja:jb, :) = u(ia:ib, ja:jb, :, 1)
+      if (comm_rank() == 0) write(*,'(a)') ' --- WARNING: u_slow not in initial file.  Initialized to u'
+    endif
+    if (have_v) then
+      do k = 1, decomp%nz
+        v_slow(:, :, k) = v_slow(:, :, k) * vmask
+      enddo
+    else
+      ia = merge(0, 1, decomp%edge_w); ib = merge(decomp%nx + 1, decomp%nx, decomp%edge_e)
+      ja = 1; jb = merge(decomp%ny + 1, decomp%ny, decomp%edge_n)
+      v_slow(ia:ib, ja:jb, :) = v(ia:ib, ja:jb, :, 1)
+      if (comm_rank() == 0) write(*,'(a)') ' --- WARNING: v_slow not in initial file.  Initialized to v'
+    endif
+    do k = 1, decomp%nz
+      p_slow(:, :, k) = p_slow(:, :, k) * rmask
+    enddo
+    call pflx_fill_slow_halos()
+  end subroutine init_pflx_slow
 
   subroutine load_rufrc_slot(ncid, rec, tindx, i0, j0, nxi, neta, xi_u, eta_v)
     integer, intent(in) :: ncid, rec, tindx, i0, j0, nxi, neta, xi_u, eta_v

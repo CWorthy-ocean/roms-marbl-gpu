@@ -28,6 +28,29 @@
 # while its switch is off gives a start-up warning. The restoring-flux
 # output (&surf_flx_output_settings wrt_rstflx) is not on the GPU.
 #
+# Pressure fluxes for nesting: &calc_pflx_settings calc_pflx and
+# pflx_timescale as UCLA ROMS (the group is optional here; absent means
+# off). UCLA ROMS computes up/vp only when built with the DIAGNOSTICS cpp
+# key; roms_gpu computes them whenever calc_pflx = .true., with the
+# internal-tide pressure of ucla-roms eae883ee, writes up_<side>/vp_<side>
+# to the child boundary file for objects whose output_vars name them, and
+# keeps u_slow, v_slow, p_slow in the restart. pflx_timescale must be > 0
+# when calc_pflx is on (the run stops otherwise).
+#
+# Sponge tuning for nested children: &sponge_tune_settings ub_tune (the CPU
+# needs the SPONGE_TUNE cpp key as well; the GPU only the switch) tunes the
+# inflow nudging of the open boundaries to the parent's up/vp of the
+# boundary files; it needs calc_pflx = .true. (the run stops otherwise), as
+# UCLA ROMS. wrt_sponge writes <output_root_name>_spn.<date>.nc every
+# output_period_sponge (nrpf_sponge records per file): the child and parent
+# fluxes and the coefficient of every open side, averaged over the period
+# (sponge_avg) or of the output step, as UCLA ROMS with its fixes of
+# 2026-11 (sponge-tune-pio-fixes). As UCLA ROMS's precheck, with restarts
+# and wrt_sponge on, nrpf_sponge * output_period_sponge must be positive
+# and divide output_period_rst (the run stops otherwise). The coefficients
+# ub_west, ub_east, ub_south, ub_north are restart fields, written after
+# the step's tuning (exact restarts), as in that version of UCLA ROMS.
+#
 # Half-resolution forcing: interp_bulk_frc, interp_flux_frc
 # (&surf_frc_settings) and interp_bgc_frc (&bgc_settings) are read but not
 # used; roms_gpu takes a forcing field as half resolution from its shape

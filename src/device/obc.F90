@@ -12,6 +12,7 @@ module obc
   use gpu_state
   use time_state
   use formulas, only: g, apply_mask
+  use pflx_mod, only: ub_tune, ub_w, ub_e, ub_s, ub_n
   use arch_mod, only: sync_arch
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
@@ -583,10 +584,11 @@ contains
     ! the CPU (normal 0, wall copy); corner means between two open edges.
     integer(ip) :: i, j, k, nx, ny, nz, i0, ns, nn, nr, iu1
     real(rp) :: dft, dfx, dfy, cff, cx, cy, cext, dtw, ub
+    logical :: ubt
     real(rp) :: g0c, g0p, g1c, g1p, g0m, g1m
     logical :: sw, se, nw, ne
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
-    ns = nstp; nn = nnew; nr = nrhs; ub = ubind
+    ns = nstp; nn = nnew; nr = nrhs; ub = ubind; ubt = ub_tune
     dtw = dtfwd()
     i0 = 1
     if (decomp%edge_w) i0 = 2
@@ -626,6 +628,7 @@ contains
           endif
           u(1, j, k, nn) = (cff * u(1, j, k, ns) + cx * u(2, j, k, nn) &
                - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p) / (cff + cx)
+          if (ubt) cext = max(cext, min(ub_w(j), 1.0_rp))   ! SPONGE_TUNE (CPU ub_tune)
           u(1, j, k, nn) = ((1.0_rp - cext) * u(1, j, k, nn) + cext * u_west(j, k)) * umask(1, j)
         enddo
       enddo
@@ -669,6 +672,7 @@ contains
           endif
           u(nx + 1, j, k, nn) = (cff * u(nx + 1, j, k, ns) + cx * u(nx, j, k, nn) &
                - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p) / (cff + cx)
+          if (ubt) cext = max(cext, min(ub_e(j), 1.0_rp))   ! SPONGE_TUNE (CPU ub_tune)
           u(nx + 1, j, k, nn) = ((1.0_rp - cext) * u(nx + 1, j, k, nn) + &
                cext * u_east(j, k)) * umask(nx + 1, j)
         enddo
@@ -704,6 +708,7 @@ contains
           u(i, 0, k, nn) = (1.0_rp - cx) * (u(i, 0, k, ns) &
                - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c) &
                + cx * (u(i, 1, k, ns) - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c)
+          if (ubt) cext = max(cext, min(ub_s(i), 1.0_rp))   ! SPONGE_TUNE (CPU ub_tune)
           u(i, 0, k, nn) = ((1.0_rp - cext) * u(i, 0, k, nn) + cext * u_south(i, k)) * umask(i, 0)
         enddo
       enddo
@@ -736,6 +741,7 @@ contains
           u(i, ny + 1, k, nn) = (1.0_rp - cx) * (u(i, ny + 1, k, ns) &
                - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c) &
                + cx * (u(i, ny, k, ns) - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c)
+          if (ubt) cext = max(cext, min(ub_n(i), 1.0_rp))   ! SPONGE_TUNE (CPU ub_tune)
           u(i, ny + 1, k, nn) = ((1.0_rp - cext) * u(i, ny + 1, k, nn) + &
                cext * u_north(i, k)) * umask(i, ny + 1)
         enddo
@@ -771,12 +777,13 @@ contains
     integer(ip) :: i, j, k, nx, ny, nz, j0, ns, nn, nr, jv1
     integer(ip) :: ip0, kk, ii
     real(rp) :: dft, dfx, dfy, cff, cx, cy, cext, dtw, ub
+    logical :: ubt
     real(rp) :: g0c, g0p, g1c, g1p, g0m, g1m
     real(rp) :: pv(16, npi, npk)
     integer(ip) :: kprb(npk)
     logical :: sw, se, nw, ne, probe_n
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
-    ns = nstp; nn = nnew; nr = nrhs; ub = ubind
+    ns = nstp; nn = nnew; nr = nrhs; ub = ubind; ubt = ub_tune
     dtw = dtfwd()
     j0 = 1
     if (decomp%edge_s) j0 = 2
@@ -814,6 +821,7 @@ contains
           endif
           v(i, 1, k, nn) = (cff * v(i, 1, k, ns) + cx * v(i, 2, k, nn) &
                - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p) / (cff + cx)
+          if (ubt) cext = max(cext, min(ub_s(i), 1.0_rp))   ! SPONGE_TUNE (CPU ub_tune)
           v(i, 1, k, nn) = ((1.0_rp - cext) * v(i, 1, k, nn) + cext * v_south(i, k)) * vmask(i, 1)
         enddo
       enddo
@@ -902,6 +910,7 @@ contains
           endif
           v(i, ny + 1, k, nn) = (cff * v(i, ny + 1, k, ns) + cx * v(i, ny, k, nn) &
                - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p) / (cff + cx)
+          if (ubt) cext = max(cext, min(ub_n(i), 1.0_rp))   ! SPONGE_TUNE (CPU ub_tune)
           v(i, ny + 1, k, nn) = ((1.0_rp - cext) * v(i, ny + 1, k, nn) + &
                cext * v_north(i, k)) * vmask(i, ny + 1)
         enddo
@@ -950,6 +959,7 @@ contains
           v(0, j, k, nn) = (1.0_rp - cx) * (v(0, j, k, ns) &
                - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c) &
                + cx * (v(1, j, k, ns) - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c)
+          if (ubt) cext = max(cext, min(ub_w(j), 1.0_rp))   ! SPONGE_TUNE (CPU ub_tune)
           v(0, j, k, nn) = ((1.0_rp - cext) * v(0, j, k, nn) + cext * v_west(j, k)) * vmask(0, j)
         enddo
       enddo
@@ -982,6 +992,7 @@ contains
           v(nx + 1, j, k, nn) = (1.0_rp - cx) * (v(nx + 1, j, k, ns) &
                - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c) &
                + cx * (v(nx, j, k, ns) - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c)
+          if (ubt) cext = max(cext, min(ub_e(j), 1.0_rp))   ! SPONGE_TUNE (CPU ub_tune)
           v(nx + 1, j, k, nn) = ((1.0_rp - cext) * v(nx + 1, j, k, nn) + &
                cext * v_east(j, k)) * vmask(nx + 1, j)
         enddo
@@ -1020,9 +1031,9 @@ contains
     integer(ip) :: i, j, k, nx, ny, nz, ns, nn, nr, it
     real(rp) :: cx, cy, cext, dtw, cff
     real(rp) :: g0c, g0p, g1c, g1p
-    logical :: sw, se, nw, ne
+    logical :: sw, se, nw, ne, ubt
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
-    ns = nstp; nn = nnew; nr = nrhs; it = itrc
+    ns = nstp; nn = nnew; nr = nrhs; it = itrc; ubt = ub_tune
     dtw = dtfwd()
 
     if (decomp%edge_w) then
@@ -1044,6 +1055,7 @@ contains
             t(0, j, k, nn, it) = (1.0_rp - cx) * (t(0, j, k, ns, it) &
                  - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p) &
                  + cx * (t(1, j, k, ns, it) - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p)
+            if (ubt) cext = max(cext, min(ub_w(j), 1.0_rp))   ! SPONGE_TUNE (CPU ub_tune)
             t(0, j, k, nn, it) = ((1.0_rp - cext) * t(0, j, k, nn, it) + &
                  cext * t_west(j, k, it)) * rmask(0, j)
           enddo
@@ -1078,6 +1090,7 @@ contains
             t(nx + 1, j, k, nn, it) = (1.0_rp - cx) * (t(nx + 1, j, k, ns, it) &
                  - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p) &
                  + cx * (t(nx, j, k, ns, it) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
+            if (ubt) cext = max(cext, min(ub_e(j), 1.0_rp))   ! SPONGE_TUNE (CPU ub_tune)
             t(nx + 1, j, k, nn, it) = ((1.0_rp - cext) * t(nx + 1, j, k, nn, it) + &
                  cext * t_east(j, k, it)) * rmask(nx + 1, j)
           enddo
@@ -1111,6 +1124,7 @@ contains
             t(i, 0, k, nn, it) = (1.0_rp - cx) * (t(i, 0, k, ns, it) &
                  - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p) &
                  + cx * (t(i, 1, k, ns, it) - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p)
+            if (ubt) cext = max(cext, min(ub_s(i), 1.0_rp))   ! SPONGE_TUNE (CPU ub_tune)
             t(i, 0, k, nn, it) = ((1.0_rp - cext) * t(i, 0, k, nn, it) + &
                  cext * t_south(i, k, it)) * rmask(i, 0)
           enddo
@@ -1145,6 +1159,7 @@ contains
             t(i, ny + 1, k, nn, it) = (1.0_rp - cx) * (t(i, ny + 1, k, ns, it) &
                  - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p) &
                  + cx * (t(i, ny, k, ns, it) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
+            if (ubt) cext = max(cext, min(ub_n(i), 1.0_rp))   ! SPONGE_TUNE (CPU ub_tune)
             t(i, ny + 1, k, nn, it) = ((1.0_rp - cext) * t(i, ny + 1, k, nn, it) + &
                  cext * t_north(i, k, it)) * rmask(i, ny + 1)
           enddo

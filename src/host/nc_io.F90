@@ -314,11 +314,19 @@ contains
     character(len=*), intent(in) :: name
     real(8),          intent(in) :: arr(n1, n2)
     integer,          intent(in), optional :: i0f, j0f
-    integer :: varid, i0, j0
+    integer :: varid, i0, j0, nd
     i0 = 1; j0 = 1
     if (present(i0f)) i0 = i0f
     if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_inquire_variable(ncid, varid, ndims=nd), 'ndims '//trim(name))
+    if (nd == 2) then
+      ! a line along one edge, (n, time) (the sponge-tuning restart fields):
+      ! the block is (n1, 1) at file position i0
+      call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, rec/), &
+                    count=(/n1 * n2, 1/)), 'putrec '//trim(name))
+      return
+    endif
     call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, rec/), &
                   count=(/n1, n2, 1/)), 'putrec '//trim(name))
   end subroutine nc_put_2d_rec_d
@@ -344,11 +352,17 @@ contains
     character(len=*), intent(in) :: name
     real(4),          intent(in) :: arr(n1, n2)
     integer,          intent(in), optional :: i0f, j0f
-    integer :: varid, i0, j0
+    integer :: varid, i0, j0, nd
     i0 = 1; j0 = 1
     if (present(i0f)) i0 = i0f
     if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_inquire_variable(ncid, varid, ndims=nd), 'ndims '//trim(name))
+    if (nd == 2) then   ! a line (n, time), see nc_put_2d_rec_d
+      call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, rec/), &
+                    count=(/n1 * n2, 1/)), 'putrec '//trim(name))
+      return
+    endif
     call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, rec/), &
                   count=(/n1, n2, 1/)), 'putrec '//trim(name))
   end subroutine nc_put_2d_rec_f
