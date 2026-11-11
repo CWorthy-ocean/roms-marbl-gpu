@@ -45,7 +45,7 @@ module implicit_fs_gpu
                        rufrc, rvfrc, DU_avg1, DU_avg2, DU_avg_bak, DV_avg1, DV_avg2, DV_avg_bak, &
                        zt_avg1, zeta_west, zeta_east, zeta_south, zeta_north, ubar_west, ubar_east, &
                        vbar_south, vbar_north, vbar_west, vbar_east, ubar_south, ubar_north, &
-                       obc_west, obc_east, obc_south, obc_north, ubind
+                       obc_west, obc_east, obc_south, obc_north, ubind, rhoS, rhoA
   use time_state, only: dt, iic, ntstart, ntimes, knew, kstp, fast
   use formulas, only: g
   use halo_mod, only: halo_fill_zuv_n
@@ -147,6 +147,7 @@ contains
       write(*,'(1x,A,F8.3,A,L1)') 'IMPLICIT_FS: fs_tang_nudge =', fs_tang_nudge, ' fs_cor_metric = ', fs_cor_metric
       write(*,'(1x,A,I2,A,F7.4,A,F7.4,A)') 'IMPLICIT_FS: fs_nsub =', fs_nsub, ' (implicit sub-steps of dt/fs_nsub;'// &
            ' explicit forcing at time +', sft, ' dt, boundary tidal harmonics at time +', fs_bry_phase, ' dt)'
+      write(*,'(1x,A,L1)') 'IMPLICIT_FS: fs_pg_rho = ', fs_pg_rho
       write(*,'(1x,A,A,A,F7.4,A)') 'IMPLICIT_FS: fs_pot_time = ', trim(fs_pot_time), ' (tidal potential at time +', &
            pot_phase, ' dt)'
       if (stress_af) then
@@ -231,7 +232,8 @@ contains
     integer(ip) :: k, l, nl, lsc(2), k0
     real(rp) :: b1, th, td, dtl, gl, ga, cdu, d, df, ainv, gam, mm, hf, cb, rf, cx, cff, dft, dfx, ce, ub, dfn
     real(rp) :: zc, xd, c, rn
-    logical :: ew, ee, es, en, ow, oe, os, on, wf, ef, sf, nf, drag, first, rv, cmet, sub, k1, last1
+    logical :: ew, ee, es, en, ow, oe, os, on, wf, ef, sf, nf, drag, first, rv, cmet, sub, k1, last1, pgr
+    real(rp) :: h1, h2, z1, z2, s1, s2, a1, a2, fac
     integer :: its
     real(rp) :: resid
     logical :: conv
@@ -252,6 +254,7 @@ contains
     cmet = fs_cor_metric
     k0 = kstp
     last1 = (fs_nsub == 1)
+    pgr = fs_pg_rho
     call tw(0)
     call tq0()
 
@@ -339,6 +342,19 @@ contains
           if (drag) gam = dtl * 0.5_rp * (r_D(i - 1, j) + r_D(i, j)) / df
           mm = umask(i, j)
           au(i, j) = th * dtl * gl * dn_u(i, j) * dn_u(i, j) * df * ainv * mm / (1.0_rp + gam)
+          if (pgr) then
+            ! fs_pg_rho: the density factor of the face coefficient (CPU fs_rho_fac). The depth integral of
+            ! the 3-D pressure gradient responds to the sea level as step2d's rubar, not as -g D grad zeta;
+            ! its derivative with respect to the difference of zeta across the face, divided by g D_face:
+            !   1 + [ (h1+h2) (s1+s2)/2 + s1 z1 + s2 z2 + (h1-h2) ((s1-a1 - s2+a2)/2 + (a1-a2)/3) ] / (h1+h2+z1+z2)
+            ! (cells 1, 2 on either side, s = rhoS, a = rhoA); the part multiplying the mean of the
+            ! increment across the face stays explicit
+            h1 = h(i - 1, j); h2 = h(i, j); z1 = zeta(i - 1, j, ks); z2 = zeta(i, j, ks)
+            s1 = rhoS(i - 1, j); s2 = rhoS(i, j); a1 = rhoA(i - 1, j); a2 = rhoA(i, j)
+            fac = 1.0_rp + (0.5_rp * (h1 + h2) * (s1 + s2) + s1 * z1 + s2 * z2 &
+                 + (h1 - h2) * (0.5_rp * ((s1 - a1) - (s2 - a2)) + (a1 - a2) / 3.0_rp)) / (h1 + h2 + z1 + z2)
+            au(i, j) = au(i, j) * fac
+          endif
           xd = dtl * dn_u(i, j) * ainv * rufrc(i, j)
           hf = dtl * dn_u(i, j) * ainv * 0.25_rp * (fcr(i, j) * (cov(i, j) + cov(i, j + 1)) &
                + fcr(i - 1, j) * (cov(i - 1, j) + cov(i - 1, j + 1)))
@@ -363,6 +379,13 @@ contains
           if (drag) gam = dtl * 0.5_rp * (r_D(i, j - 1) + r_D(i, j)) / df
           mm = vmask(i, j)
           av(i, j) = th * dtl * gl * dm_v(i, j) * dm_v(i, j) * df * ainv * mm / (1.0_rp + gam)
+          if (pgr) then
+            h1 = h(i, j - 1); h2 = h(i, j); z1 = zeta(i, j - 1, ks); z2 = zeta(i, j, ks)
+            s1 = rhoS(i, j - 1); s2 = rhoS(i, j); a1 = rhoA(i, j - 1); a2 = rhoA(i, j)
+            fac = 1.0_rp + (0.5_rp * (h1 + h2) * (s1 + s2) + s1 * z1 + s2 * z2 &
+                 + (h1 - h2) * (0.5_rp * ((s1 - a1) - (s2 - a2)) + (a1 - a2) / 3.0_rp)) / (h1 + h2 + z1 + z2)
+            av(i, j) = av(i, j) * fac
+          endif
           xd = dtl * dm_v(i, j) * ainv * rvfrc(i, j)
           hf = -dtl * dm_v(i, j) * ainv * 0.25_rp * (fcr(i, j) * (cou(i, j) + cou(i + 1, j)) &
                + fcr(i, j - 1) * (cou(i, j - 1) + cou(i + 1, j - 1)))
