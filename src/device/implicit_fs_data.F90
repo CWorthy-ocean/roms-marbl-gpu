@@ -123,10 +123,18 @@ module fs_data
   ! always computes rhoS and rhoA (its step2d always uses them, the CPU's VAR_RHO_2D), so the CPU's
   ! fallback for builds without VAR_RHO_2D (b582aa94) has no GPU counterpart.
   logical :: fs_pg_rho = .false.
+  ! fs_flather_zghost (CPU 7be4fafe): open (Flather) faces take the sea level of the condition as the mean
+  ! of the first interior and the boundary rho point, as the split's u2dbc (zx); the boundary value follows
+  ! the radiation condition of the zeta boundary kernel and is eliminated: a diagonal Robin term with
+  ! cb w1, w1 = (1 + 2 cx)/(2 (1 + cx)), and an explicit term w0 zeta_b(ks), w0 = 1/(2 (1 + cx)), cx = dts
+  ! pm sqrt(g h) at the first interior point. .false.: the first interior value alone (the boundary-forced
+  ! tide later than the split's by about dx/(2 sqrt(g h))). cbu, cbv hold cb; the products cb w1 are formed
+  ! where they are used (the same rounded values as the CPU's stored cbu = cb w1).
+  logical :: fs_flather_zghost = .false.
   namelist /implicit_fs/ fs_mode, fs_rho_inf, fs_theta, fs_theta_div, fs_tol, fs_maxit, fs_precond, &
        fs_mg_levels, fs_mg_nu, fs_mg_smoother, fs_mg_lag, fs_drag_implicit, &
        fs_warm, fs_verbose, fs_selftest, fs_tang_nudge, &
-       fs_cor_metric, fs_pot_time, fs_stress_time, fs_nsub, fs_pg_rho, &
+       fs_cor_metric, fs_pot_time, fs_stress_time, fs_nsub, fs_pg_rho, fs_flather_zghost, &
        fs_mg_gather, fs_mg_global_on, fs_mg_faces, fs_exch_thin, &
        fs_gpu_gather, fs_gpu_timers, fs_gpu_coarse, fs_gpu_graph, fs_gpu_opt
 

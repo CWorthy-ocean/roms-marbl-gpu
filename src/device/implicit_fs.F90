@@ -148,6 +148,7 @@ contains
       write(*,'(1x,A,I2,A,F7.4,A,F7.4,A)') 'IMPLICIT_FS: fs_nsub =', fs_nsub, ' (implicit sub-steps of dt/fs_nsub;'// &
            ' explicit forcing at time +', sft, ' dt, boundary tidal harmonics at time +', fs_bry_phase, ' dt)'
       write(*,'(1x,A,L1)') 'IMPLICIT_FS: fs_pg_rho = ', fs_pg_rho
+      write(*,'(1x,A,L1)') 'IMPLICIT_FS: fs_flather_zghost = ', fs_flather_zghost
       write(*,'(1x,A,A,A,F7.4,A)') 'IMPLICIT_FS: fs_pot_time = ', trim(fs_pot_time), ' (tidal potential at time +', &
            pot_phase, ' dt)'
       if (stress_af) then
@@ -232,8 +233,8 @@ contains
     integer(ip) :: k, l, nl, lsc(2), k0
     real(rp) :: b1, th, td, dtl, gl, ga, cdu, d, df, ainv, gam, mm, hf, cb, rf, cx, cff, dft, dfx, ce, ub, dfn
     real(rp) :: zc, xd, c, rn
-    logical :: ew, ee, es, en, ow, oe, os, on, wf, ef, sf, nf, drag, first, rv, cmet, sub, k1, last1, pgr
-    real(rp) :: h1, h2, z1, z2, s1, s2, a1, a2, fac
+    logical :: ew, ee, es, en, ow, oe, os, on, wf, ef, sf, nf, drag, first, rv, cmet, sub, k1, last1, pgr, zg
+    real(rp) :: h1, h2, z1, z2, s1, s2, a1, a2, fac, w1, w0
     integer :: its
     real(rp) :: resid
     logical :: conv
@@ -255,6 +256,7 @@ contains
     k0 = kstp
     last1 = (fs_nsub == 1)
     pgr = fs_pg_rho
+    zg = fs_flather_zghost
     call tw(0)
     call tq0()
 
@@ -408,6 +410,14 @@ contains
           ftu(1, j) = mm * (b1 * unu(1, j) + (1.0_rp - b1) * gru(1, j) + td * (df * dn_u(1, j) * ubar_west(j) &
                - cb * (zeta(1, j, ks) - zeta_west(j)) - unu(1, j)))
           cbu(1, j) = cb
+          if (zg) then
+            ! fs_flather_zghost: the Flather sea level (zeta_1^n+1 + zeta_b^n+1)/2 with zeta_b^n+1 from the
+            ! radiation condition = w1 zeta_1^n+1 + w0 zeta_b^n: Robin coefficient cb w1, w0 zeta_b explicit
+            cx = dtl * pm(1, j) * sqrt(gl * h(1, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            w0 = 0.5_rp / (1.0_rp + cx)
+            ftu(1, j) = mm * (b1 * unu(1, j) + (1.0_rp - b1) * gru(1, j) + td * (df * dn_u(1, j) * ubar_west(j) &
+                 - cb * (w1 * zeta(1, j, ks) + w0 * zeta(0, j, ks) - zeta_west(j)) - unu(1, j)))
+          endif
         endif
         if (ef .and. i == nx + 1 .and. j >= 1 .and. j <= ny) then
           mm = umask(nx + 1, j)
@@ -417,6 +427,12 @@ contains
           ftu(nx + 1, j) = mm * (b1 * unu(nx + 1, j) + (1.0_rp - b1) * gru(nx + 1, j) + td * (df * dn_u(nx + 1, j) &
                * ubar_east(j) + cb * (zeta(nx, j, ks) - zeta_east(j)) - unu(nx + 1, j)))
           cbu(nx + 1, j) = cb
+          if (zg) then
+            cx = dtl * pm(nx, j) * sqrt(gl * h(nx, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            w0 = 0.5_rp / (1.0_rp + cx)
+            ftu(nx + 1, j) = mm * (b1 * unu(nx + 1, j) + (1.0_rp - b1) * gru(nx + 1, j) + td * (df * dn_u(nx + 1, j) &
+                 * ubar_east(j) + cb * (w1 * zeta(nx, j, ks) + w0 * zeta(nx + 1, j, ks) - zeta_east(j)) - unu(nx + 1, j)))
+          endif
         endif
         if (sf .and. j == 1 .and. i >= 1 .and. i <= nx) then
           mm = vmask(i, 1)
@@ -426,6 +442,12 @@ contains
           ftv(i, 1) = mm * (b1 * unv(i, 1) + (1.0_rp - b1) * grv(i, 1) + td * (df * dm_v(i, 1) * vbar_south(i) &
                - cb * (zeta(i, 1, ks) - zeta_south(i)) - unv(i, 1)))
           cbv(i, 1) = cb
+          if (zg) then
+            cx = dtl * pn(i, 1) * sqrt(gl * h(i, 1)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            w0 = 0.5_rp / (1.0_rp + cx)
+            ftv(i, 1) = mm * (b1 * unv(i, 1) + (1.0_rp - b1) * grv(i, 1) + td * (df * dm_v(i, 1) * vbar_south(i) &
+                 - cb * (w1 * zeta(i, 1, ks) + w0 * zeta(i, 0, ks) - zeta_south(i)) - unv(i, 1)))
+          endif
         endif
         if (nf .and. j == ny + 1 .and. i >= 1 .and. i <= nx) then
           mm = vmask(i, ny + 1)
@@ -435,6 +457,12 @@ contains
           ftv(i, ny + 1) = mm * (b1 * unv(i, ny + 1) + (1.0_rp - b1) * grv(i, ny + 1) + td * (df * dm_v(i, ny + 1) &
                * vbar_north(i) + cb * (zeta(i, ny, ks) - zeta_north(i)) - unv(i, ny + 1)))
           cbv(i, ny + 1) = cb
+          if (zg) then
+            cx = dtl * pn(i, ny) * sqrt(gl * h(i, ny)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            w0 = 0.5_rp / (1.0_rp + cx)
+            ftv(i, ny + 1) = mm * (b1 * unv(i, ny + 1) + (1.0_rp - b1) * grv(i, ny + 1) + td * (df * dm_v(i, ny + 1) &
+                 * vbar_north(i) + cb * (w1 * zeta(i, ny, ks) + w0 * zeta(i, ny + 1, ks) - zeta_north(i)) - unv(i, ny + 1)))
+          endif
         endif
       enddo
     enddo
@@ -464,10 +492,35 @@ contains
     do j = 1, ny
       do i = 1, nx
         rb(i, j) = 0.0_rp
-        if (wf .and. i == 1) rb(i, j) = rb(i, j) + dtl * td * cbu(1, j)
-        if (ef .and. i == nx) rb(i, j) = rb(i, j) + dtl * td * cbu(nx + 1, j)
-        if (sf .and. j == 1) rb(i, j) = rb(i, j) + dtl * td * cbv(i, 1)
-        if (nf .and. j == ny) rb(i, j) = rb(i, j) + dtl * td * cbv(i, ny + 1)
+        ! (fs_flather_zghost: + dt th_d cb (w1 - 1) after each edge's term, the CPU's order)
+        if (wf .and. i == 1) then
+          rb(i, j) = rb(i, j) + dtl * td * cbu(1, j)
+          if (zg) then
+            cx = dtl * pm(1, j) * sqrt(gl * h(1, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            rb(i, j) = rb(i, j) + dtl * td * cbu(1, j) * (w1 - 1.0_rp)
+          endif
+        endif
+        if (ef .and. i == nx) then
+          rb(i, j) = rb(i, j) + dtl * td * cbu(nx + 1, j)
+          if (zg) then
+            cx = dtl * pm(nx, j) * sqrt(gl * h(nx, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            rb(i, j) = rb(i, j) + dtl * td * cbu(nx + 1, j) * (w1 - 1.0_rp)
+          endif
+        endif
+        if (sf .and. j == 1) then
+          rb(i, j) = rb(i, j) + dtl * td * cbv(i, 1)
+          if (zg) then
+            cx = dtl * pn(i, 1) * sqrt(gl * h(i, 1)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            rb(i, j) = rb(i, j) + dtl * td * cbv(i, 1) * (w1 - 1.0_rp)
+          endif
+        endif
+        if (nf .and. j == ny) then
+          rb(i, j) = rb(i, j) + dtl * td * cbv(i, ny + 1)
+          if (zg) then
+            cx = dtl * pn(i, ny) * sqrt(gl * h(i, ny)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            rb(i, j) = rb(i, j) + dtl * td * cbv(i, ny + 1) * (w1 - 1.0_rp)
+          endif
+        endif
         qs(i, j) = swflx(i, j)
       enddo
     enddo
@@ -532,19 +585,47 @@ contains
         endif
         if (ew .and. i == 1 .and. j <= ny) then
           fbu(1, j) = ftu(1, j)
-          if (ow) fbu(1, j) = fbu(1, j) - td * cbu(1, j) * xx(1, j)
+          if (ow) then
+            if (zg) then                     ! fs_flather_zghost: the Robin coefficient cb w1
+              cx = dtl * pm(1, j) * sqrt(gl * h(1, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+              fbu(1, j) = fbu(1, j) - td * (cbu(1, j) * w1) * xx(1, j)
+            else
+              fbu(1, j) = fbu(1, j) - td * cbu(1, j) * xx(1, j)
+            endif
+          endif
         endif
         if (ee .and. i == nx + 1 .and. j <= ny) then
           fbu(nx + 1, j) = ftu(nx + 1, j)
-          if (oe) fbu(nx + 1, j) = fbu(nx + 1, j) + td * cbu(nx + 1, j) * xx(nx, j)
+          if (oe) then
+            if (zg) then
+              cx = dtl * pm(nx, j) * sqrt(gl * h(nx, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+              fbu(nx + 1, j) = fbu(nx + 1, j) + td * (cbu(nx + 1, j) * w1) * xx(nx, j)
+            else
+              fbu(nx + 1, j) = fbu(nx + 1, j) + td * cbu(nx + 1, j) * xx(nx, j)
+            endif
+          endif
         endif
         if (es .and. j == 1 .and. i <= nx) then
           fbv(i, 1) = ftv(i, 1)
-          if (os) fbv(i, 1) = fbv(i, 1) - td * cbv(i, 1) * xx(i, 1)
+          if (os) then
+            if (zg) then
+              cx = dtl * pn(i, 1) * sqrt(gl * h(i, 1)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+              fbv(i, 1) = fbv(i, 1) - td * (cbv(i, 1) * w1) * xx(i, 1)
+            else
+              fbv(i, 1) = fbv(i, 1) - td * cbv(i, 1) * xx(i, 1)
+            endif
+          endif
         endif
         if (en .and. j == ny + 1 .and. i <= nx) then
           fbv(i, ny + 1) = ftv(i, ny + 1)
-          if (on) fbv(i, ny + 1) = fbv(i, ny + 1) + td * cbv(i, ny + 1) * xx(i, ny)
+          if (on) then
+            if (zg) then
+              cx = dtl * pn(i, ny) * sqrt(gl * h(i, ny)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+              fbv(i, ny + 1) = fbv(i, ny + 1) + td * (cbv(i, ny + 1) * w1) * xx(i, ny)
+            else
+              fbv(i, ny + 1) = fbv(i, ny + 1) + td * cbv(i, ny + 1) * xx(i, ny)
+            endif
+          endif
         endif
         ! rates (u faces 1..nx+1 x 1..ny, v faces 1..nx x 1..ny+1, cells)
         if (first) then
@@ -657,25 +738,53 @@ contains
         if (wf .and. i == 1 .and. j <= ny) then
           mm = umask(1, j)
           dfn = 0.5_rp * (h(0, j) + zeta(0, j, ks) + h(1, j) + zeta(1, j, ks))
+          if (zg) then                       ! fs_flather_zghost: zeta_1^n+1 -> w1 zeta_1^n+1 + w0 zeta_b(ks)
+            cx = dtl * pm(1, j) * sqrt(gl * h(1, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            w0 = 0.5_rp / (1.0_rp + cx)
+            ub = mm * (dfn * dn_u(1, j) * ubar_west(j) - (cbu(1, j) * w1) * (zeta(1, j, kn) &
+                 + (w0 * zeta(0, j, ks) - zeta_west(j)) / w1))
+          else
           ub = mm * (dfn * dn_u(1, j) * ubar_west(j) - cbu(1, j) * (zeta(1, j, kn) - zeta_west(j)))
+          endif
           ubar(1, j, kn) = 2.0_rp * ub / ((wd(0, j) + wd(1, j)) * dn_u(1, j))
         endif
         if (ef .and. i == nx + 1 .and. j <= ny) then
           mm = umask(nx + 1, j)
           dfn = 0.5_rp * (h(nx, j) + zeta(nx, j, ks) + h(nx + 1, j) + zeta(nx + 1, j, ks))
+          if (zg) then
+            cx = dtl * pm(nx, j) * sqrt(gl * h(nx, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            w0 = 0.5_rp / (1.0_rp + cx)
+            ub = mm * (dfn * dn_u(nx + 1, j) * ubar_east(j) + (cbu(nx + 1, j) * w1) * (zeta(nx, j, kn) &
+                 + (w0 * zeta(nx + 1, j, ks) - zeta_east(j)) / w1))
+          else
           ub = mm * (dfn * dn_u(nx + 1, j) * ubar_east(j) + cbu(nx + 1, j) * (zeta(nx, j, kn) - zeta_east(j)))
+          endif
           ubar(nx + 1, j, kn) = 2.0_rp * ub / ((wd(nx, j) + wd(nx + 1, j)) * dn_u(nx + 1, j))
         endif
         if (sf .and. j == 1 .and. i <= nx) then
           mm = vmask(i, 1)
           dfn = 0.5_rp * (h(i, 0) + zeta(i, 0, ks) + h(i, 1) + zeta(i, 1, ks))
+          if (zg) then
+            cx = dtl * pn(i, 1) * sqrt(gl * h(i, 1)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            w0 = 0.5_rp / (1.0_rp + cx)
+            ub = mm * (dfn * dm_v(i, 1) * vbar_south(i) - (cbv(i, 1) * w1) * (zeta(i, 1, kn) &
+                 + (w0 * zeta(i, 0, ks) - zeta_south(i)) / w1))
+          else
           ub = mm * (dfn * dm_v(i, 1) * vbar_south(i) - cbv(i, 1) * (zeta(i, 1, kn) - zeta_south(i)))
+          endif
           vbar(i, 1, kn) = 2.0_rp * ub / ((wd(i, 0) + wd(i, 1)) * dm_v(i, 1))
         endif
         if (nf .and. j == ny + 1 .and. i <= nx) then
           mm = vmask(i, ny + 1)
           dfn = 0.5_rp * (h(i, ny) + zeta(i, ny, ks) + h(i, ny + 1) + zeta(i, ny + 1, ks))
+          if (zg) then
+            cx = dtl * pn(i, ny) * sqrt(gl * h(i, ny)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            w0 = 0.5_rp / (1.0_rp + cx)
+            ub = mm * (dfn * dm_v(i, ny + 1) * vbar_north(i) + (cbv(i, ny + 1) * w1) * (zeta(i, ny, kn) &
+                 + (w0 * zeta(i, ny + 1, ks) - zeta_north(i)) / w1))
+          else
           ub = mm * (dfn * dm_v(i, ny + 1) * vbar_north(i) + cbv(i, ny + 1) * (zeta(i, ny, kn) - zeta_north(i)))
+          endif
           vbar(i, ny + 1, kn) = 2.0_rp * ub / ((wd(i, ny) + wd(i, ny + 1)) * dm_v(i, ny + 1))
         endif
       enddo
