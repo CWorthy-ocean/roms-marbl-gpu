@@ -39,6 +39,8 @@ module case_io
   use marbl_gpu, only: marbl_gpu_init_diagnostics
   use marbl_gpu, only: marbl_on, read_marbl_namelist, marbl_gpu_setup_tracers, marbl_gpu_init_forcing, &
                        marbl_gpu_load_state
+  use fs_data, only: fs_alloc_rates, udu, udv, gru, grv, qd, xx, mg_se0, mg_scu, mg_scv, fs_nsc
+  use implicit_fs_gpu, only: fs_rst_loaded, fs_on, fs_rst_scal_in, fs_mg_loaded
   implicit none
   private
   logical :: passive_loaded = .false.
@@ -794,7 +796,9 @@ contains
     integer, intent(in) :: ncid, i0, j0, nxi, neta, xi_u, eta_v
     integer :: nrecs, rec, ibuf(8)
     real(rp) :: tbuf(1), time_bak, tscale
-    logical :: times_ok, steps_ok, have_coup, has_tstep
+    logical :: times_ok, steps_ok, have_coup, has_tstep, fs_rates_read
+    logical :: have_sc, take_rates, take_mg
+    real(8) :: fsc(fs_nsc)
     character(len=64) :: units
 
     case_exact_restart = .false.
@@ -805,6 +809,7 @@ contains
     nrecs = 1
     tscale = 1.0_rp
     have_coup = .false.
+    fs_rates_read = .false.
     has_tstep = .false.
 
     if (nc_has_var(ncid, 'ocean_time')) then
@@ -876,6 +881,16 @@ contains
     case_record = rec
 
     write(*,'(a,i0,a,i0)') 'exact-restart: reading current record ', rec, ' into slot 1; nrecs=', nrecs
+    ! implicit free surface scalars (CPU 22c05bc1 fs_rst_get): the memory kind of the rates (a removed
+    ! fs_mom_mem 'all'/'pg' gives a cold start of the memory),
+    ! the fs_mg_lag > 1 phase and stored fine operator
+    take_rates = .true.; take_mg = .false.
+    if (fs_on) then
+      have_sc = nc_has_var(ncid, 'fs_rst_scal')
+      fsc = 0.0d0
+      if (have_sc) call nc_get_vec_rec_d(ncid, 'fs_rst_scal', fsc, rec)
+      call fs_rst_scal_in(have_sc, fsc, take_rates, take_mg)
+    endif
     ! All records through the collective reader: phase 1 queues every window,
     ! pr_flush reads whole variables in parallel and redistributes, phase 2
     ! stores the windows (same call sequence both times).
@@ -894,6 +909,22 @@ contains
       call load_rufrc_slot(ncid, rec, 1, i0, j0, nxi, neta, xi_u, eta_v)
       if (have_coup .or. has_coupling_fields(ncid)) then
         call load_coupling_fields(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
+        ! implicit free surface: the generalized-alpha rates and delta (CPU a0e9e2be fs_rst_get)
+        if (fs_on .and. take_rates .and. nc_has_var(ncid, 'fs_delta')) then
+          fs_rates_read = .true.
+          call fs_alloc_rates()
+          call pr_store_2d(ncid, 'fs_udu', udu(decomp%is, decomp%js), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+          call pr_store_2d(ncid, 'fs_gru', gru(decomp%is, decomp%js), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+          call pr_store_2d(ncid, 'fs_udv', udv(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+          call pr_store_2d(ncid, 'fs_grv', grv(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+          call pr_store_2d(ncid, 'fs_qd', qd(decomp%is, decomp%js), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+          call pr_store_2d(ncid, 'fs_delta', xx(decomp%is, decomp%js), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+          if (take_mg) then
+            call pr_store_2d(ncid, 'fs_mge0', mg_se0(decomp%is, decomp%js), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+            call pr_store_2d(ncid, 'fs_mgcu', mg_scu(decomp%is, decomp%js), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+            call pr_store_2d(ncid, 'fs_mgcv', mg_scv(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+          endif
+        endif
       endif
       if (calc_pflx) call load_pflx_slow(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
       if (ld_phase == 1) then
@@ -903,6 +934,12 @@ contains
       endif
     enddo
     call pr_end()
+    if (fs_rates_read .and. take_mg) call fs_mg_loaded()
+    if (fs_rates_read) then
+      call fs_rst_loaded()
+    elseif (fs_on .and. take_rates .and. comm_rank() == 0) then
+      write(*,'(a)') ' IMPLICIT_FS: no rates in the initial file (cold start of the generalized-alpha memory)'
+    endif
     call wall_stamp('ini stored')
     if (case_exact_restart) then
       write(*,'(a,f12.4,a,i0,a,i0)') 'get_init :: Exact restart from day =', &

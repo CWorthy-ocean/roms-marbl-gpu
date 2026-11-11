@@ -20,6 +20,8 @@ module his_io
   use wvlcty_mod, only: wvlcty_compute
   use marbl_gpu, only: marbl_on, marbl_gpu_nhis, marbl_gpu_nhis3, marbl_gpu_define_his, marbl_gpu_stage_his, &
                        marbl_gpu_define_rst, marbl_gpu_write_rst, marbl_gpu_stage_rst8
+  use fs_data, only: fs_on, udu, udv, gru, grv, qd, xx, mg_on, fs_mg_lag, mg_se0, mg_scu, mg_scv, fs_nsc
+  use implicit_fs_gpu, only: fs_rst_prepare, fs_rst_scal_vals
   implicit none
   private
 
@@ -276,6 +278,7 @@ contains
 
   subroutine wrt_rst()
     integer :: ncid, n2, n3, itp, ir, nz, is, js
+    real(8) :: fsc(fs_nsc)
     real(rp) :: twrite
     character(len=512) :: open_rst
     open_rst = ''
@@ -322,6 +325,22 @@ contains
       call io_stage8_2d('DV_avg2', DV_avg2(is, js), ir0, ir1, jv0, jv1, ir0, 0)
       call io_stage8_2d('DU_avg_bak', DU_avg_bak(is, js), iu0, iu1, jr0, jr1, 0, jr0)
       call io_stage8_2d('DV_avg_bak', DV_avg_bak(is, js), ir0, ir1, jv0, jv1, ir0, 0)
+      if (fs_on) then   ! implicit free surface: generalized-alpha rates, delta (CPU a0e9e2be fs_rst_wrt)
+        call fs_rst_prepare()
+        call io_stage8_2d('fs_udu', udu(is, js), iu0, iu1, jr0, jr1, 0, jr0)
+        call io_stage8_2d('fs_gru', gru(is, js), iu0, iu1, jr0, jr1, 0, jr0)
+        call io_stage8_2d('fs_udv', udv(is, js), ir0, ir1, jv0, jv1, ir0, 0)
+        call io_stage8_2d('fs_grv', grv(is, js), ir0, ir1, jv0, jv1, ir0, 0)
+        call io_stage8_2d('fs_qd', qd(is, js), ir0, ir1, jr0, jr1, ir0, jr0)
+        call io_stage8_2d('fs_delta', xx(is, js), ir0, ir1, jr0, jr1, ir0, jr0)
+        call fs_rst_scal_vals(fsc)
+        call io_stage8_vec('fs_rst_scal', fsc)
+        if (mg_on .and. fs_mg_lag > 1) then
+          call io_stage8_2d('fs_mge0', mg_se0(is, js), ir0, ir1, jr0, jr1, ir0, jr0)
+          call io_stage8_2d('fs_mgcu', mg_scu(is, js), iu0, iu1, jr0, jr1, 0, jr0)
+          call io_stage8_2d('fs_mgcv', mg_scv(is, js), ir0, ir1, jv0, jv1, ir0, 0)
+        endif
+      endif
       call io_stage8_2d('rufrc', rufrc_bak(is, js, max(nstp, 1)), iu0, iu1, jr0, jr1, 0, jr0)
       call io_stage8_2d('rvfrc', rvfrc_bak(is, js, max(nstp, 1)), ir0, ir1, jv0, jv1, ir0, 0)
       if (river_on) then   ! river faces for the next run's initial masks (CPU wrt_rst)
@@ -365,6 +384,22 @@ contains
     call put_v2(ncid, 'DV_avg2', DV_avg2, rec_rst)
     call put_u2(ncid, 'DU_avg_bak', DU_avg_bak, rec_rst)
     call put_v2(ncid, 'DV_avg_bak', DV_avg_bak, rec_rst)
+    if (fs_on) then
+      call fs_rst_prepare()
+      call put_u2(ncid, 'fs_udu', udu, rec_rst)
+      call put_u2(ncid, 'fs_gru', gru, rec_rst)
+      call put_v2(ncid, 'fs_udv', udv, rec_rst)
+      call put_v2(ncid, 'fs_grv', grv, rec_rst)
+      call put_r2(ncid, 'fs_qd', qd, rec_rst)
+      call put_r2(ncid, 'fs_delta', xx, rec_rst)
+      call fs_rst_scal_vals(fsc)
+      call nc_put_vec_rec_d(ncid, 'fs_rst_scal', fsc, rec_rst)
+      if (mg_on .and. fs_mg_lag > 1) then
+        call put_r2(ncid, 'fs_mge0', mg_se0, rec_rst)
+        call put_u2(ncid, 'fs_mgcu', mg_scu, rec_rst)
+        call put_v2(ncid, 'fs_mgcv', mg_scv, rec_rst)
+      endif
+    endif
     call put_u2(ncid, 'rufrc', rufrc_bak(:,:,max(nstp,1)), rec_rst)
     call put_v2(ncid, 'rvfrc', rvfrc_bak(:,:,max(nstp,1)), rec_rst)
     if (river_on) then
@@ -431,7 +466,7 @@ contains
 
   subroutine create_rst_file(path)
     character(len=*), intent(in) :: path
-    integer :: itp, ncid, d_t, d_xi, d_eta, d_xiu, d_etav, d_s, d_aux, id
+    integer :: itp, ncid, d_t, d_xi, d_eta, d_xiu, d_etav, d_s, d_aux, id, d_sc
     call ensure_parent(path)
     call nc_create(trim(path), ncid)
     d_t = nc_def_dim(ncid, 'time', 0)
@@ -466,6 +501,22 @@ contains
     id = nc_def_var(ncid, 'DV_avg2', (/d_xi, d_etav, d_t/))
     id = nc_def_var(ncid, 'DU_avg_bak', (/d_xiu, d_eta, d_t/))
     id = nc_def_var(ncid, 'DV_avg_bak', (/d_xi, d_etav, d_t/))
+    if (fs_on) then
+      id = nc_def_var(ncid, 'fs_udu', (/d_xiu, d_eta, d_t/))
+      id = nc_def_var(ncid, 'fs_udv', (/d_xi, d_etav, d_t/))
+      id = nc_def_var(ncid, 'fs_gru', (/d_xiu, d_eta, d_t/))
+      id = nc_def_var(ncid, 'fs_grv', (/d_xi, d_etav, d_t/))
+      id = nc_def_var(ncid, 'fs_qd', (/d_xi, d_eta, d_t/))
+      id = nc_def_var(ncid, 'fs_delta', (/d_xi, d_eta, d_t/))
+      ! restart scalars and the fs_mg_lag > 1 fine operator (CPU 22c05bc1 fs_rst_def)
+      d_sc = nc_def_dim(ncid, 'fs_nscal', fs_nsc)
+      id = nc_def_var(ncid, 'fs_rst_scal', (/d_sc, d_t/))
+      if (mg_on .and. fs_mg_lag > 1) then
+        id = nc_def_var(ncid, 'fs_mge0', (/d_xi, d_eta, d_t/))
+        id = nc_def_var(ncid, 'fs_mgcu', (/d_xiu, d_eta, d_t/))
+        id = nc_def_var(ncid, 'fs_mgcv', (/d_xi, d_etav, d_t/))
+      endif
+    endif
     id = nc_def_var(ncid, 'rufrc', (/d_xiu, d_eta, d_t/))
     id = nc_def_var(ncid, 'rvfrc', (/d_xi, d_etav, d_t/))
     if (river_on) then
@@ -507,8 +558,9 @@ contains
     cap_field = nxy * nhw
     if (wrt_file_his .or. wrt_file_rst) call io_init(cap_rec, cap_field)
     ! double-precision capacity for one restart record of this tile
-    if (wrt_file_rst) call io_init8((15 + 2) * nxy + (4 + ntp + 2 + merge(3, 0, calc_pflx)) * nxy * nh &
-         + 4 * (max(nxi, neta) + 2), nxy * nh)
+    ! (+ the implicit free surface's rates, scalars and fs_mg_lag fields, when on: 8 2-D fields and 64 values)
+    if (wrt_file_rst) call io_init8((15 + 2 + 8) * nxy + (4 + ntp + 2 + merge(3, 0, calc_pflx)) * nxy * nh &
+         + 4 * (max(nxi, neta) + 2) + 64, nxy * nh)
   end subroutine init_staging
 
   subroutine set_write_bounds()

@@ -148,6 +148,7 @@ module io_server
   public :: io_stage_begin
   public :: io_init8, io_stage8_begin, io_stage8_2d, io_stage8_3d, io_stage8_3d_pt, io_stage8_end
   public :: io_stage8_line
+  public :: io_stage8_vec
   public :: io_stage_2d
   public :: io_stage_3d
   public :: io_stage_3d_p, io_stage_3d_pt
@@ -742,7 +743,9 @@ contains
       call put_time_step(ncid, r0)
       call put_avg_times(ncid, r0)
       do iv = 1, r0%nvars
-        if (r0%nrank(iv) == 2) then
+        if (r0%nrank(iv) == 1) then
+          call nc_put_vec_rec_d(ncid, trim(r0%names(iv)), (/0.0d0/), r0%rec, min(me_w + 1, r0%n1(iv)))
+        else if (r0%nrank(iv) == 2) then
           call nc_put_2d_rec_f(ncid, trim(r0%names(iv)), zero1, 1, 1, r0%rec, me_w + 1, 1)
         else
           call nc_put_3d_rec_f(ncid, trim(r0%names(iv)), zero1, 1, 1, 1, r0%rec, me_w + 1, 1)
@@ -785,7 +788,9 @@ contains
         enddo
         ca = wall_time()
         t_asm = t_asm + (ca - cb)
-        if (r0%nrank(iv) == 2) then
+        if (r0%nrank(iv) == 1) then
+          call nc_put_vec_rec_d(ncid, trim(r0%names(iv)), gbuf8(1:gx), r0%rec)
+        else if (r0%nrank(iv) == 2) then
           call nc_put_2d_rec_d(ncid, trim(r0%names(iv)), gbuf8, gx, gy, r0%rec)
         else
           call nc_put_3d_rec_d(ncid, trim(r0%names(iv)), gbuf8, gx, gy, n3, r0%rec)
@@ -850,7 +855,9 @@ contains
     call put_avg_times(ncid, r)
     do iv = 1, r%nvars
       off = r%off(iv)
-      if (r%nrank(iv) == 2) then
+      if (r%nrank(iv) == 1) then
+        call nc_put_vec_rec_d(ncid, trim(r%names(iv)), buf(off:off+r%n1(iv)-1), r%rec)
+      else if (r%nrank(iv) == 2) then
         call nc_put_2d_rec_d(ncid, trim(r%names(iv)), buf(off), r%n1(iv), r%n2(iv), r%rec, r%i0f(iv), r%j0f(iv))
       else
         call nc_put_3d_rec_d(ncid, trim(r%names(iv)), buf(off), r%n1(iv), r%n2(iv), r%n3(iv), r%rec, r%i0f(iv), r%j0f(iv))
@@ -918,6 +925,23 @@ contains
     integer, intent(in), optional :: di, dj
     call add_var(name, n1, n2, n3, nrank, off, di, dj)
   end subroutine add_var8
+
+  subroutine io_stage8_vec(name, vals)
+    ! A (n, time) double variable of a restart record (scalars, the same on every tile): every
+    ! tile stages it at file position 1, the assembly overlays them (nrank 1).
+    character(len=*), intent(in) :: name
+    real(8), intent(in) :: vals(:)
+    integer :: n, off, iv
+    n = size(vals)
+    call add_var8(name, n, 1, 1, 1, off)
+    iv = pend(cur)%nvars
+    pend(cur)%i0f(iv) = 1; pend(cur)%j0f(iv) = 1
+    if (cur == 1) then
+      hpin8_1(off:off+n-1) = vals
+    else
+      hpin8_2(off:off+n-1) = vals
+    endif
+  end subroutine io_stage8_vec
 
   subroutine io_stage8_2d(name, a, i0, i1, j0, j1, di, dj)
     character(len=*), intent(in) :: name
