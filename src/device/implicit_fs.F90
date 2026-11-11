@@ -57,7 +57,7 @@ module implicit_fs_gpu
   use run_timers, only: wall_time
   use fs_data
   use fs_mg, only: mg_build_layout, mg_setup, mg_vcycle
-  use fs_ipc, only: ipc_init, ipc_on
+  use fs_ipc, only: ipc_init, ipc_on, ipc_set_opts
 #ifdef USE_CUDA
   use cudafor
   use arch_mod, only: work_stream
@@ -133,7 +133,7 @@ contains
     if (trim(fs_gpu_coarse) /= 'device' .and. trim(fs_gpu_coarse) /= 'host') &
          error stop "IMPLICIT_FS: fs_gpu_coarse must be 'device' or 'host'"
     dev_glob = (trim(fs_gpu_coarse) == 'device')
-    if (fs_gpu_opt < 0 .or. fs_gpu_opt > 16383) error stop 'IMPLICIT_FS: fs_gpu_opt must lie in [0, 16383]'
+    if (fs_gpu_opt < 0 .or. fs_gpu_opt > 65535) error stop 'IMPLICIT_FS: fs_gpu_opt must lie in [0, 65535]'
     if (fs_gpu_timers < 0 .or. fs_gpu_timers > 2) error stop 'IMPLICIT_FS: fs_gpu_timers must be 0, 1 or 2'
     call fs_opt_flags()
     if (talk) then
@@ -157,7 +157,7 @@ contains
       write(*,'(1x,A,A,A,I6,A,A,A,L1,A)') 'IMPLICIT_FS: fs_mg_faces = ', trim(fs_mg_faces), &
            ' (CPU layout keys read, not used: fs_mg_gather =', fs_mg_gather, ' fs_mg_global_on = ', &
            trim(fs_mg_global_on), ' fs_exch_thin = ', fs_exch_thin, ')'
-      write(*,'(1x,A,A,A,I2,A,I3)') 'IMPLICIT_FS: fs_gpu_coarse = ', trim(fs_gpu_coarse), ' fs_gpu_graph =', &
+      write(*,'(1x,A,A,A,I2,A,I6)') 'IMPLICIT_FS: fs_gpu_coarse = ', trim(fs_gpu_coarse), ' fs_gpu_graph =', &
            fs_gpu_graph, ' fs_gpu_opt =', fs_gpu_opt
       if (fs_selftest > 0) write(*,'(1x,A)') 'IMPLICIT_FS: note: fs_selftest is not implemented on the GPU (ignored)'
     endif
@@ -234,6 +234,7 @@ contains
     m = int(RG_NF * (max(nx, ny) + 2))
     call fs_alloc_bufs(m)
     if (o_ipc) then
+      call ipc_set_opts(o_ipf, o_gmb)        ! fs_gpu_opt 16384, 32768
       call ipc_init(int(m), [int(decomp%nbr_w), int(decomp%nbr_e), int(decomp%nbr_s), int(decomp%nbr_n)], &
            int(nx), int(ny), int(is), int(ie), int(js), int(je), &
            [decomp%edge_w, decomp%edge_e, decomp%edge_s, decomp%edge_n], work_stream)

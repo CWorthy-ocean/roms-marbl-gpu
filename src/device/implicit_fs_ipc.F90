@@ -24,6 +24,7 @@ module fs_ipc
   implicit none
   private
   public :: ipc_init, ipc_on, ipc_ring_fine, ipc_ring_plane, ipc_gather_init, ipcg_on, ipc_gather, ipc_gather_v
+  public :: ipc_set_opts
 
   logical :: ipc_on = .false.
   ! the multigrid's vector gather (fs_mgg) by IPC, when all compute ranks (at most 4) share the node:
@@ -40,6 +41,11 @@ module fs_ipc
   integer(kind=cuda_stream_kind) :: ist
 #endif
   integer, parameter :: IPC_NT = 512
+  ! fs_gpu_opt 16384 (o_fuse): a ring's put and wait in one kernel (kring_f, kring_p: every thread puts,
+  ! thread 1 raises the flags and spins on this rank's own, then every thread unpacks); 32768 (o_mblk):
+  ! the gathers' put by several blocks (kgput_m, kgput_vm; the last block to finish raises the flags)
+  logical :: o_fuse = .false., o_mblk = .false.
+  integer, parameter :: GP_NT = 256, GP_MAXB = 64
 #ifdef USE_CUDA
   ! (mv, 2 slots, 4 arrival sides W E S N) and the flags per arrival side: own cudaMalloc blocks (an
   ! IPC handle maps a whole allocation); qc: the sequence counter
@@ -51,6 +57,7 @@ module fs_ipc
   integer, device, pointer :: gfl(:) => null(), gf1(:) => null(), gf2(:) => null(), gf3(:) => null()
   integer, device, allocatable :: gqc(:)
   type(c_devptr) :: gbuf_p, gfl_p
+  integer, device, allocatable :: gbc(:)      ! o_mblk: blocks finished (reset by the last block)
   real(8), device, pointer :: pw(:,:,:) => null(), pe(:,:,:) => null(), ps(:,:,:) => null(), pn(:,:,:) => null()
   integer, device, pointer :: fw(:) => null(), fe(:) => null(), fs(:) => null(), fn(:) => null()
   ! the CUDA runtime's IPC calls (not in the cudafor module); cudaIpcMemHandle_t is 64 bytes,
@@ -78,6 +85,12 @@ module fs_ipc
 #endif
 
 contains
+
+  subroutine ipc_set_opts(fuse, mblk)
+    ! the IPC kernel options (fs_gpu_opt 16384, 32768), before ipc_init
+    logical, intent(in) :: fuse, mblk
+    o_fuse = fuse; o_mblk = mblk
+  end subroutine ipc_set_opts
 
   subroutine ipc_init(m, nbr, nx, ny, is, ie, js, je, edges, stream)
     ! collective over the compute ranks: decide, allocate, exchange and open the IPC handles.
@@ -207,6 +220,8 @@ contains
     if (ierr /= 0) error stop 'implicit_fs: ipc_gather_init cudaMalloc'
     call c_f_pointer(gbuf_p, gbuf, [gld, 2]); call c_f_pointer(gfl_p, gfl, [4])
     allocate(gqc(1)); gbuf = 0; gfl = 0; gqc = 0
+    if (.not. allocated(gbc)) allocate(gbc(1))
+    gbc = 0
     ok = 1
     ierr = c_ipc_get(hb, transfer(gbuf_p, addr)); if (ierr /= 0) ok = 0
     ierr = c_ipc_get(hf, transfer(gfl_p, addr)); if (ierr /= 0) ok = 0
@@ -314,9 +329,15 @@ contains
 #ifdef USE_CUDA
     real(8), device :: x(0:mgx + 1, 0:mgy + 1, *)
     real(8), device :: out(*)
-    integer :: ierr
+    integer :: ierr, nb
+    if (o_mblk) then
+      nb = max(1, min(GP_MAXB, (nxd * nyd + GP_NT - 1) / GP_NT))
+      call kgput_m<<<nb, GP_NT, 0, ist>>>(x, mgx, mgy, l, nxd, nyd, gld, go, gme, gnpeer, &
+           gbuf, gq1, gq2, gq3, gf1, gf2, gf3, gqc, gbc)
+    else
     call kgput<<<1, IPC_NT, 0, ist>>>(x, mgx, mgy, l, nxd, nyd, gld, go, gme, gnpeer, gpr(1), gpr(2), gpr(3), &
          gbuf, gq1, gq2, gq3, gf1, gf2, gf3, gqc)
+    endif
     call kgwait<<<1, 32, 0, ist>>>(gnpeer, gpr(1), gpr(2), gpr(3), gfl, gqc)
     call kgcopy<<<(gtot + 255) / 256, 256, 0, ist>>>(gtot, gld, gbuf, gqc, out)
     ierr = cudaGetLastError()
@@ -333,9 +354,14 @@ contains
     integer, intent(in) :: n, o, cnt
 #ifdef USE_CUDA
     real(8), device :: xv(*), out(*)
-    integer :: ierr
+    integer :: ierr, nb
     if (cnt > gld) error stop 'implicit_fs: ipc_gather_v: buffer too short'
+    if (o_mblk) then
+      nb = max(1, min(GP_MAXB, (n + GP_NT - 1) / GP_NT))
+      call kgput_vm<<<nb, GP_NT, 0, ist>>>(xv, n, gld, o, gme, gnpeer, gbuf, gq1, gq2, gq3, gf1, gf2, gf3, gqc, gbc)
+    else
     call kgput_v<<<1, IPC_NT, 0, ist>>>(xv, n, gld, o, gme, gnpeer, gbuf, gq1, gq2, gq3, gf1, gf2, gf3, gqc)
+    endif
     call kgwait<<<1, 32, 0, ist>>>(gnpeer, gpr(1), gpr(2), gpr(3), gfl, gqc)
     call kgcopy<<<(cnt + 255) / 256, 256, 0, ist>>>(cnt, gld, gbuf, gqc, out)
     ierr = cudaGetLastError()
@@ -354,10 +380,15 @@ contains
     nx = g_nx; ny = g_ny; is = g_is; ie = g_ie; js = g_js; je = g_je
     j0 = g_j0; j1 = g_j1; i0 = g_i0; i1 = g_i1
     h = merge(1, 0, has)
+    if (o_fuse) then
+      call kring_f<<<1, IPC_NT, 0, ist>>>(nf, nx, ny, is, ie, js, je, j0, j1, i0, i1, mv, a1, a2, a3, a4, a5, a6, &
+           pw, pe, ps, pn, fw, fe, fs, fn, rbuf, rflag, qc, h(1), h(2), h(3), h(4))
+    else
     call kput_f<<<1, IPC_NT, 0, ist>>>(nf, nx, ny, is, ie, js, je, j0, j1, i0, i1, mv, a1, a2, a3, a4, a5, a6, &
          pw, pe, ps, pn, fw, fe, fs, fn, qc, h(1), h(2), h(3), h(4))
     call kwait_f<<<1, IPC_NT, 0, ist>>>(nf, nx, ny, is, ie, js, je, j0, j1, i0, i1, mv, a1, a2, a3, a4, a5, a6, &
          rbuf, rflag, qc, h(1), h(2), h(3), h(4))
+    endif
     ierr = cudaGetLastError()
     if (ierr /= 0) error stop 'implicit_fs: ipc_ring_fine launch'
 #else
@@ -372,9 +403,14 @@ contains
     real(8), device :: x(0:mgx + 1, 0:mgy + 1, *)
     integer :: h(4), ierr
     h = merge(1, 0, has)
+    if (o_fuse) then
+      call kring_p<<<1, IPC_NT, 0, ist>>>(x, mgx, mgy, l, nxl, nyl, mv, pw, pe, ps, pn, fw, fe, fs, fn, rbuf, rflag, &
+           qc, h(1), h(2), h(3), h(4))
+    else
     call kput_p<<<1, IPC_NT, 0, ist>>>(x, mgx, mgy, l, nxl, nyl, mv, pw, pe, ps, pn, fw, fe, fs, fn, qc, &
          h(1), h(2), h(3), h(4))
     call kwait_p<<<1, IPC_NT, 0, ist>>>(x, mgx, mgy, l, nxl, nyl, mv, rbuf, rflag, qc, h(1), h(2), h(3), h(4))
+    endif
     ierr = cudaGetLastError()
     if (ierr /= 0) error stop 'implicit_fs: ipc_ring_plane launch'
 #else
@@ -435,6 +471,243 @@ contains
       if (npeer >= 3) f3(me + 1) = q
     endif
   end subroutine kgput_v
+
+  attributes(global) subroutine kgput_m(x, mgx, mgy, l, nxd, nyd, tot, o, me, npeer, gb, q1, q2, q3, &
+       f1, f2, f3, qc, bc)
+    ! kgput by several blocks: each block puts its share and fences; the last block to finish (counter
+    ! bc, reset by it) raises the flags (fsr_k12's scheme)
+    integer, value :: mgx, mgy, l, nxd, nyd, tot, o, me, npeer
+    real(8), device :: x(0:mgx + 1, 0:mgy + 1, *)
+    real(8), device :: gb(tot, 2), q1(tot, 2), q2(tot, 2), q3(tot, 2)
+    integer, device, volatile :: f1(4), f2(4), f3(4)
+    integer, device :: qc(1), bc(1)
+    integer, shared :: last
+    integer :: q, s, k, i, j, old
+    real(8) :: v
+    q = qc(1) + 1; s = mod(q, 2) + 1
+    do k = (blockIdx%x - 1) * blockDim%x + threadIdx%x, nxd * nyd, gridDim%x * blockDim%x
+      j = (k - 1) / nxd + 1; i = k - (j - 1) * nxd
+      v = x(i, j, l)
+      gb(o + k, s) = v
+      if (npeer >= 1) q1(o + k, s) = v
+      if (npeer >= 2) q2(o + k, s) = v
+      if (npeer >= 3) q3(o + k, s) = v
+    enddo
+    call threadfence_system()
+    call syncthreads()
+    if (threadIdx%x == 1) then
+      old = atomicadd(bc(1), 1)
+      last = 0
+      if (old == gridDim%x - 1) last = 1
+    endif
+    call syncthreads()
+    if (last == 0) return
+    if (threadIdx%x == 1) then
+      call threadfence_system()
+      bc(1) = 0
+      if (npeer >= 1) f1(me + 1) = q
+      if (npeer >= 2) f2(me + 1) = q
+      if (npeer >= 3) f3(me + 1) = q
+    endif
+  end subroutine kgput_m
+
+  attributes(global) subroutine kgput_vm(xv, n, ld, o, me, npeer, gb, q1, q2, q3, f1, f2, f3, qc, bc)
+    ! kgput_v by several blocks (kgput_m's scheme)
+    integer, value :: n, ld, o, me, npeer
+    real(8), device :: xv(n)
+    real(8), device :: gb(ld, 2), q1(ld, 2), q2(ld, 2), q3(ld, 2)
+    integer, device, volatile :: f1(4), f2(4), f3(4)
+    integer, device :: qc(1), bc(1)
+    integer, shared :: last
+    integer :: q, s, k, old
+    real(8) :: v
+    q = qc(1) + 1; s = mod(q, 2) + 1
+    do k = (blockIdx%x - 1) * blockDim%x + threadIdx%x, n, gridDim%x * blockDim%x
+      v = xv(k)
+      gb(o + k, s) = v
+      if (npeer >= 1) q1(o + k, s) = v
+      if (npeer >= 2) q2(o + k, s) = v
+      if (npeer >= 3) q3(o + k, s) = v
+    enddo
+    call threadfence_system()
+    call syncthreads()
+    if (threadIdx%x == 1) then
+      old = atomicadd(bc(1), 1)
+      last = 0
+      if (old == gridDim%x - 1) last = 1
+    endif
+    call syncthreads()
+    if (last == 0) return
+    if (threadIdx%x == 1) then
+      call threadfence_system()
+      bc(1) = 0
+      if (npeer >= 1) f1(me + 1) = q
+      if (npeer >= 2) f2(me + 1) = q
+      if (npeer >= 3) f3(me + 1) = q
+    endif
+  end subroutine kgput_vm
+
+  attributes(global) subroutine kring_f(nf, nx, ny, is, ie, js, je, j0, j1, i0, i1, mv, a1, a2, a3, a4, a5, a6, &
+       pw, pe, ps, pn, fw, fe, fs, fn, rb, fl, qc, hw, he, hs, hn)
+    ! kput_f and kwait_f in one kernel (one block): the same puts, flags, wait and unpacking in the
+    ! same order (every rank puts before it waits)
+    integer, value :: nf, nx, ny, is, ie, js, je, j0, j1, i0, i1, mv, hw, he, hs, hn
+    real(8), device, dimension(is:ie, js:je) :: a1, a2, a3, a4, a5, a6
+    real(8), device :: pw(mv, 2, 4), pe(mv, 2, 4), ps(mv, 2, 4), pn(mv, 2, 4)
+    integer, device, volatile :: fw(4), fe(4), fs(4), fn(4)
+    real(8), device, volatile :: rb(mv, 2, 4)
+    integer, device, volatile :: fl(4)
+    integer, device :: qc(1)
+    integer :: q, s, k, f, m, n2, jj, ii
+    real(8) :: vw, ve, vs, vn
+    q = qc(1) + 1; s = mod(q, 2) + 1
+    n2 = j1 - j0 + 1
+    do k = threadIdx%x, nf * n2, blockDim%x
+      f = (k - 1) / n2 + 1; m = k - (f - 1) * n2; jj = j0 + m - 1
+      select case (f)
+      case (1); vw = a1(1, jj); ve = a1(nx, jj)
+      case (2); vw = a2(1, jj); ve = a2(nx, jj)
+      case (3); vw = a3(1, jj); ve = a3(nx, jj)
+      case (4); vw = a4(1, jj); ve = a4(nx, jj)
+      case (5); vw = a5(1, jj); ve = a5(nx, jj)
+      case default; vw = a6(1, jj); ve = a6(nx, jj)
+      end select
+      if (hw /= 0) pw(k, s, 2) = vw
+      if (he /= 0) pe(k, s, 1) = ve
+    enddo
+    n2 = i1 - i0 + 1
+    do k = threadIdx%x, nf * n2, blockDim%x
+      f = (k - 1) / n2 + 1; m = k - (f - 1) * n2; ii = i0 + m - 1
+      select case (f)
+      case (1); vs = a1(ii, 1); vn = a1(ii, ny)
+      case (2); vs = a2(ii, 1); vn = a2(ii, ny)
+      case (3); vs = a3(ii, 1); vn = a3(ii, ny)
+      case (4); vs = a4(ii, 1); vn = a4(ii, ny)
+      case (5); vs = a5(ii, 1); vn = a5(ii, ny)
+      case default; vs = a6(ii, 1); vn = a6(ii, ny)
+      end select
+      if (hs /= 0) ps(k, s, 4) = vs
+      if (hn /= 0) pn(k, s, 3) = vn
+    enddo
+    call threadfence_system()
+    call syncthreads()
+    if (threadIdx%x == 1) then
+      if (hw /= 0) fw(2) = q
+      if (he /= 0) fe(1) = q
+      if (hs /= 0) fs(4) = q
+      if (hn /= 0) fn(3) = q
+      do while ((hw /= 0 .and. fl(1) < q) .or. (he /= 0 .and. fl(2) < q) .or. (hs /= 0 .and. fl(3) < q) &
+           .or. (hn /= 0 .and. fl(4) < q))
+      enddo
+    endif
+    call syncthreads()
+    call threadfence()
+    n2 = j1 - j0 + 1
+    do k = threadIdx%x, nf * n2, blockDim%x
+      f = (k - 1) / n2 + 1; m = k - (f - 1) * n2; jj = j0 + m - 1
+      if (hw /= 0) then
+        vw = rb(k, s, 1)
+        select case (f)
+        case (1); a1(0, jj) = vw
+        case (2); a2(0, jj) = vw
+        case (3); a3(0, jj) = vw
+        case (4); a4(0, jj) = vw
+        case (5); a5(0, jj) = vw
+        case default; a6(0, jj) = vw
+        end select
+      endif
+      if (he /= 0) then
+        ve = rb(k, s, 2)
+        select case (f)
+        case (1); a1(nx + 1, jj) = ve
+        case (2); a2(nx + 1, jj) = ve
+        case (3); a3(nx + 1, jj) = ve
+        case (4); a4(nx + 1, jj) = ve
+        case (5); a5(nx + 1, jj) = ve
+        case default; a6(nx + 1, jj) = ve
+        end select
+      endif
+    enddo
+    n2 = i1 - i0 + 1
+    do k = threadIdx%x, nf * n2, blockDim%x
+      f = (k - 1) / n2 + 1; m = k - (f - 1) * n2; ii = i0 + m - 1
+      if (hs /= 0) then
+        vs = rb(k, s, 3)
+        select case (f)
+        case (1); a1(ii, 0) = vs
+        case (2); a2(ii, 0) = vs
+        case (3); a3(ii, 0) = vs
+        case (4); a4(ii, 0) = vs
+        case (5); a5(ii, 0) = vs
+        case default; a6(ii, 0) = vs
+        end select
+      endif
+      if (hn /= 0) then
+        vn = rb(k, s, 4)
+        select case (f)
+        case (1); a1(ii, ny + 1) = vn
+        case (2); a2(ii, ny + 1) = vn
+        case (3); a3(ii, ny + 1) = vn
+        case (4); a4(ii, ny + 1) = vn
+        case (5); a5(ii, ny + 1) = vn
+        case default; a6(ii, ny + 1) = vn
+        end select
+      endif
+    enddo
+    call syncthreads()
+    if (threadIdx%x == 1) qc(1) = q
+  end subroutine kring_f
+
+  attributes(global) subroutine kring_p(x, mgx, mgy, l, nxl, nyl, mv, pw, pe, ps, pn, fw, fe, fs, fn, rb, fl, qc, &
+       hw, he, hs, hn)
+    ! kput_p and kwait_p in one kernel (kring_f's scheme)
+    integer, value :: mgx, mgy, l, nxl, nyl, mv, hw, he, hs, hn
+    real(8), device :: x(0:mgx + 1, 0:mgy + 1, *)
+    real(8), device :: pw(mv, 2, 4), pe(mv, 2, 4), ps(mv, 2, 4), pn(mv, 2, 4)
+    integer, device, volatile :: fw(4), fe(4), fs(4), fn(4)
+    real(8), device, volatile :: rb(mv, 2, 4)
+    integer, device, volatile :: fl(4)
+    integer, device :: qc(1)
+    integer :: q, s, m
+    q = qc(1) + 1; s = mod(q, 2) + 1
+    do m = threadIdx%x, max(nxl, nyl), blockDim%x
+      if (m <= nyl) then
+        if (hw /= 0) pw(m, s, 2) = x(1, m, l)
+        if (he /= 0) pe(m, s, 1) = x(nxl, m, l)
+      endif
+      if (m <= nxl) then
+        if (hs /= 0) ps(m, s, 4) = x(m, 1, l)
+        if (hn /= 0) pn(m, s, 3) = x(m, nyl, l)
+      endif
+    enddo
+    call threadfence_system()
+    call syncthreads()
+    if (threadIdx%x == 1) then
+      if (hw /= 0) fw(2) = q
+      if (he /= 0) fe(1) = q
+      if (hs /= 0) fs(4) = q
+      if (hn /= 0) fn(3) = q
+      do while ((hw /= 0 .and. fl(1) < q) .or. (he /= 0 .and. fl(2) < q) .or. (hs /= 0 .and. fl(3) < q) &
+           .or. (hn /= 0 .and. fl(4) < q))
+      enddo
+    endif
+    call syncthreads()
+    call threadfence()
+    do m = threadIdx%x, max(nxl, nyl), blockDim%x
+      if (m <= nyl) then
+        x(0, m, l) = 0.0d0; x(nxl + 1, m, l) = 0.0d0
+        if (hw /= 0) x(0, m, l) = rb(m, s, 1)
+        if (he /= 0) x(nxl + 1, m, l) = rb(m, s, 2)
+      endif
+      if (m <= nxl) then
+        x(m, 0, l) = 0.0d0; x(m, nyl + 1, l) = 0.0d0
+        if (hs /= 0) x(m, 0, l) = rb(m, s, 3)
+        if (hn /= 0) x(m, nyl + 1, l) = rb(m, s, 4)
+      endif
+    enddo
+    call syncthreads()
+    if (threadIdx%x == 1) qc(1) = q
+  end subroutine kring_p
 
   attributes(global) subroutine kgwait(npeer, p1, p2, p3, fl, qc)
     integer, value :: npeer, p1, p2, p3
