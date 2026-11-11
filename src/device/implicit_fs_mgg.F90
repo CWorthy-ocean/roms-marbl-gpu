@@ -50,7 +50,14 @@ module fs_mgg
   ! dvm, dcm: this rank's block is written there by the pack kernel), host MPI, one copy up
   real(rp), FSD pointer, contiguous :: dvm(:) => null(), dcm(:) => null()
   real(rp), pointer, contiguous :: hva(:) => null(), hca(:) => null()
+  ! fs_gpu_opt 1024: the coarsest level's factor is not made at the end of mgg_setup but in the first
+  ! coarsest solve after it (mgg_act_coarse), once the coefficients' copy to the host has completed
+  ! (event ev_cf), while the device runs the PCG start and the first down leg; fac_n: nx, ny, n
+  logical :: fac_pend = .false.
+  integer :: fac_n(3) = 0
 #ifdef USE_CUDA
+  type(cudaEvent) :: ev_cf
+  logical :: ev_made = .false.
   type(cudaGraph) :: gr_dn, gr_up
   type(cudaGraphExec) :: ge_dn, ge_up
   logical :: gr_ready = .false.
@@ -153,6 +160,7 @@ contains
     integer(ip) :: i, j, ic, jc, nxc, nyc, nxf, nyf, fi, fj, ll, k, o, a, b, gl
     integer :: ierr, n, m
     real(rp) :: s
+    if (fac_pend) call fac_finish()        ! (a rebuild before any coarsest solve: not in fs_step's order)
     nxc = mg_nx(l); nyc = mg_ny(l); ll = l; o = cdsp(me + 1)
     if (o_gath .and. np > 1) then
       CUF_DO2
@@ -259,6 +267,19 @@ contains
     enddo
 #ifdef USE_CUDA
     ierr = cudaMemcpyAsync(hcf, dcf, 3 * n, cudaMemcpyDeviceToHost, work_stream)
+    if (o_fac) then
+      ! fs_gpu_opt 1024: the factor later, in the first coarsest solve (fac_finish)
+      if (.not. ev_made) then
+        ierr = cudaEventCreateWithFlags(ev_cf, cudaEventDisableTiming)
+        if (ierr /= 0) error stop 'implicit_fs: mgg_setup event'
+        ev_made = .true.
+      endif
+      ierr = cudaEventRecord(ev_cf, work_stream)
+      if (ierr /= 0) error stop 'implicit_fs: mgg_setup event record'
+      fac_n = [int(nxc), int(nyc), n]
+      fac_pend = .true.
+      return
+    endif
     ierr = cudaStreamSynchronize(work_stream)
     if (ierr /= 0) error stop 'implicit_fs: mgg_setup copy'
 #else
@@ -266,6 +287,19 @@ contains
 #endif
     call fsh_factor_from(int(nxc), int(nyc), hcf(1), hcf(n + 1), hcf(2 * n + 1))
   end subroutine mgg_setup
+
+  subroutine fac_finish()
+    ! fs_gpu_opt 1024: the coefficients' copy to the host complete (only that, not the work queued
+    ! after it), then the factor, as mgg_setup made it before
+    integer :: ierr, n
+#ifdef USE_CUDA
+    ierr = cudaEventSynchronize(ev_cf)
+    if (ierr /= 0) error stop 'implicit_fs: coarse factor event'
+#endif
+    n = fac_n(3)
+    call fsh_factor_from(fac_n(1), fac_n(2), hcf(1), hcf(n + 1), hcf(2 * n + 1))
+    fac_pend = .false.
+  end subroutine fac_finish
 
   subroutine gdiag(gl)
     integer, intent(in) :: gl
@@ -456,7 +490,9 @@ contains
 
   subroutine mgg_act_coarse()
     ! the host part of the coarsest level: the down leg complete, the banded Cholesky solve
+    ! (fs_gpu_opt 1024: the first after a rebuild makes the factor first, while the down leg runs)
     integer :: ierr
+    if (fac_pend) call fac_finish()
 #ifdef USE_CUDA
     ierr = cudaStreamSynchronize(work_stream)
     if (ierr /= 0) error stop 'implicit_fs: mgg coarse copy down'
