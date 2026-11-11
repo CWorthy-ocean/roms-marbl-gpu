@@ -16,6 +16,7 @@ module tide_io
   use frc_io, only: case_frcfiles, case_nfrc, frc_file_ncid
   use nc_io
   use arch_mod, only: sync_arch
+  use fs_data, only: pot_phase
 #ifdef USE_CUDA
   use cudadevice, only: __dmul_rn
 #endif
@@ -150,10 +151,13 @@ contains
     ! One small device kernel per constituent and target (c, s are
     ! kernel arguments), in the same order as the host loops it replaces.
     ! bry_phase (units of dt, default 0.5): the boundary harmonics are at
-    ! time + bry_phase*dt; the potential is always at n+1/2, where prsgrd
-    ! uses it. Both calls of the step use n+1/2 (CPU tides.F90 since
-    ! ab490df8): the harmonics enter only the 2D boundary conditions of the
-    ! fast loop, which runs from n to n+1. The coefficients are
+    ! time + bry_phase*dt; the potential is at time + pot_phase*dt (n+1/2,
+    ! where prsgrd uses it, unless the implicit free surface sets it). Both
+    ! calls of the step use n+1/2 for the split fast loop (CPU tides.F90
+    ! since ab490df8), which runs from n to n+1 with the harmonics (2D
+    ! boundary conditions) held fixed; with the implicit free surface the
+    ! second call passes 1.0, its boundary data being at n+alpha_f (CPU
+    ! 6a2d56da; see the call in step_driver). The coefficients are
     ! host-written managed arrays; the corrector call overwrites the
     ! predictor's only after set_depth's device sync, so the predictor's
     ! kernels have used them by then.
@@ -179,7 +183,7 @@ contains
     ! as the per-constituent kernels it replaces (same rounded products).
     do it = 1, ntides
       omT = ftide(it) * (time + bphase * dt)
-      omTp = ftide(it) * (time + 0.5_rp * dt)
+      omTp = ftide(it) * (time + pot_phase * dt)   ! n+1/2; implicit FS fs_pot_time 'af': n+alpha_f
       tide_c(it) = cos(omT)
       tide_s(it) = sin(omT)
       tide_cp(it) = cos(omTp)

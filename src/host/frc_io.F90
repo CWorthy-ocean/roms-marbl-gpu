@@ -150,6 +150,7 @@ module frc_io
   public :: read_forcing_namelist
   public :: init_forcing
   public :: set_forces
+  public :: frc_stress_af
   public :: init_bgc_forcing
   public :: set_bgc_forces
   public :: init_cdr_lite_forcing, set_cdr_lite_forces
@@ -415,6 +416,116 @@ contains
       call divide_2d(srflx, rho0_case * Cp)
     endif
   end subroutine set_forces
+
+  subroutine frc_stress_af(alf)
+    ! Implicit free surface, fs_stress_time = 'af' (CPU 19383afc/f77dbc19 fs_stress_af, FS_SPEC 3.1, 9b-F):
+    ! the surface stress in rufrc, rvfrc (step3d_uv1: dm dn sustr at n+1/2) moved to t' = t_{n+alpha_f}
+    ! for the 2-D step: rufrc += dm_u dn_u (sustr(t') - sustr(n+1/2)) on the owned u-faces (v likewise).
+    ! The stress data come from the forcing slots already on the device (no read, no advance; past
+    ! the second slot a linear extrapolation, as the CPU's frc_data_at):
+    !  - bulk forcing (bulk_stress_shift): per rho point the step's wind part k W of sustr_r, svstr_r
+    !    (the current-feedback term removed with the same formula; u, v(nrhs) are still the n+1/2
+    !    predictor), k = (wx uwnd + wy vwnd)/|W|^2, and the stress at the wind W' of t' with the drag
+    !    coefficient and air density held, gustiness 0.5 m/s: dsr = k (sqrt((|W'|^2 + 0.25)/(|W|^2
+    !    + 0.25)) W' - W); dsu = 0.5 (dsr(i-1) + dsr(i)) umask. (roms_gpu has no TAU_CORRECTION.)
+    !  - flux forcing (flux_stress_shift): dsu = sustr_data(t')/rho0 - sustr.
+    ! rufrc is not read after the barotropic step; the 3-D step keeps the n+1/2 stress.
+    real(rp), intent(in) :: alf
+    real(rp), parameter :: sh_slope = -0.0029_rp, sh_offset = 0.008_rp, sh_wmin = 3.0_rp, sh_sref = -0.0027_rp
+    real(rp), parameter :: sh_gus2 = 0.25_rp
+    real(rp), WORK_ATTR allocatable, save :: w1(:,:), w2(:,:), dsr(:,:), dsrv(:,:)
+    real(rp) :: tsh, r0, cf, wx, wy, ww, k, rat, uw, vw
+    integer(ip) :: i, j, nx, ny, nzz, n_rhs, istrU, jstrV
+    if (.not. (have_bulk .or. have_flux)) return
+    if (.not. allocated(w1)) then
+      allocate(w1(decomp%is:decomp%ie, decomp%js:decomp%je), w2(decomp%is:decomp%ie, decomp%js:decomp%je), &
+               dsr(decomp%is:decomp%ie, decomp%js:decomp%je), dsrv(decomp%is:decomp%ie, decomp%js:decomp%je))
+      w1 = 0.0_rp; w2 = 0.0_rp; dsr = 0.0_rp; dsrv = 0.0_rp
+    endif
+    tsh = (time + alf * dt) * sec2day        ! time is t_n during the step
+    nx = decomp%nx; ny = decomp%ny; nzz = decomp%nz; n_rhs = nrhs; r0 = rho0_case
+    istrU = merge(2, 1, decomp%edge_w); jstrV = merge(2, 1, decomp%edge_s)
+    if (have_bulk) then
+      call fill_at(s_uwnd, tsh, w1, 'r')
+      call fill_at(s_vwnd, tsh, w2, 'r')
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = 0, ny
+        do i = 0, nx
+          uw = uwnd(i, j); vw = vwnd(i, j)
+          ww = sqrt(uw * uw + vw * vw)
+          if (ww > sh_wmin) then
+            cf = sh_slope * ww + sh_offset
+          else
+            cf = sh_sref
+          endif
+          wx = sustr_r(i, j) - cf * 0.5_rp * (u(i, j, nzz, n_rhs) + u(i + 1, j, nzz, n_rhs)) / r0
+          wy = svstr_r(i, j) - cf * 0.5_rp * (v(i, j, nzz, n_rhs) + v(i, j + 1, nzz, n_rhs)) / r0
+          ww = uw**2 + vw**2
+          k = 0.0_rp
+          if (ww > 1.e-8_rp) k = (wx * uw + wy * vw) / ww
+          rat = sqrt((w1(i, j)**2 + w2(i, j)**2 + sh_gus2) / (ww + sh_gus2))
+          dsr(i, j) = k * (rat * w1(i, j) - uw)
+          dsrv(i, j) = k * (rat * w2(i, j) - vw)
+        enddo
+      enddo
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = 1, ny
+        do i = istrU, nx
+          rufrc(i, j) = rufrc(i, j) + dm_u(i, j) * dn_u(i, j) * (0.5_rp * (dsr(i - 1, j) + dsr(i, j)) * umask(i, j))
+        enddo
+      enddo
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = jstrV, ny
+        do i = 1, nx
+          rvfrc(i, j) = rvfrc(i, j) + dm_v(i, j) * dn_v(i, j) * (0.5_rp * (dsrv(i, j - 1) + dsrv(i, j)) * vmask(i, j))
+        enddo
+      enddo
+    else
+      call fill_at(s_sustr, tsh, w1, 'u')
+      call fill_at(s_svstr, tsh, w2, 'v')
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = 1, ny
+        do i = istrU, nx
+          rufrc(i, j) = rufrc(i, j) + dm_u(i, j) * dn_u(i, j) * (w1(i, j) / r0 - sustr(i, j))
+        enddo
+      enddo
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = jstrV, ny
+        do i = 1, nx
+          rvfrc(i, j) = rvfrc(i, j) + dm_v(i, j) * dn_v(i, j) * (w2(i, j) / r0 - svstr(i, j))
+        enddo
+      enddo
+    endif
+  end subroutine frc_stress_af
+
+  subroutine fill_at(s, t, dest, gtype)
+    ! The field of the two slots of s interpolated to time t [days] with set_forces' weights
+    ! (linear; outside the bracket a linear extrapolation), without advancing the series
+    ! (the CPU's frc_data_at). NaN -> 0. The layout as fill_any (bind_series): a field on the
+    ! grid over this tile's window, or a 2x-coarse field interpolated from the global index.
+    type(series2d), intent(inout), target :: s
+    real(rp),       intent(in)    :: t
+    real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
+    character(len=1), intent(in)  :: gtype
+    real(rp) :: c1, c2
+    if (.not. s%ready) return
+    call weights(s, t, c1, c2)
+    if (s%lay == LAY_GRID) then
+      call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0)
+    else
+      call interp_coarse(s%buf, s%n1, s%n2, c1, c2, dest, gtype, .false.)
+    endif
+  end subroutine fill_at
 
   subroutine prefetch_time_axes()
     ! Collective over the compute ranks. The 1-D real variables of every

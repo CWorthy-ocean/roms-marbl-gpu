@@ -20,6 +20,7 @@ module case_io
   use cdr_gas_out, only: read_cdr_gas_output_namelist, set_cdr_gas_output_root, init_cdr_gas_output
   use cdr_out, only: read_cdr_output_namelist, set_cdr_output_root, init_cdr_output
   use upscale_out, only: read_upscale_namelist, set_upscale_root, init_upscale_output
+  use implicit_fs_gpu, only: fs_read_namelist
   use his_io, only: read_output_namelist, read_refdate_namelist, set_output_root, init_output
   use avg_out, only: read_avg_namelist, set_avg_root, init_avg_output
   use extract_out, only: read_extract_namelist, init_extract
@@ -200,6 +201,7 @@ contains
     call read_cdr_gas_output_namelist(unit)
     call read_cdr_output_namelist(unit)
     call read_upscale_namelist(unit)
+    call fs_read_namelist(unit)           ! &implicit_fs: implicit free surface when fs_mode = 'implicit'
     case_ntp_est = nt_bgc + ntp + ncdr        ! MARBL + generic + CDR_LITE (ntp = nt_passive here)
 
     rewind(unit); read(unit, nml=simulation_name_settings, iostat=ios, iomsg=msg)

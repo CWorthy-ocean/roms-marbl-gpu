@@ -22,7 +22,8 @@ module step_driver
   use t3dmix_mod, only: t3dmix
   use passive_mod, only: ntp, passive_t3dmix, passive_exchange_mid
   use lmd_mod, only: lmd_vmix
-  use frc_io, only: set_forces, frc_prefetch
+  use frc_io, only: set_forces, frc_prefetch, frc_stress_af
+  use fs_data, only: stress_af, alf
   use river_io, only: set_rivers
   use cdr_io, only: set_cdr, set_cdr_pred
   use cdr_lite_io, only: set_cdr_lite
@@ -31,6 +32,7 @@ module step_driver
   use run_timers, only: rt_dev_collect, wall_time
   use arch_mod, only: sync_arch
   use upscale_out, only: wrt_upscale
+  use implicit_fs_gpu, only: fs_on, fs_step, fs_srcdiag, fs_src_diag
   implicit none
   private
 
@@ -149,14 +151,18 @@ contains
     call lmd_vmix(nrhs)
     ! Boundary data for n+1 (CPU main.F90 since 69a23382; before it read
     ! n+3/2). The boundary tidal harmonics are added to the 2D boundary
-    ! arrays, which only the fast loop reads (uv2dbc). The fast loop
+    ! arrays, which the split fast loop reads (uv2dbc). The fast loop
     ! advances the barotropic mode from n to n+1 with these values held
     ! fixed, so they are evaluated at the centre of that interval, n+1/2;
     ! at n+1 the boundary-forced tide leads by about omega*dt/2 (CPU
-    ! ab490df8). The potential is at n+1/2 as well, where prsgrd uses it.
+    ! ab490df8). The potential is at n+1/2 as well, where prsgrd uses it
+    ! (the implicit free surface moves it, see pot_phase). With the
+    ! implicit free surface (fs_on) the same arrays are read by the
+    ! implicit step, whose boundary face takes data at n+alpha_f, so fs_on
+    ! keeps the harmonics at n+1 (CPU 6a2d56da).
     frc_slot = 2
     call set_bry_all()
-    call set_tides(0.5_rp)
+    call set_tides(merge(1.0_rp, 0.5_rp, fs_on))
     call dump_bry_north('after tide', frc_modtime())
     call step_mark('corrector forces')
     call dump_vic('before uv1')
@@ -180,6 +186,14 @@ contains
     call dump_ztd_pt('after step3d_uv1+visc')
     call dump_rim('after step3d_uv1+visc')
 
+    if (fs_on) then
+      ! implicit free surface (implicit_fs.F90, FS_SPEC.md): one step
+      ! replaces the fast loop; kstp then points at the new level
+      call cycle_fast_index()
+      if (stress_af) call frc_stress_af(alf)   ! fs_stress_time = 'af': rufrc's stress at n+alpha_f
+      call fs_step()
+      kstp = knew
+    else
     do n = 1, nfast
       iif = n
       call cycle_fast_index()
@@ -192,6 +206,8 @@ contains
       endif
       call dump_fast_probe()
     enddo
+    endif
+    if (fs_srcdiag) call fs_src_diag()   ! IMPLICIT_FS fs_verbose >= 2: FS_SRC line (both fs_mode values)
     call step_mark('step2d')
     call dump_ic_jet_2d('after step2d')
 
