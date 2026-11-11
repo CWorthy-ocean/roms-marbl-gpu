@@ -133,7 +133,7 @@ contains
     if (trim(fs_gpu_coarse) /= 'device' .and. trim(fs_gpu_coarse) /= 'host') &
          error stop "IMPLICIT_FS: fs_gpu_coarse must be 'device' or 'host'"
     dev_glob = (trim(fs_gpu_coarse) == 'device')
-    if (fs_gpu_opt < 0 .or. fs_gpu_opt > 8191) error stop 'IMPLICIT_FS: fs_gpu_opt must lie in [0, 8191]'
+    if (fs_gpu_opt < 0 .or. fs_gpu_opt > 16383) error stop 'IMPLICIT_FS: fs_gpu_opt must lie in [0, 16383]'
     if (fs_gpu_timers < 0 .or. fs_gpu_timers > 2) error stop 'IMPLICIT_FS: fs_gpu_timers must be 0, 1 or 2'
     call fs_opt_flags()
     if (talk) then

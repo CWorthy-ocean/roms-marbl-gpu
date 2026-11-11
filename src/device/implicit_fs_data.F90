@@ -113,6 +113,8 @@ module fs_data
   !     instead of one per colour, reading one array and writing the other; a second-colour cell forms
   !     its first-colour neighbours' new values itself with the same expression (bit-identical); the
   !     down leg's first sweep reads a plane of zeros instead of a zeroed level (no zeroing kernels)
+  ! 8192 the same for the fine level and the distributed coarse levels (fs_mg), the rings between the
+  !     sweeps on the array the next sweep reads
   ! Default 471 = all but 8 and 32, which were slower (sargasso and Pac FS window: 8 +0.2 / +0.15 ms,
   ! 32 +0.2 / +0.3 ms with 128 on: graph-launched kernels beat the cooperative kernels' grid syncs).
   ! fs_gpu_timers 2: the FS window (device synchronised at entry and exit of fs_step) only.
@@ -192,7 +194,7 @@ module fs_data
 #endif
   logical :: o_ring = .false., o_red = .false., o_cvec = .false., o_gath = .false., o_chol = .false.
   logical :: o_fleg = .false., o_cc = .false., o_vgr = .false., o_ipc = .false., o_shm = .false.
-  logical :: o_fac = .false., o_cgi = .false., o_g2g = .false.
+  logical :: o_fac = .false., o_cgi = .false., o_g2g = .false., o_g2f = .false.
   ! fs_gpu_opt 128: a V-cycle recording is open (the host actions go through vg_point_p, which
   ! closes the stretch's graph, launches it, does the action and opens the next stretch)
   logical :: vg_rec = .false.
@@ -282,7 +284,7 @@ contains
     o_fleg = iand(fs_gpu_opt, 32) /= 0; o_cc = iand(fs_gpu_opt, 64) /= 0; o_vgr = iand(fs_gpu_opt, 128) /= 0
     o_ipc = iand(fs_gpu_opt, 256) /= 0; o_shm = iand(fs_gpu_opt, 512) /= 0
     o_fac = iand(fs_gpu_opt, 1024) /= 0; o_cgi = iand(fs_gpu_opt, 2048) /= 0
-    o_g2g = iand(fs_gpu_opt, 4096) /= 0
+    o_g2g = iand(fs_gpu_opt, 4096) /= 0; o_g2f = iand(fs_gpu_opt, 8192) /= 0
     if (fs_gpu_timers == 1) o_vgr = .false.
 #ifndef USE_CUDA
     o_ring = .false.; o_red = .false.; o_cvec = .false.; o_gath = .false.; o_fleg = .false.; o_vgr = .false.
