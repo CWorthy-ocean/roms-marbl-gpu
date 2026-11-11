@@ -36,6 +36,11 @@ module fs_mgg
   integer, allocatable :: gi0(:), gj0(:), gnx(:), gny(:), gcnt(:), gdsp(:), ccnt(:), cdsp(:)
   logical :: perx = .false., pery = .false.
   real(rp), FSD allocatable, dimension(:,:,:) :: gx_, gb_, ge_, gw_, gs_, gd_, gt_
+  ! fs_gpu_opt 4096 (even fs_mg_nu, red-black): one kernel per sweep of the global levels, reading one
+  ! array and writing the other (gx_ <-> gxb_); the first sweep of a down leg reads gz_, a plane of
+  ! zeros that is never written (instead of gx_ zeroed by gzero)
+  real(rp), FSD allocatable, dimension(:,:,:) :: gxb_, gz_
+  logical :: g2 = .false.
   ! coarse face factors of the global levels (fs_mg_faces; (ic, level), levels 2..ng)
   real(rp), FSD allocatable :: gfx_(:,:), gfy_(:,:)
   integer, FSD allocatable :: mapv(:,:), mape(:,:), mapw(:,:), maps(:,:)
@@ -134,6 +139,11 @@ contains
       dco => dco0; dcx => dco0; hco_b => hco_b0; hco_x => hco_x0
     endif
     if (o_fleg) call mgk_init(glx, gly)
+    g2 = o_g2g .and. .not. jac_sm .and. mod(fs_mg_nu, 2) == 0
+    if (g2) then
+      allocate(gxb_(0:gx1 + 1, 0:gy1 + 1, ng), gz_(0:gx1 + 1, 0:gy1 + 1, 1))
+      gxb_ = 0; gz_ = 0
+    endif
     if (o_ipc) then
       ! (fs_gpu_opt 2048: the buffers also hold the coarse coefficients, ipc_gather_v)
       call ipc_gather_init(np, me, sum(gcnt), gdsp(me + 1), merge(sum(ccnt), sum(gcnt), o_cgi))
@@ -434,6 +444,24 @@ contains
       integer :: gl2, kk2
       integer(ip) :: i2, j2, a2, b2, k2
       do gl2 = 1, ng - 1
+        if (g2) then
+          ! fs_gpu_opt 4096: sweep 1 gz_ -> gxb_, then alternately gxb_ -> gx_, gx_ -> gxb_ (ends in gx_);
+          ! the periodic wrap of the array a sweep reads before it (gz_'s halo is zero)
+          do kk2 = 1, fs_mg_nu
+            if (kk2 == 1) then
+              call gsweep2(gl2, 1, gz_, 1, gxb_, gl2)
+            else if (mod(kk2, 2) == 0) then
+              call ghalo_a(gl2, gxb_)
+              call gsweep2(gl2, 1, gxb_, gl2, gx_, gl2)
+            else
+              call ghalo_a(gl2, gx_)
+              call gsweep2(gl2, 1, gx_, gl2, gxb_, gl2)
+            endif
+          enddo
+          call ghalo(gl2)
+          call gresid_restrict(gl2)
+          cycle
+        endif
         call gzero(gl2)
         do kk2 = 1, fs_mg_nu
           call ghalo(gl2)
@@ -454,6 +482,29 @@ contains
       integer :: gl2, kk2
       integer(ip) :: i2, j2, a2, b2, k2, i02, j02, nx2, ny2, l2
       a2 = glx(ng); b2 = gly(ng); k2 = ng
+      if (g2) then
+        ! fs_gpu_opt 4096: gzero folded into the copy (the same plane: zeros, the solution inside)
+        nx2 = gx1; ny2 = gy1
+        CUF_DO2
+        do j2 = 0, ny2 + 1
+          do i2 = 0, nx2 + 1
+            gx_(i2, j2, k2) = 0.0_rp
+            if (i2 >= 1 .and. i2 <= a2 .and. j2 >= 1 .and. j2 <= b2) gx_(i2, j2, k2) = dcx(i2 + (j2 - 1) * a2)
+          enddo
+        enddo
+        do gl2 = ng - 1, 1, -1
+          call gprolong(gl2)
+          do kk2 = 1, fs_mg_nu            ! alternately gx_ -> gxb_, gxb_ -> gx_ (ends in gx_)
+            if (mod(kk2, 2) == 1) then
+              call ghalo_a(gl2, gx_)
+              call gsweep2(gl2, 2, gx_, gl2, gxb_, gl2)
+            else
+              call ghalo_a(gl2, gxb_)
+              call gsweep2(gl2, 2, gxb_, gl2, gx_, gl2)
+            endif
+          enddo
+        enddo
+      else
       call gzero(ng)
       CUF_DO2
       do j2 = 1, b2
@@ -468,6 +519,7 @@ contains
           call gsmooth(gl2, 2)
         enddo
       enddo
+      endif
       ! this rank's block into the coarsest distributed level (zero halo)
       i02 = gi0(me + 1); j02 = gj0(me + 1); a2 = mgx; b2 = mgy; nx2 = nxd; ny2 = nyd; l2 = ll
       CUF_DO2
@@ -535,6 +587,83 @@ contains
       endif
     enddo
   end subroutine ghalo
+
+  subroutine ghalo_a(gl, x)
+    ! ghalo of the array x (gx_ or gxb_)
+    integer, intent(in) :: gl
+    real(rp), FSD intent(inout) :: x(0:gx1 + 1, 0:gy1 + 1, *)
+    integer(ip) :: m, nx, ny, mm, k
+    logical :: px, py
+    if (.not. (perx .or. pery)) return
+    nx = glx(gl); ny = gly(gl); k = gl; px = perx; py = pery; mm = max(nx, ny) + 2
+    CUF_DO1
+    do m = 0, mm
+      if (px .and. m >= 1 .and. m <= ny) then
+        x(0, m, k) = x(nx, m, k); x(nx + 1, m, k) = x(1, m, k)
+      endif
+      if (py .and. m >= 1 .and. m <= nx) then
+        x(m, 0, k) = x(m, ny, k); x(m, ny + 1, k) = x(m, 1, k)
+      endif
+    enddo
+  end subroutine ghalo_a
+
+  subroutine gsweep2(gl, mode, xs, ks, xd, kd)
+    ! fs_gpu_opt 4096: one red-black sweep of global level gl in one kernel, from xs(:, :, ks) (halo
+    ! current) into xd(:, :, kd). A first-colour cell gets gsmooth's expression of xs; a second-colour
+    ! cell first forms the new values of its four first-colour neighbours with that same expression
+    ! (or takes xs's value where the neighbour is a halo cell: gsmooth's second colour reads the halo
+    ! as it was before the sweep), then its own from them. Every value gsmooth stores is made from
+    ! the same operands in the same order: bit-identical. mode 1: colour mod(i + j, 2) = 1 first
+    ! (gsmooth's c = 1, col = 0), mode 2: mod(i + j, 2) = 0 first.
+    integer, intent(in) :: gl, mode, ks, kd
+    real(rp), FSD intent(in) :: xs(0:gx1 + 1, 0:gy1 + 1, *)
+    real(rp), FSD intent(inout) :: xd(0:gx1 + 1, 0:gy1 + 1, *)
+    integer(ip) :: i, j, nx, ny, k, p1, s1, d1
+    real(rp) :: vw, ve, vs, vn
+    nx = glx(gl); ny = gly(gl); k = gl; p1 = mod(1 + mode, 2); s1 = ks; d1 = kd
+    CUF_DO2
+    do j = 1, ny
+      do i = 1, nx
+        if (mod(i + j + p1, 2) == 1) then
+          xd(i, j, d1) = gd_(i, j, k) * (gb_(i, j, k) + gw_(i, j, k) * xs(i - 1, j, s1) &
+               + gw_(i + 1, j, k) * xs(i + 1, j, s1) + gs_(i, j, k) * xs(i, j - 1, s1) &
+               + gs_(i, j + 1, k) * xs(i, j + 1, s1))
+        else
+          if (i > 1) then
+            vw = gd_(i - 1, j, k) * (gb_(i - 1, j, k) + gw_(i - 1, j, k) * xs(i - 2, j, s1) &
+                 + gw_(i, j, k) * xs(i, j, s1) + gs_(i - 1, j, k) * xs(i - 1, j - 1, s1) &
+                 + gs_(i - 1, j + 1, k) * xs(i - 1, j + 1, s1))
+          else
+            vw = xs(i - 1, j, s1)
+          endif
+          if (i < nx) then
+            ve = gd_(i + 1, j, k) * (gb_(i + 1, j, k) + gw_(i + 1, j, k) * xs(i, j, s1) &
+                 + gw_(i + 2, j, k) * xs(i + 2, j, s1) + gs_(i + 1, j, k) * xs(i + 1, j - 1, s1) &
+                 + gs_(i + 1, j + 1, k) * xs(i + 1, j + 1, s1))
+          else
+            ve = xs(i + 1, j, s1)
+          endif
+          if (j > 1) then
+            vs = gd_(i, j - 1, k) * (gb_(i, j - 1, k) + gw_(i, j - 1, k) * xs(i - 1, j - 1, s1) &
+                 + gw_(i + 1, j - 1, k) * xs(i + 1, j - 1, s1) + gs_(i, j - 1, k) * xs(i, j - 2, s1) &
+                 + gs_(i, j, k) * xs(i, j, s1))
+          else
+            vs = xs(i, j - 1, s1)
+          endif
+          if (j < ny) then
+            vn = gd_(i, j + 1, k) * (gb_(i, j + 1, k) + gw_(i, j + 1, k) * xs(i - 1, j + 1, s1) &
+                 + gw_(i + 1, j + 1, k) * xs(i + 1, j + 1, s1) + gs_(i, j + 1, k) * xs(i, j, s1) &
+                 + gs_(i, j + 2, k) * xs(i, j + 2, s1))
+          else
+            vn = xs(i, j + 1, s1)
+          endif
+          xd(i, j, d1) = gd_(i, j, k) * (gb_(i, j, k) + gw_(i, j, k) * vw + gw_(i + 1, j, k) * ve &
+               + gs_(i, j, k) * vs + gs_(i, j + 1, k) * vn)
+        endif
+      enddo
+    enddo
+    call tq(T_MSM)
+  end subroutine gsweep2
 
   subroutine gsmooth(gl, mode)
     integer, intent(in) :: gl, mode
