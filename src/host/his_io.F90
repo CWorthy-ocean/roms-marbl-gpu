@@ -15,6 +15,8 @@ module his_io
   use run_timers, only: rt_tic, rt_toc, rt_mark_rst, RT_HIS, RT_RST
   use passive_mod, only: ntp, tp, wrt_passive, passive_name
   use rivers_mod, only: river_on
+  use pflx_mod, only: calc_pflx, u_slow, v_slow, p_slow
+  use sponge_io, only: def_rst_ub, stage_rst_ub, put_rst_ub
   use wvlcty_mod, only: wvlcty_compute
   use marbl_gpu, only: marbl_on, marbl_gpu_nhis, marbl_gpu_nhis3, marbl_gpu_define_his, marbl_gpu_stage_his, &
                        marbl_gpu_define_rst, marbl_gpu_write_rst, marbl_gpu_stage_rst8
@@ -61,6 +63,7 @@ module his_io
   public :: read_output_namelist
   public :: read_refdate_namelist
   public :: output_fname
+  public :: output_period_rst   ! sponge_out: the CPU's file-length check
   public :: set_output_root
   public :: init_output
   public :: wrt_his
@@ -325,6 +328,12 @@ contains
         call io_stage8_2d('riv_umask', riv_umask(is, js), iu0, iu1, jr0, jr1, 0, jr0)
         call io_stage8_2d('riv_vmask', riv_vmask(is, js), ir0, ir1, jv0, jv1, ir0, 0)
       endif
+      if (calc_pflx) then  ! the CPU's wrt_rst_diag_slow
+        call io_stage8_3d('u_slow', u_slow(is, js, 1), 1, nz, iu0, iu1, jr0, jr1, 0, jr0)
+        call io_stage8_3d('v_slow', v_slow(is, js, 1), 1, nz, ir0, ir1, jv0, jv1, ir0, 0)
+        call io_stage8_3d('p_slow', p_slow(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+      endif
+      call stage_rst_ub()   ! ub_tune: ub_west, ub_east, ub_south, ub_north
       call io_stage8_end()
       call wall_stamp('restart staged')
       if (comm_rank() == 0) write(*,'(a,es14.6,a,i0,a,i0)') 'staged restart t = ', twrite, &
@@ -362,6 +371,12 @@ contains
       call put_u2(ncid, 'riv_umask', riv_umask, rec_rst)
       call put_v2(ncid, 'riv_vmask', riv_vmask, rec_rst)
     endif
+    if (calc_pflx) then
+      call put_u3(ncid, 'u_slow', u_slow, rec_rst)
+      call put_v3(ncid, 'v_slow', v_slow, rec_rst)
+      call put_r3(ncid, 'p_slow', p_slow, rec_rst)
+    endif
+    call put_rst_ub(ncid, rec_rst)
     call nc_close(ncid)
     endif
     call compute_barrier()
@@ -457,6 +472,18 @@ contains
       id = nc_def_var(ncid, 'riv_umask', (/d_xiu, d_eta, d_t/))
       id = nc_def_var(ncid, 'riv_vmask', (/d_xi, d_etav, d_t/))
     endif
+    if (calc_pflx) then   ! the CPU's names and attributes (wrt_rst_diag_slow)
+      id = nc_def_var(ncid, 'u_slow', (/d_xiu, d_eta, d_s, d_t/))
+      call nc_put_att_text(ncid, 'u_slow', 'long_name', 'time filtered u')
+      call nc_put_att_text(ncid, 'u_slow', 'units', 'm/s')
+      id = nc_def_var(ncid, 'v_slow', (/d_xi, d_etav, d_s, d_t/))
+      call nc_put_att_text(ncid, 'v_slow', 'long_name', 'time filtered v')
+      call nc_put_att_text(ncid, 'v_slow', 'units', 'm/s')
+      id = nc_def_var(ncid, 'p_slow', (/d_xi, d_eta, d_s, d_t/))
+      call nc_put_att_text(ncid, 'p_slow', 'long_name', 'time filtered pressure')
+      call nc_put_att_text(ncid, 'p_slow', 'units', 'Pa??')
+    endif
+    call def_rst_ub(ncid, d_xi, d_eta, d_t)
     call nc_put_att_text(ncid, '', 'title', output_title)
     call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
@@ -480,7 +507,8 @@ contains
     cap_field = nxy * nhw
     if (wrt_file_his .or. wrt_file_rst) call io_init(cap_rec, cap_field)
     ! double-precision capacity for one restart record of this tile
-    if (wrt_file_rst) call io_init8((15 + 2) * nxy + (4 + ntp + 2) * nxy * nh, nxy * nh)
+    if (wrt_file_rst) call io_init8((15 + 2) * nxy + (4 + ntp + 2 + merge(3, 0, calc_pflx)) * nxy * nh &
+         + 4 * (max(nxi, neta) + 2), nxy * nh)
   end subroutine init_staging
 
   subroutine set_write_bounds()

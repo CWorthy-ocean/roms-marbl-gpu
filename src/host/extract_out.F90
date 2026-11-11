@@ -11,9 +11,11 @@ module extract_out
   ! named <set>_<side>_<stagger> (side north/south/east/west), with the
   ! fields in its output_vars attribute (matched as substrings, as the CPU's
   ! findstr: zeta, ubar, vbar, u, v, temp, salt, passive, cdr_oae, cdr_dor,
-  ! bgc; w, up, vp are not supported). The child's sizes come from the
+  ! bgc, up, vp; w is not supported). The child's sizes come from the
   ! dimensions child_xi_rho and child_eta_rho; N_chd, theta_s_chd,
-  ! theta_b_chd and hc_chd give the child's vertical grid.
+  ! theta_b_chd and hc_chd give the child's vertical grid (as the CPU, the
+  ! dimensions <prefix>_xi_rho / <prefix>_eta_rho are taken first, <prefix>
+  ! the set name of the first object).
   !
   ! As the CPU: each tile takes the points inside it (the first contiguous
   ! run); the interpolation is bilinear with the mask in the weights,
@@ -23,13 +25,19 @@ module extract_out
   ! from the parent layers at the point (Hz interpolated; at u/v points
   ! the mean of the two rho columns) to the child layers of the same total
   ! depth. Fields: zeta, ubar, vbar at knew (time n+1); u, v and the tracers
-  ! at slot nstp (time n). A record every output_period_extract (after the
-  ! step), nrpf_extract per file, bry_time in days (time n+1).
+  ! at slot nstp (time n); the pressure fluxes up and vp of this step
+  ! (calc_pflx, pflx_mod) as the CPU after its fix 4b07d30e: the interior
+  ! values (1:nx, 1:ny) of each tile, exchanged (zero beyond a physical
+  ! edge), interpolated at the u points (up) and the v points (vp) of a
+  ! u- or v-object and rotated as ubar/vbar. A record every
+  ! output_period_extract (after the step), nrpf_extract per file,
+  ! bry_time in days (time n+1).
   !
   ! Files <extract_root_name>_bry.<date>.nc (the CPU naming, his_io
   ! output_fname), in double, the CPU's dimensions and variables: for each child
-  ! side present, zeta, ubar, vbar, every tracer, u and v; only the fields
-  ! an object asks for are written. The interpolation runs on the device;
+  ! side present, zeta, ubar, vbar, every tracer, u and v, and up/vp where an
+  ! object of the side asks for them; only the fields an object asks for
+  ! are written. The interpolation runs on the device;
   ! rotation and remap on the host of the tile; compute rank 0 writes the
   ! sum over the ranks of the boundary lines.
   use kinds
@@ -49,6 +57,8 @@ module extract_out
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
 #endif
+  use pflx_mod, only: calc_pflx, up, vp
+  use halo_mod, only: halo_fill_2d
   implicit none
   private
   public :: read_extract_namelist, init_extract, wrt_extract
@@ -74,6 +84,10 @@ module extract_out
   integer :: nobj = 0, LLm_chd = 0, MMm_chd = 0, nlev = 0
   logical :: on = .false., mismatch = .true.
   logical :: side_on(4) = .false.               ! 1 north, 2 south, 3 east, 4 west (the CPU's order)
+  logical :: side_up(4) = .false., side_vp(4) = .false.   ! the CPU's child_up / child_vp
+  ! the CPU's upe/vpe: up/vp on the tile interior, exchanged
+  real(rp), WORK_ATTR allocatable :: upe(:,:), vpe(:,:)
+  logical :: want_pflx = .false.
   character(len=5), parameter :: side_name(4) = (/'north', 'south', 'east ', 'west '/)
   integer :: dim_t(4), dim_u(4), dim_v(4)       ! child boundary lengths (rho, u, v points)
   real(rp), allocatable :: Cs_w_chd(:)
@@ -85,7 +99,8 @@ module extract_out
   ! one record's interpolations, all objects and fields, queued on the
   ! device into dbuf (field f of object o at fld_off(o, f): (np, nk)
   ! column-major) and copied to the host once (hb)
-  integer, parameter :: F_HZ1 = 1, F_ZETA = 2, F_UBAR = 3, F_VBAR = 4, F_U = 5, F_V = 6, F_HZ2 = 7, F_HZ3 = 8, F_TRC = 8
+  integer, parameter :: F_HZ1 = 1, F_ZETA = 2, F_UBAR = 3, F_VBAR = 4, F_U = 5, F_V = 6, F_HZ2 = 7, F_HZ3 = 8, &
+                        F_UP = 9, F_VP = 10, F_TRC = 10
   integer, allocatable :: fld_off(:,:)
   integer :: nbtot = 0
 #ifdef USE_CUDA
@@ -148,7 +163,7 @@ contains
   subroutine init_extract()
     ! The CPU's init_extract_data and read_extraction_objects.
     integer :: ncid, io, dimids(2), n1, n2, cxr, cer, s, l, i, np, p, k
-    character(len=60) :: oname
+    character(len=60) :: oname, pfx
     character(len=150) :: vars
     real(rp), allocatable :: ob(:,:)
     on = do_extract
@@ -158,8 +173,16 @@ contains
     if (N_chd < 1) error stop 'init_extract: N_chd must be >= 1'
     call ex_check(nf90_open(trim(extract_file), nf90_nowrite, ncid), 'open '//trim(extract_file))
     call ex_check(nf90_inquire(ncid, nVariables=nobj), 'inquire')
-    call ex_check(nf90_inq_dimid(ncid, 'child_xi_rho', cxr), 'child_xi_rho')
-    call ex_check(nf90_inq_dimid(ncid, 'child_eta_rho', cer), 'child_eta_rho')
+    ! The CPU's child size: <prefix>_xi_rho / <prefix>_eta_rho, <prefix> the
+    ! set name of the first object (roms-tools make_nesting_info prefix),
+    ! else child_xi_rho / child_eta_rho.
+    call ex_check(nf90_inquire_variable(ncid, 1, name=oname), 'inquire variable')
+    pfx = oname
+    if (index(oname, '_') > 0) pfx = oname(1:index(oname, '_') - 1)
+    if (nf90_inq_dimid(ncid, trim(pfx)//'_xi_rho', cxr) /= nf90_noerr) &
+      call ex_check(nf90_inq_dimid(ncid, 'child_xi_rho', cxr), trim(pfx)//'_xi_rho (or child_xi_rho)')
+    if (nf90_inq_dimid(ncid, trim(pfx)//'_eta_rho', cer) /= nf90_noerr) &
+      call ex_check(nf90_inq_dimid(ncid, 'child_eta_rho', cer), trim(pfx)//'_eta_rho (or child_eta_rho)')
     call ex_check(nf90_inquire_dimension(ncid, cxr, len=LLm_chd), 'child_xi_rho')
     call ex_check(nf90_inquire_dimension(ncid, cer, len=MMm_chd), 'child_eta_rho')
     allocate(obj(nobj))
@@ -205,12 +228,17 @@ contains
       obj(io)%ubar = findstr(vars, 'ubar'); obj(io)%vbar = findstr(vars, 'vbar')
       obj(io)%u = findstr(vars, 'u'); obj(io)%v = findstr(vars, 'v'); obj(io)%w = findstr(vars, 'w')
       obj(io)%up = findstr(vars, 'up'); obj(io)%vp = findstr(vars, 'vp'); obj(io)%bgc = findstr(vars, 'bgc')
-      if (obj(io)%up .or. obj(io)%vp) error stop 'init_extract: up/vp extraction needs calc_pflx, not on the GPU'
+      if ((obj(io)%up .or. obj(io)%vp) .and. .not. calc_pflx) &
+        error stop 'init_extract: up/vp extraction needs &calc_pflx_settings calc_pflx = .true.'
       if (obj(io)%w) error stop 'init_extract: w extraction is not supported (the CPU''s parallel-I/O path does not write it)'
       if (obj(io)%bgc .and. .not. passive_marbl) error stop 'init_extract: bgc extraction needs MARBL'
-      if ((obj(io)%u .or. obj(io)%v .or. obj(io)%ubar .or. obj(io)%vbar) .and. obj(io)%scalar) &
+      if ((obj(io)%u .or. obj(io)%v .or. obj(io)%ubar .or. obj(io)%vbar .or. obj(io)%up .or. obj(io)%vp) &
+          .and. obj(io)%scalar) &
         error stop 'init_extract: velocities need an object with angles (i, j, angle)'
       if (obj(io)%side == 0) error stop 'init_extract: object names must be <set>_<north|south|east|west>_...'
+      if (obj(io)%up) side_up(obj(io)%side) = .true.
+      if (obj(io)%vp) side_vp(obj(io)%side) = .true.
+      if (obj(io)%up .or. obj(io)%vp) want_pflx = .true.
     enddo
     call ex_check(nf90_close(ncid), 'close')
     dim_t = (/LLm_chd, LLm_chd, MMm_chd, MMm_chd/)
@@ -225,6 +253,10 @@ contains
     endif
     if (comm_rank() == 0) write(*,'(a,i0,a,i0,a,i0,a,l2)') 'extract: ', nobj, ' objects, child ', LLm_chd, ' x ', &
          MMm_chd, ', vertical remap', mismatch
+    if (want_pflx) then
+      allocate(upe(decomp%is:decomp%ie, decomp%js:decomp%je), vpe(decomp%is:decomp%ie, decomp%js:decomp%je))
+      upe = 0.0_rp; vpe = 0.0_rp
+    endif
     call set_coefs()
     call set_tracers()
     call set_vars()
@@ -403,8 +435,8 @@ contains
     ! zeta, ubar, vbar, every tracer, u, v) and which of them are written.
     integer :: s, n, io
     nvar = 0
-    allocate(var_name(4 * (ntrc + 5)), var_len(4 * (ntrc + 5)), var_lev(4 * (ntrc + 5)), &
-             var_off(4 * (ntrc + 5)), var_wr(4 * (ntrc + 5)))
+    allocate(var_name(4 * (ntrc + 7)), var_len(4 * (ntrc + 7)), var_lev(4 * (ntrc + 7)), &
+             var_off(4 * (ntrc + 7)), var_wr(4 * (ntrc + 7)))
     nbuf = 0
     do s = 1, 4
       if (.not. side_on(s)) cycle
@@ -416,6 +448,8 @@ contains
       enddo
       call add('u_'//trim(side_name(s)), dim_u(s), nlev, any(obj(:)%u .and. obj(:)%side == s))
       call add('v_'//trim(side_name(s)), dim_v(s), nlev, any(obj(:)%v .and. obj(:)%side == s))
+      if (side_up(s)) call add('up_'//trim(side_name(s)), dim_u(s), 1, .true.)
+      if (side_vp(s)) call add('vp_'//trim(side_name(s)), dim_v(s), 1, .true.)
     enddo
     allocate(hbuf(max(nbuf, 1)), gbuf(max(nbuf, 1)))
   contains
@@ -467,6 +501,9 @@ contains
         endif
         if (obj(io)%u .or. obj(io)%v) then
           call take(F_U, nz); call take(F_V, nz)
+        endif
+        if (obj(io)%up .or. obj(io)%vp) then
+          call take(F_UP, 1); call take(F_VP, 1)
         endif
         if (obj(io)%u .and. mismatch) call take(F_HZ2, nz)
         if (obj(io)%v .and. mismatch) call take(F_HZ3, nz)
@@ -542,10 +579,30 @@ contains
       if (fld_off(io, F_VBAR) >= 0) call interp3(vbar(is, js, kn), 1, 1, 5, p0, np, fld_off(io, F_VBAR))
       if (fld_off(io, F_U) >= 0) call interp3(u(is, js, 1, ns), 1, nz, 4, p0, np, fld_off(io, F_U))
       if (fld_off(io, F_V) >= 0) call interp3(v(is, js, 1, ns), 1, nz, 5, p0, np, fld_off(io, F_V))
+      if (fld_off(io, F_UP) >= 0) call interp3(upe, 1, 1, 4, p0, np, fld_off(io, F_UP))
+      if (fld_off(io, F_VP) >= 0) call interp3(vpe, 1, 1, 5, p0, np, fld_off(io, F_VP))
       if (fld_off(io, F_HZ2) >= 0) call interp3(Hz, 1, nz, 2, p0, np, fld_off(io, F_HZ2))
       if (fld_off(io, F_HZ3) >= 0) call interp3(Hz, 1, nz, 3, p0, np, fld_off(io, F_HZ3))
     enddo
   end subroutine queue_record
+
+  subroutine set_upe()
+    ! The CPU's upe(1:nx,1:ny) = up(1:nx,1:ny) (vpe alike), then the
+    ! exchange; the rest stays 0 (as allocated).
+    integer :: i, j, nx, ny
+    nx = decomp%nx; ny = decomp%ny
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*, *, 0, work_stream>>>
+#endif
+    do j = 1, ny
+      do i = 1, nx
+        upe(i, j) = up(i, j)
+        vpe(i, j) = vp(i, j)
+      enddo
+    enddo
+    call halo_fill_2d(upe, STAGGER_U)
+    call halo_fill_2d(vpe, STAGGER_V)
+  end subroutine set_upe
 
   subroutine fetch(io, f, nk, out)
     ! field f of object io from the host copy of the record
@@ -578,6 +635,7 @@ contains
                              ui(:,:), vi(:,:), wk(:,:), h(:)
     nz = decomp%nz; kn = knew; ns = nstp
     c0 = wall_time()
+    if (want_pflx) call set_upe()
     call queue_record()
     if (nbtot > 0) hb(1:nbtot) = dbuf(1:nbtot)        ! one copy (after the queued kernels)
     c1 = wall_time()
@@ -619,6 +677,18 @@ contains
           if (obj(io)%vbar) then
             wk(:, 1) = obj(io)%sina * ui(:, 1) + obj(io)%cosa * vi(:, 1)
             call put('vbar', obj(io), wk(:, 1:1), 1)
+          endif
+        endif
+        if (obj(io)%up .or. obj(io)%vp) then
+          call fetch(io, F_UP, 1, ui(:, 1:1))
+          call fetch(io, F_VP, 1, vi(:, 1:1))
+          if (obj(io)%up) then
+            wk(:, 1) = obj(io)%cosa * ui(:, 1) - obj(io)%sina * vi(:, 1)
+            call put('up', obj(io), wk(:, 1:1), 1)
+          endif
+          if (obj(io)%vp) then
+            wk(:, 1) = obj(io)%sina * ui(:, 1) + obj(io)%cosa * vi(:, 1)
+            call put('vp', obj(io), wk(:, 1:1), 1)
           endif
         endif
         if (obj(io)%u .or. obj(io)%v) then
@@ -818,6 +888,11 @@ contains
       enddo
       call def('u_'//trim(side_name(s)), (/du_(s), d5, d0/), 'u-momentum component', 'meter second-1')
       call def('v_'//trim(side_name(s)), (/dv_(s), d5, d0/), 'v-momentum component', 'meter second-1')
+      ! the CPU's names and attributes (the values are m^4 s^-3: W/m / rho0)
+      if (side_up(s)) call def('up_'//trim(side_name(s)), (/du_(s), d0/), 'u-momentum pressure flux', &
+                               'meter3 second-2')
+      if (side_vp(s)) call def('vp_'//trim(side_name(s)), (/dv_(s), d0/), 'v-momentum pressure flux', &
+                               'meter3 second-2')
     enddo
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu child boundary extraction')
     call nc_enddef(ncid)

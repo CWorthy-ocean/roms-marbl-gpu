@@ -17,6 +17,7 @@ module bry_io
   use passive_mod, only: ntp, passive_bry, passive_name, tb_west, tb_east, tb_south, tb_north
   use nc_io
   use arch_mod, only: sync_arch
+  use pflx_mod, only: ub_tune, pf_w, pf_e, pf_s, pf_n
 #ifdef USE_CUDA
   use cudafor
   use cudadevice, only: __dmul_rn
@@ -58,9 +59,13 @@ module bry_io
   type(series_z) :: ser_us, ser_vs, ser_ts, ser_ss, ser_un, ser_vn, ser_tn, ser_sn
   ! MARBL tracers (passive_mod MARBL mode): one series per tracer and side
   type(series_z), allocatable :: ser_tbw(:), ser_tbe(:), ser_tbs(:), ser_tbn(:)
+  ! SPONGE_TUNE: the parent's baroclinic energy flux normal to each side
+  ! (extracted by the parent as up_<side>/vp_<side>)
+  type(series1d) :: ser_upw, ser_upe, ser_vps, ser_vpn
 
   public :: init_bry
   public :: set_bry_all
+  public :: set_pflx_bry
   public :: dump_bry_north
   public :: write_toy_bry
 
@@ -88,6 +93,12 @@ contains
     obc_south = ser_zs%ready .or. ser_vbs%ready
     obc_north = ser_zn%ready .or. ser_vbn%ready
     have_bry = obc_west .or. obc_east .or. obc_south .or. obc_north
+    if (ub_tune) then
+      call bind1(ser_upw, 'up_west', 'j'); call bind1(ser_upe, 'up_east', 'j')
+      call bind1(ser_vps, 'vp_south', 'i'); call bind1(ser_vpn, 'vp_north', 'i')
+      write(*,'(a,4l2)') 'sponge_tune: parent up_west, up_east, vp_south, vp_north found:', &
+           ser_upw%ready, ser_upe%ready, ser_vps%ready, ser_vpn%ready
+    endif
     if (have_bry) write(*,'(a,4l2)') 'OBC W E S N =', obc_west, obc_east, obc_south, obc_north
     if (have_bry .and. passive_bry .and. ntp > 0) then
       allocate(ser_tbw(ntp), ser_tbe(ntp), ser_tbs(ntp), ser_tbn(ntp))
@@ -152,6 +163,17 @@ contains
     endif
     call dump_bry_north('after clim', tneed)
   end subroutine set_bry_all
+
+  subroutine set_pflx_bry(tneed)
+    ! The CPU's set_pflx: the parent fluxes at time tneed (days), on the
+    ! device into pf_<side>; a side without data keeps 0 (the CPU's missing
+    ! forcing).
+    real(rp), intent(in) :: tneed
+    call fill1j(ser_upw, tneed, pf_w)
+    call fill1j(ser_upe, tneed, pf_e)
+    call fill1i(ser_vps, tneed, pf_s)
+    call fill1i(ser_vpn, tneed, pf_n)
+  end subroutine set_pflx_bry
 
   subroutine tile_window(axis, n, f0)
     ! An edge series of global length gn+2 / gn+1 / gn (rho with boundary

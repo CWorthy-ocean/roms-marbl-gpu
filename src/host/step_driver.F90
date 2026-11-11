@@ -11,6 +11,7 @@ module step_driver
   use halo_mod
   use step2d_mod, only: step2d_with_halo
   use prsgrd_mod, only: prsgrd, dump_pgf_col
+  use pflx_mod, only: calc_pflx, calc_pressure_flux
   use advect, only: tracer_advect_fluxes
   use rho_eos_mod, only: rho_eos
   use pre_step3d_mod, only: pre_step3d, ncol_probe, icol_probe, jcol_probe
@@ -163,6 +164,11 @@ contains
     call dump_rim('before_uv1')
     call prsgrd()
     call step_mark('corrector rhs')
+    if (calc_pflx) then
+      ! the CPU's calc_pressure_flux (prsgrd, corrector stage, DIAGNOSTICS)
+      call calc_pressure_flux()
+      call step_mark('calc_pflx')
+    endif
     call step3d_uv1()
     call visc3d()
     call step_mark('step3d_uv1+visc')
