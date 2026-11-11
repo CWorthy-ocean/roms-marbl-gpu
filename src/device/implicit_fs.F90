@@ -97,16 +97,25 @@ contains
     if (fs_theta < 0.5_rp .or. fs_theta > 1.0_rp .or. fs_theta_div < 0.5_rp .or. fs_theta_div > 1.0_rp) &
          error stop 'IMPLICIT_FS: fs_theta and fs_theta_div must lie in [0.5, 1]'
     if (fs_rho_inf < 0.0_rp .or. fs_rho_inf > 1.0_rp) error stop 'IMPLICIT_FS: fs_rho_inf must lie in [0, 1]'
+    if (fs_nsub < 1 .or. fs_nsub > 4) error stop 'IMPLICIT_FS: fs_nsub must lie in [1, 4]'
     call fs_scheme_coef()
-    select case (trim(fs_pot_time))        ! the tidal potential at n+alpha_f (tide_io: pot_phase)
-    case ('af'); pot_phase = 1.0_rp / (1.0_rp + fs_rho_inf)
+    alf = 1.0_rp / (1.0_rp + fs_rho_inf)
+    ! forcing time of the step: alpha_f; with sub-steps (rufrc held over the step) the mean of the
+    ! sub-steps' forcing times n + (k-1+alpha_f)/fs_nsub (CPU b6325f06)
+    sft = alf
+    if (fs_nsub > 1) sft = (alf + 0.5_rp * real(fs_nsub - 1, rp)) / real(fs_nsub, rp)
+    fs_bry_phase = 1.0_rp
+    if (fs_nsub > 1) fs_bry_phase = 0.5_rp * real(fs_nsub + 1, rp) / real(fs_nsub, rp)
+    select case (trim(fs_pot_time))        ! the tidal potential at n+sft (tide_io: pot_phase)
+    case ('af')
+      pot_phase = 1.0_rp / (1.0_rp + fs_rho_inf)
+      if (fs_nsub > 1) pot_phase = sft
     case ('mid'); pot_phase = 0.5_rp
     case default; error stop "IMPLICIT_FS: fs_pot_time must be 'af' or 'mid'"
     end select
-    alf = 1.0_rp / (1.0_rp + fs_rho_inf)
     if (trim(fs_stress_time) /= 'af' .and. trim(fs_stress_time) /= 'mid') &
          error stop "IMPLICIT_FS: fs_stress_time must be 'af' or 'mid'"
-    stress_af = (trim(fs_stress_time) == 'af' .and. abs(alf - 0.5_rp) > 1.e-12_rp)
+    stress_af = (trim(fs_stress_time) == 'af' .and. abs(sft - 0.5_rp) > 1.e-12_rp)
     if (trim(fs_mg_faces) /= 'width' .and. trim(fs_mg_faces) /= 'half') &
          error stop "IMPLICIT_FS: fs_mg_faces must be 'width' or 'half'"
     if (fs_tol <= 0.0_rp .or. fs_maxit < 1) error stop 'IMPLICIT_FS: fs_tol > 0 and fs_maxit >= 1 required'
@@ -136,11 +145,13 @@ contains
            ' fs_mg_nu =', fs_mg_nu, ' fs_mg_smoother = ', trim(fs_mg_smoother), ' fs_mg_lag =', fs_mg_lag, &
            ' fs_gpu_gather =', fs_gpu_gather, ' fs_gpu_timers =', fs_gpu_timers
       write(*,'(1x,A,F8.3,A,L1)') 'IMPLICIT_FS: fs_tang_nudge =', fs_tang_nudge, ' fs_cor_metric = ', fs_cor_metric
+      write(*,'(1x,A,I2,A,F7.4,A,F7.4,A)') 'IMPLICIT_FS: fs_nsub =', fs_nsub, ' (implicit sub-steps of dt/fs_nsub;'// &
+           ' explicit forcing at time +', sft, ' dt, boundary tidal harmonics at time +', fs_bry_phase, ' dt)'
       write(*,'(1x,A,A,A,F7.4,A)') 'IMPLICIT_FS: fs_pot_time = ', trim(fs_pot_time), ' (tidal potential at time +', &
            pot_phase, ' dt)'
       if (stress_af) then
         write(*,'(1x,A,A,A,F7.4,A)') 'IMPLICIT_FS: fs_stress_time = ', trim(fs_stress_time), &
-             ' (surface stress of the 2-D step at time +', alf, ' dt; the 3-D step keeps n+1/2)'
+             ' (surface stress of the 2-D step at time +', sft, ' dt; the 3-D step keeps n+1/2)'
       else
         write(*,'(1x,A,A,A)') 'IMPLICIT_FS: fs_stress_time = ', trim(fs_stress_time), &
              ' (surface stress of the 2-D step at n+1/2 as set_forces)'
@@ -185,6 +196,10 @@ contains
              xru(is:ie, js:je), xrv(is:ie, js:je), cou(is:ie, js:je), cov(is:ie, js:je), fcr(is:ie, js:je))
     xru = 0; xrv = 0; cou = 0; cov = 0; fcr = 0
     call fs_alloc_rates()      ! kept if a restart file supplied them
+    if (fs_nsub > 1) then
+      allocate(fsu(is:ie, js:je), fsv(is:ie, js:je), asu(is:ie, js:je), asv(is:ie, js:je))
+      fsu = 0; fsv = 0; asu = 0; asv = 0
+    endif
     unu = 0; unv = 0; usu = 0; usv = 0; au = 0; av = 0; cu = 0; cv = 0; ftu = 0; ftv = 0
     fbu = 0; fbv = 0; u1u = 0; u1v = 0; cbu = 0; cbv = 0; wd = 0; ar = 0; rb = 0; dinv = 0
     qs = 0; act = 0; bb = 0; rr = 0; zz = 0; pd = 0; qq = 0; wk2 = 0
@@ -213,38 +228,64 @@ contains
   subroutine fs_step()
     ! The implicit barotropic step; the caller has rotated kstp, knew.
     integer(ip) :: i, j, nx, ny, ks, kn, istrU, istrR, iendR, jstrV, jstrR, jendR, nmax, m
+    integer(ip) :: k, l, nl, lsc(2), k0
     real(rp) :: b1, th, td, dtl, gl, ga, cdu, d, df, ainv, gam, mm, hf, cb, rf, cx, cff, dft, dfx, ce, ub, dfn
-    real(rp) :: zc, xd
-    logical :: ew, ee, es, en, ow, oe, os, on, wf, ef, sf, nf, drag, first, rv, cmet
+    real(rp) :: zc, xd, c, rn
+    logical :: ew, ee, es, en, ow, oe, os, on, wf, ef, sf, nf, drag, first, rv, cmet, sub, k1, last1
     integer :: its
     real(rp) :: resid
     logical :: conv
 
     if (.not. ready) call fs_init()
     nx = decomp%nx; ny = decomp%ny
-    ks = kstp; kn = knew
     ew = decomp%edge_w; ee = decomp%edge_e; es = decomp%edge_s; en = decomp%edge_n
     ow = obc_west; oe = obc_east; os = obc_south; on = obc_north
     wf = ew .and. ow; ef = ee .and. oe; sf = es .and. os; nf = en .and. on   ! Flather faces
     istrU = merge(2, 1, ew); istrR = merge(0, 1, ew); iendR = merge(nx + 1, nx, ee)
     jstrV = merge(2, 1, es); jstrR = merge(0, 1, es); jendR = merge(ny + 1, ny, en)
-    th = thp; td = thd; dtl = dt; gl = g; ga = gam_a
-    b1 = beta1
-    if (ga_first) b1 = 1.0_rp
-    first = ga_first
+    ! (sub-)step length dts = dt/fs_nsub (CPU b6325f06)
+    dts = dt
+    if (fs_nsub > 1) dts = dt / real(fs_nsub, rp)
+    th = thp; td = thd; dtl = dts; gl = g; ga = gam_a
     drag = fs_drag_implicit
     rv = river_on
     cmet = fs_cor_metric
+    k0 = kstp
+    last1 = (fs_nsub == 1)
     call tw(0)
     call tq0()
 
-    ! ---- (A) DU_avg_bak bookkeeping (EXTRAP_BAR_FLUXES) and D^n
+    ! ---- (A) DU_avg_bak bookkeeping (EXTRAP_BAR_FLUXES): U^n for the end of the step
     CUF_DO2
     do j = jstrR, jendR
       do i = istrR, iendR
         du1o(i, j) = DU_avg1(i, j); dv1o(i, j) = DV_avg1(i, j)
       enddo
     enddo
+
+    ! ---- sub-steps k = 1..fs_nsub of length dts (CPU b6325f06), each from the source level ks to the
+    ! level kn: ks = kstp (zeta^n) for k = 1, else the level of sub-step k-1; kn = knew for the last
+    ! sub-step, else one of the two time levels other than kstp and knew (unused during the barotropic
+    ! step; the levels alternate), so that no sub-step reads a level it writes. rufrc (with the 3-D
+    ! pressure gradient of zeta^n) is held over the step; sub-steps k > 1 add the pressure gradient of
+    ! zeta(ks) - zeta^n. fs_nsub = 1 is the single step.
+    nl = 0
+    do l = 1, 4
+      if (l /= kstp .and. l /= knew .and. nl < 2) then
+        nl = nl + 1; lsc(nl) = l
+      endif
+    enddo
+    do k = 1, fs_nsub
+    ks = kstp
+    if (k > 1) ks = lsc(mod(k - 2, 2) + 1)
+    kn = knew
+    if (k < fs_nsub) kn = lsc(mod(k - 1, 2) + 1)
+    sub = (k > 1); k1 = (k == 1)
+    b1 = beta1
+    if (ga_first) b1 = 1.0_rp                ! no rates yet: the first sub-step of the run without memory
+    first = ga_first
+
+    ! D^n of the (sub-)step (level ks)
     CUF_DO2
     do j = 0, ny + 1
       do i = 0, nx + 1
@@ -305,6 +346,14 @@ contains
           xru(i, j) = mm * hf / (1.0_rp + gam)
           ftu(i, j) = mm * (b1 * unu(i, j) + (1.0_rp - b1) * gru(i, j) + td * (usu(i, j) - unu(i, j)))
           cu(i, j) = td * dtl * au(i, j)
+          if (sub) then
+            ! sub-steps after the first: rufrc holds the pressure gradient of zeta^n, so the explicit
+            ! pressure gradient of zeta(ks) - zeta^n is added in the discrete form of the implicit
+            ! increment's (au/th per unit difference) with the weight b1 of the explicit rhs
+            c = b1 * (au(i, j) / th) * ((zeta(i - 1, j, ks) - zeta(i - 1, j, k0)) - (zeta(i, j, ks) - zeta(i, j, k0)))
+            usu(i, j) = usu(i, j) + c
+            ftu(i, j) = ftu(i, j) + td * c
+          endif
         endif
         ! owned v faces
         if (j >= jstrV .and. j <= ny .and. i >= 1 .and. i <= nx) then
@@ -321,6 +370,11 @@ contains
           xrv(i, j) = mm * hf / (1.0_rp + gam)
           ftv(i, j) = mm * (b1 * unv(i, j) + (1.0_rp - b1) * grv(i, j) + td * (usv(i, j) - unv(i, j)))
           cv(i, j) = td * dtl * av(i, j)
+          if (sub) then
+            c = b1 * (av(i, j) / th) * ((zeta(i, j - 1, ks) - zeta(i, j - 1, k0)) - (zeta(i, j, ks) - zeta(i, j, k0)))
+            usv(i, j) = usv(i, j) + c
+            ftv(i, j) = ftv(i, j) + td * c
+          endif
         endif
         ! open normal faces: Flather on the th_d-level flux
         if (wf .and. i == 1 .and. j >= 1 .and. j <= ny) then
@@ -429,6 +483,13 @@ contains
     call fs_pcg(its, resid, conv)
     n_solve = n_solve + 1; n_its = n_its + its; its_last = its; res_last = resid
     if (.not. conv) n_unconv = n_unconv + 1
+    if (fs_nsub > 1) then                   ! the step's FS_SOLVE statistics
+      if (k1) then
+        its_sum = 0; its_max = 0; res_max = 0.0_rp; dz_max = 0.0_rp
+      endif
+      its_sum = its_sum + its; its_max = max(its_max, its); res_max = max(res_max, resid)
+      if (fs_verbose >= 1) dz_max = max(dz_max, xx_absmax())
+    endif
 
     ! ---- (F) E2, momentum and fluxes, generalized-alpha rates
     call ring(1, xx, fdum, fdum, fdum, fdum, fdum, .true.)
@@ -547,7 +608,6 @@ contains
       enddo
     endif
     call tq(T_FIN)
-    if (fs_verbose >= 2) call fs_volume_check()
     call ring_slot(zeta, kn)                                       ! E4a (one cell)
     call tq(T_EXFIN)
 
@@ -597,7 +657,7 @@ contains
         endif
       enddo
     enddo
-    call fs_tang_bc(ks, kn)
+    call fs_tang_bc(ks, kn, dtl)
     call tq(T_BCUV)
 
     ! ---- (I) hand-over: DU_avg1 = U^n+1, DU_avg2 = Fbar, Zt_avg1, DU_avg_bak
@@ -660,8 +720,8 @@ contains
             DV_avg2(i, ny + 1) = td * DV_avg1(i, ny + 1) + (1.0_rp - td) * unv(i, ny + 1)
           endif
         endif
-        ! rho points and the predictor's extrapolation
-        if (i >= istrR .and. i <= iendR .and. j >= jstrR .and. j <= jendR) then
+        ! rho points and the predictor's extrapolation (fs_nsub > 1: after the mean of the sub-steps)
+        if (last1 .and. i >= istrR .and. i <= iendR .and. j >= jstrR .and. j <= jendR) then
           zt_avg1(i, j) = zeta(i, j, kn)
           DU_avg_bak(i, j) = ((1.5_rp - 3.63_rp) * DU_avg1(i, j) - 0.5_rp * du1o(i, j) + 4.47_rp * DU_avg2(i, j)) &
                / 2.05_rp
@@ -682,12 +742,64 @@ contains
       enddo
     endif
     call tq(T_FIN)
+    if (fs_nsub > 1) then
+      ! sums over the sub-steps of Fbar (fsu, fsv) and of DU_avg2 (asu, asv; every face it is set on)
+      CUF_DO2
+      do j = decomp%js, decomp%je
+        do i = decomp%is, decomp%ie
+          if (k1) then
+            fsu(i, j) = fbu(i, j); fsv(i, j) = fbv(i, j)
+          else
+            fsu(i, j) = fsu(i, j) + fbu(i, j); fsv(i, j) = fsv(i, j) + fbv(i, j)
+          endif
+          if (i >= istrR .and. i <= iendR .and. j >= jstrR .and. j <= jendR) then
+            if (k1) then
+              asu(i, j) = DU_avg2(i, j); asv(i, j) = DV_avg2(i, j)
+            else
+              asu(i, j) = asu(i, j) + DU_avg2(i, j); asv(i, j) = asv(i, j) + DV_avg2(i, j)
+            endif
+          endif
+        enddo
+      enddo
+      call tq(T_FIN)
+    endif
+    if (k < fs_nsub) then
+      ! E4b of the sub-step: zeta, ubar, vbar(kn) with their two-cell halos for the next sub-step
+      fast%kstp = ks; fast%knew = kn
+      call halo_fill_zuv_n(zeta, ubar, vbar)
+      n_ring = n_ring + 2
+      call tq(T_EXFIN)
+    endif
+    enddo                                   ! sub-steps
+
+    if (fs_nsub > 1) then
+      ! DU_avg2 = the mean flux of the sub-steps: zeta^n+1 = zeta^n - dt pm pn Div(DU_avg2) + dt Q (to
+      ! rounding); fbu, fbv likewise for the step's volume check; then Zt_avg1 and DU_avg_bak
+      rn = 1.0_rp / real(fs_nsub, rp)
+      CUF_DO2
+      do j = decomp%js, decomp%je
+        do i = decomp%is, decomp%ie
+          fbu(i, j) = rn * fsu(i, j); fbv(i, j) = rn * fsv(i, j)
+          if (i >= istrR .and. i <= iendR .and. j >= jstrR .and. j <= jendR) then
+            DU_avg2(i, j) = rn * asu(i, j); DV_avg2(i, j) = rn * asv(i, j)
+            zt_avg1(i, j) = zeta(i, j, kn)
+            DU_avg_bak(i, j) = ((1.5_rp - 3.63_rp) * DU_avg1(i, j) - 0.5_rp * du1o(i, j) + 4.47_rp * DU_avg2(i, j)) &
+                 / 2.05_rp
+            DV_avg_bak(i, j) = ((1.5_rp - 3.63_rp) * DV_avg1(i, j) - 0.5_rp * dv1o(i, j) + 4.47_rp * DV_avg2(i, j)) &
+                 / 2.05_rp
+          endif
+        enddo
+      enddo
+      call tq(T_FIN)
+    endif
+    if (fs_verbose >= 2) call fs_volume_check()                     ! the whole step
+    n_step = n_step + 1
     ! the seam faces of the hand-over (nx+1, ny+1 toward a neighbour; the
     ! split loop forms them redundantly, read by set_HUV1 before its own
     ! exchanges)
     call ring(6, DU_avg1, DU_avg2, DU_avg_bak, DV_avg1, DV_avg2, DV_avg_bak, .true.)
     ! E4b: zeta, ubar, vbar(knew) with their two-cell halos (as the last fast step)
-    fast%kstp = ks; fast%knew = kn
+    fast%kstp = kstp; fast%knew = knew
     call halo_fill_zuv_n(zeta, ubar, vbar)
     n_ring = n_ring + 2
     call tq(T_EXFIN)
@@ -699,13 +811,15 @@ contains
     if (iic == ntstart + ntimes - 1) call fs_cost_print()
   end subroutine fs_step
 
-  subroutine fs_tang_bc(ks, kn)
+  subroutine fs_tang_bc(ks, kn, dts_)
     ! Tangential boundary velocities (FS_SPEC 3.7.5, the CPU's fs_tang_bc):
     ! open edges the backward-Euler form of stock u2dbc/v2dbc (upwind advection by the
     ! normal flow, inflow nudging at fs_tang_nudge |u_n|/dx; the former fs_tang = 'adv');
     ! closed edges gamma2 (= 1, roms_gpu supports free slip only) v_int;
     ! then the corners between two open edges.
+    ! ks, kn, dts_: the (sub-)step's source and new levels and its length
     integer(ip), intent(in) :: ks, kn
+    real(rp), intent(in) :: dts_
     integer(ip) :: m, nx, ny, nmax, istrU, iendR, jstrV, jendR
     real(rp) :: dtl, ca, cy, tnu, cc, rr_, gmm, gpp
     logical :: ew, ee, es, en, ow, oe, os, on
@@ -716,7 +830,7 @@ contains
     if (.not. (ew .or. ee .or. es .or. en)) return
     istrU = merge(2, 1, ew); iendR = merge(nx + 1, nx, ee)
     jstrV = merge(2, 1, es); jendR = merge(ny + 1, ny, en)
-    dtl = dt; tnu = fs_tang_nudge
+    dtl = dts_; tnu = fs_tang_nudge
     nmax = max(nx, ny) + 1
     CUF_DO1
     do m = 1, nmax
@@ -1080,10 +1194,34 @@ contains
          ' rel_err', (glob(1) - glob(2) - glob(3)) / max(glob(4), 1.e-300_rp), ' V', glob(5)
   end subroutine fs_volume_check
 
+  real(rp) function xx_absmax()
+    ! max |delta| over the tile (the sub-step's FS_SOLVE statistic)
+    integer(ip) :: i, j, nx, ny
+    real(rp) :: amax
+    nx = decomp%nx; ny = decomp%ny
+    amax = 0.0_rp
+    !$cuf kernel do(2) <<<*,*,0,work_stream>>> reduce(max:amax)
+    do j = 1, ny
+      do i = 1, nx
+        amax = max(amax, abs(xx(i, j)))
+      enddo
+    enddo
+    xx_absmax = amax
+  end function xx_absmax
+
   subroutine fs_solve_line()
     integer(ip) :: i, j, nx, ny
     real(rp) :: loc(1), glob(1), amax
     nx = decomp%nx; ny = decomp%ny
+    if (fs_nsub > 1) then
+      ! sub-steps: iterations summed over the step (and the largest of one sub-step), the worst
+      ! residual, the largest increment of a sub-step (CPU b6325f06)
+      loc(1) = dz_max
+      call comm_allreduce_max(1, loc, glob)
+      if (talk) write(*,'(1x,A,I8,A,I6,A,ES10.3,A,ES11.4,A,I2,A,I6)') 'FS_SOLVE', iic, ' its', its_sum, &
+           ' rel_res', res_max, ' max|dzeta|', glob(1), ' sub-steps', fs_nsub, ' max its', its_max
+      return
+    endif
     amax = 0.0_rp
     !$cuf kernel do(2) <<<*,*,0,work_stream>>> reduce(max:amax)
     do j = 1, ny
@@ -1107,6 +1245,7 @@ contains
     if (talk) then
       write(*,'(1x,A,I7,A,F9.2,A,I6)') 'FS_STAT solves', n_solve, ' mean its', real(n_its, 8) / max(n_solve, 1), &
            ' unconverged', n_unconv
+      if (fs_nsub > 1) write(*,'(1x,A,I7,A,I2,A)') 'FS_STAT steps', n_step, ' (', fs_nsub, ' sub-steps each)'
       write(*,'(1x,A,4(A,F9.2))') 'FS_STAT per solve:', ' ring rounds', real(n_ring, 8) / max(n_solve, 1), &
            ' reductions', real(n_red, 8) / max(n_solve, 1), ' V-cycles', real(n_vc, 8) / max(n_solve, 1), &
            ' host gathers', real(n_gath, 8) / max(n_solve, 1)
@@ -1114,12 +1253,12 @@ contains
            ' ms per step (FS window, device synchronised at entry and exit; max rank, mean over', n_win - 10, &
            ' steps after the first 10)'
       if (fs_gpu_timers == 1) then
-        write(*,'(1x,A,I6,A)') 'FS_COST [ms per step, max rank over', n_solve, ' steps; synchronised pieces]:'
+        write(*,'(1x,A,I6,A)') 'FS_COST [ms per step, max rank over', n_step, ' steps; synchronised pieces]:'
         do i = 1, ntm
-          write(*,'(1x,A,1x,A12,F9.3)') 'FS_COST', tm_name(i), 1.e3_8 * gm(i) / max(n_solve, 1)
+          write(*,'(1x,A,1x,A12,F9.3)') 'FS_COST', tm_name(i), 1.e3_8 * gm(i) / max(n_step, 1)
         enddo
-        write(*,'(1x,A,1x,A12,F9.3)') 'FS_COST', 'mg_setup', 1.e3_8 * y(1) / max(n_solve, 1)
-        write(*,'(1x,A,1x,A12,F9.3)') 'FS_COST', 'SUM', 1.e3_8 * (sum(gm) + y(1)) / max(n_solve, 1)
+        write(*,'(1x,A,1x,A12,F9.3)') 'FS_COST', 'mg_setup', 1.e3_8 * y(1) / max(n_step, 1)
+        write(*,'(1x,A,1x,A12,F9.3)') 'FS_COST', 'SUM', 1.e3_8 * (sum(gm) + y(1)) / max(n_step, 1)
       endif
     endif
   end subroutine fs_cost_print
@@ -1203,13 +1342,15 @@ contains
     ! fs_rst_scal of the record (the CPU's layout): 1 version (1), 2 fs_mg_lag, 3 phase of the
     ! coarse-operator rebuild counter for the next step, 4 the memory kind of the rates (3; 1 and 2 were the
     ! removed fs_mom_mem 'all' and 'pg'),
-    ! 5 the fine operator of the last build is in fs_mge0, fs_mgcu, fs_mgcv
+    ! 5 the fine operator of the last build is in fs_mge0, fs_mgcu, fs_mgcv (1/0), 6 fs_nsub (0 in files
+    ! written before the key existed)
     real(8), intent(out) :: sc(fs_nsc)
     sc = 0.0d0
     if (.not. fs_on) return
     sc(1) = 1.0d0; sc(2) = dble(fs_mg_lag); sc(3) = dble(mod(n_solve + mg_ph0, fs_mg_lag))
     sc(4) = dble(mem_kind)
     if (mg_built > 0 .and. allocated(mg_se0)) sc(5) = 1.0d0
+    sc(6) = dble(fs_nsub)
   end subroutine fs_rst_scal_vals
 
   subroutine fs_rst_scal_in(have, sc, take_rates, take_mg)
@@ -1230,6 +1371,9 @@ contains
       take_rates = .false.
       return
     endif
+    if (have .and. nint(sc(6)) > 0 .and. nint(sc(6)) /= fs_nsub .and. talk) write(*,'(1x,A,I2,A,I2,A)') &
+         'IMPLICIT_FS: the restart record was written with fs_nsub =', nint(sc(6)), ', this run uses', fs_nsub, &
+         ' (the rates are per second and are used as they are; not an exact restart)'
     mg_ph0 = 0; mg_rpend = .false.
     if (.not. have) return
     if (mg_on .and. fs_mg_lag > 1 .and. nint(sc(1)) == 1 .and. nint(sc(2)) == fs_mg_lag .and. nint(sc(3)) /= 0) then

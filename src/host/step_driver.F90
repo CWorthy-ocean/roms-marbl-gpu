@@ -23,7 +23,7 @@ module step_driver
   use passive_mod, only: ntp, passive_t3dmix, passive_exchange_mid
   use lmd_mod, only: lmd_vmix
   use frc_io, only: set_forces, frc_prefetch, frc_stress_af
-  use fs_data, only: stress_af, alf
+  use fs_data, only: stress_af, sft, fs_bry_phase
   use river_io, only: set_rivers
   use cdr_io, only: set_cdr, set_cdr_pred
   use cdr_lite_io, only: set_cdr_lite
@@ -159,10 +159,12 @@ contains
     ! (the implicit free surface moves it, see pot_phase). With the
     ! implicit free surface (fs_on) the same arrays are read by the
     ! implicit step, whose boundary face takes data at n+alpha_f, so fs_on
-    ! keeps the harmonics at n+1 (CPU 6a2d56da).
+    ! keeps the harmonics at n+1 (CPU 6a2d56da; fs_bry_phase = 1); with
+    ! fs_nsub sub-steps, which hold these values, the mean of the
+    ! sub-steps' end times, (fs_nsub+1)/(2 fs_nsub).
     frc_slot = 2
     call set_bry_all()
-    call set_tides(merge(1.0_rp, 0.5_rp, fs_on))
+    call set_tides(merge(fs_bry_phase, 0.5_rp, fs_on))
     call dump_bry_north('after tide', frc_modtime())
     call step_mark('corrector forces')
     call dump_vic('before uv1')
@@ -190,7 +192,7 @@ contains
       ! implicit free surface (implicit_fs.F90, FS_SPEC.md): one step
       ! replaces the fast loop; kstp then points at the new level
       call cycle_fast_index()
-      if (stress_af) call frc_stress_af(alf)   ! fs_stress_time = 'af': rufrc's stress at n+alpha_f
+      if (stress_af) call frc_stress_af(sft)   ! fs_stress_time = 'af': rufrc's stress at n+sft (alpha_f)
       call fs_step()
       kstp = knew
     else

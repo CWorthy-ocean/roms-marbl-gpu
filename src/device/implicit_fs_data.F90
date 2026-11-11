@@ -109,10 +109,19 @@ module fs_data
   ! 32 +0.2 / +0.3 ms with 128 on: graph-launched kernels beat the cooperative kernels' grid syncs).
   ! fs_gpu_timers 2: the FS window (device synchronised at entry and exit of fs_step) only.
   integer :: fs_gpu_opt = 471
+  ! fs_nsub (CPU b6325f06): implicit barotropic sub-steps of dt/fs_nsub per 3-D step (1..4); rufrc is
+  ! held over the step, sub-steps after the first add the pressure gradient of their own sea-level
+  ! change since n (weight beta1), the generalized-alpha rates are carried from sub-step to sub-step;
+  ! DU_avg1 = U of the last sub-step, DU_avg2 = the mean flux of the sub-steps. The explicit forcing
+  ! (tidal potential 'af', stress 'af') is taken at n + sft dt, sft = (alpha_f + (fs_nsub-1)/2)/fs_nsub
+  ! (= alpha_f for one step), the boundary tidal harmonics at n + fs_bry_phase dt, fs_bry_phase =
+  ! (fs_nsub+1)/(2 fs_nsub) (1 for one step). dts = dt/fs_nsub, the (sub-)step length.
+  integer :: fs_nsub = 1
+  real(rp) :: sft = 1.0_rp, fs_bry_phase = 1.0_rp, dts = 0.0_rp
   namelist /implicit_fs/ fs_mode, fs_rho_inf, fs_theta, fs_theta_div, fs_tol, fs_maxit, fs_precond, &
        fs_mg_levels, fs_mg_nu, fs_mg_smoother, fs_mg_lag, fs_drag_implicit, &
        fs_warm, fs_verbose, fs_selftest, fs_tang_nudge, &
-       fs_cor_metric, fs_pot_time, fs_stress_time, &
+       fs_cor_metric, fs_pot_time, fs_stress_time, fs_nsub, &
        fs_mg_gather, fs_mg_global_on, fs_mg_faces, fs_exch_thin, &
        fs_gpu_gather, fs_gpu_timers, fs_gpu_coarse, fs_gpu_graph, fs_gpu_opt
 
@@ -129,6 +138,8 @@ module fs_data
   real(rp), FSD allocatable, dimension(:,:) :: unu, unv, usu, usv, au, av, cu, cv, ftu, ftv, fbu, fbv, &
        u1u, u1v, cbu, cbv, wd, ar, rb, dinv, qs, act, bb, rr, zz, pd, qq, wk2, &
        du1o, dv1o, fdum, xru, xrv, cou, cov, fcr
+  ! fs_nsub > 1: sums over the sub-steps of fbu, fbv (fsu, fsv) and of DU_avg2, DV_avg2 (asu, asv)
+  real(rp), FSD allocatable, dimension(:,:) :: fsu, fsv, asu, asv
   ! the generalized-alpha rates and the PCG warm start delta: managed, as they are written
   ! to and read from the restart file (a0e9e2be)
   real(rp), WORK_ATTR allocatable, dimension(:,:) :: udu, udv, gru, grv, qd, xx
@@ -197,7 +208,10 @@ module fs_data
   real(rp), parameter :: om = 0.8_rp
 
   ! statistics and cost pieces (FS_STAT, FS_COST)
-  integer :: n_solve = 0, n_its = 0, n_unconv = 0, its_last = 0
+  integer :: n_solve = 0, n_its = 0, n_unconv = 0, its_last = 0, n_step = 0
+  ! fs_nsub > 1: the step's iteration sum and maximum, worst residual and max |delta| of its sub-steps
+  integer :: its_sum = 0, its_max = 0
+  real(rp) :: res_max = 0.0_rp, dz_max = 0.0_rp
   integer(8) :: n_ring = 0, n_red = 0, n_gath = 0, n_vc = 0
   real(rp) :: res_last = 0.0_rp
   integer, parameter :: ntm = 16
