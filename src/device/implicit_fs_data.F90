@@ -544,7 +544,7 @@ contains
 #endif
     if (fs_gpu_timers /= 1 .or. fs_capt) return
 #ifdef USE_CUDA
-    ierr = cudaStreamSynchronize(work_stream)
+    ierr = cudaDeviceSynchronize()
 #endif
     tm_t0 = wall_time()
   end subroutine tq0
@@ -557,7 +557,7 @@ contains
 #endif
     if (fs_gpu_timers /= 1 .or. fs_capt) return
 #ifdef USE_CUDA
-    ierr = cudaStreamSynchronize(work_stream)
+    ierr = cudaDeviceSynchronize()
 #endif
     t = wall_time()
     tm(id) = tm(id) + (t - tm_t0)
@@ -566,14 +566,17 @@ contains
 
   subroutine tw(e)
     ! fs_gpu_timers 2: the FS window, device synchronised at entry (e = 0) and exit (e = 1) of
-    ! fs_step; steps after the first 10 of the run are summed
+    ! fs_step; steps after the first 10 of the run are summed. The whole device is synchronised
+    ! (here and in tq0, tq): the 3-D kernels run on the default stream, and a synchronisation of
+    ! work_stream alone let the clock start while the device was still working through them (one
+    ! GPU, where no exchange holds the host back: 14.3 ms reported for a 4.9 ms window)
     integer, intent(in) :: e
 #ifdef USE_CUDA
     integer :: ierr
 #endif
     if (fs_gpu_timers /= 2) return
 #ifdef USE_CUDA
-    ierr = cudaStreamSynchronize(work_stream)
+    ierr = cudaDeviceSynchronize()
 #endif
     if (e == 0) then
       tw_t0 = wall_time()
