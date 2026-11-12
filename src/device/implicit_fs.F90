@@ -75,14 +75,18 @@ contains
   !======================================================================
   subroutine fs_read_namelist(unit)
     integer, intent(in) :: unit
-    integer :: ios
+    integer :: ios, i
     real(rp) :: alf                        ! alpha_f
     character(len=512) :: msg
     talk = (comm_world_rank() == 0)
     rewind(unit)
     read(unit, nml=implicit_fs, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'IMPLICIT_FS: could not read the IMPLICIT_FS section of the namelist file ('//trim(msg)//')'
+      do i = 1, len(msg)                     ! nvfortran pads iomsg with NULs (as nc_io's iomsg_text)
+        if (iachar(msg(i:i)) < 32) msg(i:i) = ' '
+      enddo
+      write(*,*) 'IMPLICIT_FS: could not read the IMPLICIT_FS section of the namelist file ('// &
+           trim(adjustl(msg))//')'
       error stop 'read_namelist: unreadable namelist group (see above)'
     endif
     if (ios < 0) then
