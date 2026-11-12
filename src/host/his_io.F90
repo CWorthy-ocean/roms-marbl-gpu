@@ -21,7 +21,7 @@ module his_io
   use marbl_gpu, only: marbl_on, marbl_gpu_nhis, marbl_gpu_nhis3, marbl_gpu_define_his, marbl_gpu_stage_his, &
                        marbl_gpu_define_rst, marbl_gpu_write_rst, marbl_gpu_stage_rst8
   use fs_data, only: fs_on, udu, udv, gru, grv, qd, xx, mg_on, fs_mg_lag, mg_se0, mg_scu, mg_scv, fs_nsc
-  use implicit_fs_gpu, only: fs_rst_prepare, fs_rst_scal_vals
+  use implicit_fs_gpu, only: fs_rst_prepare, fs_rst_scal_vals, fs_global_atts
   implicit none
   private
 
@@ -456,6 +456,7 @@ contains
     if (wrt_Hbbl) id = nc_def_var_f(ncid, 'hbbl', (/d_xi, d_eta, d_t/))
     if (marbl_on) call marbl_gpu_define_his(ncid, d_xi, d_eta, d_s, d_t)
     call nc_put_att_text(ncid, '', 'title', output_title)
+    call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
     call nc_put_att_text(ncid, '', 'history_precision', 'float32 (staged on the GPU)')
     call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
@@ -536,6 +537,7 @@ contains
     endif
     call def_rst_ub(ncid, d_xi, d_eta, d_t)
     call nc_put_att_text(ncid, '', 'title', output_title)
+    call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
     call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
     call nc_enddef(ncid)

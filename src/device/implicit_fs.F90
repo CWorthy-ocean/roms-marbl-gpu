@@ -66,6 +66,7 @@ module implicit_fs_gpu
 
   public :: fs_read_namelist, fs_step, fs_on, fs_rst_prepare, fs_rst_loaded
   public :: fs_src_diag, fs_srcdiag, fs_rst_scal_vals, fs_rst_scal_in, fs_mg_loaded
+  public :: fs_global_atts
 
 contains
 
@@ -165,6 +166,25 @@ contains
       if (fs_selftest > 0) write(*,'(1x,A)') 'IMPLICIT_FS: note: fs_selftest is not implemented on the GPU (ignored)'
     endif
   end subroutine fs_read_namelist
+
+  subroutine fs_global_atts(ncid)
+    ! Global attributes of an output file (the CPU's put_global_atts, ucla-roms e34f73bd): fs_mode
+    ! always ('split' also when the group is absent); with 'implicit' also fs_rho_inf (double) and fs_nsub
+    ! (int). Called by the output modules where they write the file's title (compute rank 0, which has
+    ! read the namelist).
+    use netcdf, only: nf90_put_att, nf90_global, nf90_noerr, nf90_strerror
+    integer, intent(in) :: ncid
+    integer :: ierr
+    ierr = nf90_put_att(ncid, nf90_global, 'fs_mode', trim(fs_mode))
+    if (ierr == nf90_noerr .and. fs_on) then
+      ierr = nf90_put_att(ncid, nf90_global, 'fs_rho_inf', real(fs_rho_inf, 8))
+      if (ierr == nf90_noerr) ierr = nf90_put_att(ncid, nf90_global, 'fs_nsub', int(fs_nsub, 4))
+    endif
+    if (ierr /= nf90_noerr) then
+      write(*,'(1x,A,A)') 'fs_global_atts: ', trim(nf90_strerror(ierr))
+      error stop 'fs_global_atts: netCDF error'
+    endif
+  end subroutine fs_global_atts
 
   subroutine fs_scheme_coef()
     ! generalized-alpha written as a theta-step with memory (FS_SPEC 3.1)

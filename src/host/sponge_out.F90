@@ -17,6 +17,7 @@ module sponge_out
   use gpu_state
   use time_state
   use nc_io
+  use implicit_fs_gpu, only: fs_global_atts
   use his_io, only: output_fname, refdatestr, wrt_file_rst, output_period_rst
   use comm_mod, only: comm_rank, comm_reduce_sum
   use arch_mod, only: sync_arch
@@ -203,6 +204,7 @@ contains
       call nc_put_att_text(ncid, trim(vname(3, s)), 'units', 'm/s')
     enddo
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu sponge tuning')
+    call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
     call nc_enddef(ncid)
     call nc_close(ncid)
     write(*,'(a,a)') 'created sponge-tuning file: ', trim(path)

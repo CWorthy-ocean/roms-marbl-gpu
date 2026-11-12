@@ -23,6 +23,7 @@ module cdr_gas_out
   use gpu_state
   use time_state
   use nc_io
+  use implicit_fs_gpu, only: fs_global_atts
   use io_server, only: IO_KIND_CDRGAS, io_init, io_init8, io_stage8_begin, io_stage8_2d, io_stage8_end
   use comm_mod, only: comm_rank, compute_barrier
   use passive_mod, only: ntp, tp
@@ -277,6 +278,7 @@ contains
     call def1('ddic_dco2_time', (/d_t/), 'time of ddic_dco2 record, days since reference date', 'days')
     call def1('ddic_dalk_time', (/d_t/), 'time of ddic_dalk record, days since reference date', 'days')
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu CDR gas-exchange output')
+    call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
     call nc_enddef(ncid)
     call nc_close(ncid)
     write(*,'(a,a)') 'created cdr_gas file: ', trim(path)

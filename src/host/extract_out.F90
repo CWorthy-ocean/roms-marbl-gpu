@@ -47,6 +47,7 @@ module extract_out
   use time_state
   use run_timers, only: wall_time
   use netcdf
+  use implicit_fs_gpu, only: fs_global_atts
   use nc_io, only: nc_create, nc_def_dim, nc_def_var, nc_put_att_text, nc_enddef, nc_close, nc_open_write, &
                    nc_put_1d_rec
   use comm_mod, only: comm_rank, comm_reduce_sum
@@ -895,6 +896,7 @@ contains
                                'meter3 second-2')
     enddo
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu child boundary extraction')
+    call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
     call nc_enddef(ncid)
     call nc_close(ncid)
     write(*,'(a,a)') 'created extract file: ', trim(path)
