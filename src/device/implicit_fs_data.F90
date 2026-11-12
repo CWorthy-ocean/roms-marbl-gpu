@@ -54,12 +54,6 @@ module fs_data
   ! (ptide at time + pot_phase dt; 0.5 in the split and without the group)
   character(len=8) :: fs_pot_time = 'af'
   real(rp) :: pot_phase = 0.5_rp
-  ! 09c6d284 (FS_SPEC 3.1, 9b-F): surface stress of the 2-D step at t_{n+alpha_f} ('af', default;
-  ! frc_io frc_stress_af adds the change from n+1/2 to rufrc, rvfrc before fs_step) or n+1/2 ('mid',
-  ! 22c05bc1 and the split); stress_af: 'af' in effect (implicit, alpha_f /= 1/2), alf = alpha_f
-  character(len=8) :: fs_stress_time = 'af'
-  logical :: stress_af = .false.
-  real(rp) :: alf = 1.0_rp
   ! 14233194 (FS_SPEC 5, 9b-E): coarse face factors of the multigrid, 'width' (default: (w_f(fi-1) +
   ! w_f(fi)) / (w_c(I-1) + w_c(I)), the aggregates' widths in fine cells; = 0.5 for full aggregates of
   ! equal cells) or 'half' (0.5, 6fc45b50). The CPU's MPI-layout keys fs_mg_gather, fs_mg_global_on
@@ -114,7 +108,7 @@ module fs_data
   ! held over the step, sub-steps after the first add the pressure gradient of their own sea-level
   ! change since n (weight beta1), the generalized-alpha rates are carried from sub-step to sub-step;
   ! DU_avg1 = U of the last sub-step, DU_avg2 = the mean flux of the sub-steps. The explicit forcing
-  ! (tidal potential 'af', stress 'af') is taken at n + sft dt, sft = (alpha_f + (fs_nsub-1)/2)/fs_nsub
+  ! (tidal potential 'af') is taken at n + sft dt, sft = (alpha_f + (fs_nsub-1)/2)/fs_nsub
   ! (= alpha_f for one step), the boundary tidal harmonics at n + fs_bry_phase dt, fs_bry_phase =
   ! (fs_nsub+1)/(2 fs_nsub) (1 for one step). dts = dt/fs_nsub, the (sub-)step length.
   integer :: fs_nsub = 2
@@ -135,7 +129,7 @@ module fs_data
   namelist /implicit_fs/ fs_mode, fs_rho_inf, fs_theta, fs_theta_div, fs_tol, fs_maxit, fs_precond, &
        fs_mg_levels, fs_mg_nu, fs_mg_smoother, fs_mg_lag, fs_drag_implicit, &
        fs_warm, fs_verbose, fs_selftest, fs_tang_nudge, &
-       fs_cor_metric, fs_pot_time, fs_stress_time, fs_nsub, fs_pg_rho, fs_flather_zghost, &
+       fs_cor_metric, fs_pot_time, fs_nsub, fs_pg_rho, fs_flather_zghost, &
        fs_mg_gather, fs_mg_global_on, fs_mg_faces, fs_exch_thin, &
        fs_gpu_gather, fs_gpu_timers, fs_gpu_coarse, fs_gpu_graph, fs_gpu_opt
 

@@ -22,8 +22,8 @@ module step_driver
   use t3dmix_mod, only: t3dmix
   use passive_mod, only: ntp, passive_t3dmix, passive_exchange_mid
   use lmd_mod, only: lmd_vmix
-  use frc_io, only: set_forces, frc_prefetch, frc_stress_af
-  use fs_data, only: stress_af, sft, fs_bry_phase
+  use frc_io, only: set_forces, frc_prefetch
+  use fs_data, only: fs_bry_phase
   use river_io, only: set_rivers
   use cdr_io, only: set_cdr, set_cdr_pred
   use cdr_lite_io, only: set_cdr_lite
@@ -192,7 +192,6 @@ contains
       ! implicit free surface (implicit_fs.F90, FS_SPEC.md): one step
       ! replaces the fast loop; kstp then points at the new level
       call cycle_fast_index()
-      if (stress_af) call frc_stress_af(sft)   ! fs_stress_time = 'af': rufrc's stress at n+sft (alpha_f)
       call fs_step()
       kstp = knew
     else

@@ -76,6 +76,7 @@ contains
   subroutine fs_read_namelist(unit)
     integer, intent(in) :: unit
     integer :: ios
+    real(rp) :: alf                        ! alpha_f
     character(len=512) :: msg
     talk = (comm_world_rank() == 0)
     rewind(unit)
@@ -113,9 +114,6 @@ contains
     case ('mid'); pot_phase = 0.5_rp
     case default; error stop "IMPLICIT_FS: fs_pot_time must be 'af' or 'mid'"
     end select
-    if (trim(fs_stress_time) /= 'af' .and. trim(fs_stress_time) /= 'mid') &
-         error stop "IMPLICIT_FS: fs_stress_time must be 'af' or 'mid'"
-    stress_af = (trim(fs_stress_time) == 'af' .and. abs(sft - 0.5_rp) > 1.e-12_rp)
     if (trim(fs_mg_faces) /= 'width' .and. trim(fs_mg_faces) /= 'half') &
          error stop "IMPLICIT_FS: fs_mg_faces must be 'width' or 'half'"
     if (fs_tol <= 0.0_rp .or. fs_maxit < 1) error stop 'IMPLICIT_FS: fs_tol > 0 and fs_maxit >= 1 required'
@@ -151,13 +149,6 @@ contains
       write(*,'(1x,A,L1)') 'IMPLICIT_FS: fs_flather_zghost = ', fs_flather_zghost
       write(*,'(1x,A,A,A,F7.4,A)') 'IMPLICIT_FS: fs_pot_time = ', trim(fs_pot_time), ' (tidal potential at time +', &
            pot_phase, ' dt)'
-      if (stress_af) then
-        write(*,'(1x,A,A,A,F7.4,A)') 'IMPLICIT_FS: fs_stress_time = ', trim(fs_stress_time), &
-             ' (surface stress of the 2-D step at time +', sft, ' dt; the 3-D step keeps n+1/2)'
-      else
-        write(*,'(1x,A,A,A)') 'IMPLICIT_FS: fs_stress_time = ', trim(fs_stress_time), &
-             ' (surface stress of the 2-D step at n+1/2 as set_forces)'
-      endif
       write(*,'(1x,A,A,A,I6,A,A,A,L1,A)') 'IMPLICIT_FS: fs_mg_faces = ', trim(fs_mg_faces), &
            ' (CPU layout keys read, not used: fs_mg_gather =', fs_mg_gather, ' fs_mg_global_on = ', &
            trim(fs_mg_global_on), ' fs_exch_thin = ', fs_exch_thin, ')'
