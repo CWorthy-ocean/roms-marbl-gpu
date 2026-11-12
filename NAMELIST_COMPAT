@@ -59,6 +59,13 @@
 # fs_mg_global_on and fs_exch_thin are read and not used (the GPU's layout
 # keys are fs_gpu_gather, fs_gpu_coarse, fs_gpu_graph, fs_gpu_opt;
 # fs_gpu_timers for timing runs); fs_selftest is read and ignored.
+# Boundary options: roms_gpu's open edges have one barotropic type, UCLA
+# ROMS's OBC_M2FLATHER (Flather normal faces, the zetabc sea level, the
+# upwind tangential condition with inflow nudging), which the implicit
+# free surface implements. The UCLA ROMS options for which the implicit
+# step prints a start-up note there (OBC_M2ORLANSKI, open edges without an
+# OBC_M2 type, OBC_Z2ORLANSKI, LEGACY_ORLANSKI, OBC_RAD_NORMAL, OBC_RAD_NPO)
+# do not exist in roms_gpu, so it prints none.
 #
 # Half-resolution forcing: interp_bulk_frc, interp_flux_frc
 # (&surf_frc_settings) and interp_bgc_frc (&bgc_settings) are read but not
