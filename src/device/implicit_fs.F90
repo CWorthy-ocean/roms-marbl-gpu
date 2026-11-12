@@ -1393,19 +1393,25 @@ contains
   end subroutine fs_solve_line
 
   subroutine fs_cost_print()
+    ! end of the run: FS_STAT (as the CPU, always); with fs_verbose >= 1 also the GPU's communication
+    ! counts per solve (FS_STAT per solve); with fs_gpu_timers 1 the FS_COST pieces, with 2 FS_WIN
+    ! (their reductions only then)
     real(8) :: gm(ntm), lm(ntm), x(2), y(2)
     integer :: i
+    if (talk) then
+      write(*,'(1x,A,I7,A,F9.2,A,I6)') 'FS_STAT solves', n_solve, ' mean its', real(n_its, 8) / max(n_solve, 1), &
+           ' unconverged', n_unconv
+      if (fs_nsub > 1) write(*,'(1x,A,I7,A,I2,A)') 'FS_STAT steps', n_step, ' (', fs_nsub, ' sub-steps each)'
+      if (fs_verbose >= 1) write(*,'(1x,A,4(A,F9.2))') 'FS_STAT per solve:', ' ring rounds', &
+           real(n_ring, 8) / max(n_solve, 1), ' reductions', real(n_red, 8) / max(n_solve, 1), &
+           ' V-cycles', real(n_vc, 8) / max(n_solve, 1), ' host gathers', real(n_gath, 8) / max(n_solve, 1)
+    endif
+    if (fs_gpu_timers < 1) return
     lm = tm
     call comm_allreduce_max(ntm, lm, gm)
     x(1) = tm_mgsetup; x(2) = tm_win
     call comm_allreduce_max(2, x, y)
     if (talk) then
-      write(*,'(1x,A,I7,A,F9.2,A,I6)') 'FS_STAT solves', n_solve, ' mean its', real(n_its, 8) / max(n_solve, 1), &
-           ' unconverged', n_unconv
-      if (fs_nsub > 1) write(*,'(1x,A,I7,A,I2,A)') 'FS_STAT steps', n_step, ' (', fs_nsub, ' sub-steps each)'
-      write(*,'(1x,A,4(A,F9.2))') 'FS_STAT per solve:', ' ring rounds', real(n_ring, 8) / max(n_solve, 1), &
-           ' reductions', real(n_red, 8) / max(n_solve, 1), ' V-cycles', real(n_vc, 8) / max(n_solve, 1), &
-           ' host gathers', real(n_gath, 8) / max(n_solve, 1)
       if (fs_gpu_timers == 2) write(*,'(1x,A,F9.3,A,I6,A)') 'FS_WIN', 1.e3_8 * y(2) / max(n_win - 10, 1), &
            ' ms per step (FS window, device synchronised at entry and exit; max rank, mean over', n_win - 10, &
            ' steps after the first 10)'

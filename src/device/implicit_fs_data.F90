@@ -47,7 +47,8 @@ module fs_data
   ! (fs_cor_metric: with the curvilinear metric terms of the stock rhs, .false. = a0e9e2be), the
   ! step's own volume sources (Ftil = Fbar = Q_r, Qbar = Q), a memory-less first step
   real(rp) :: fs_tang_nudge = 1.0_rp
-  integer :: fs_verbose = 0
+  integer :: fs_verbose = 0            ! 1 FS_SOLVE line per step and FS_STAT per solve at the end;
+                                       ! 2 + FS_VOL, FS_SRC, FS_WALL lines (FS_SRC also in fs_mode = 'split')
   integer :: fs_selftest = 0
   logical :: fs_cor_metric = .true.
   ! 8edf0a02 (FS_SPEC 9b item 8, 9b-D): time of the tidal potential in implicit mode, 'af' n+alpha_f =
