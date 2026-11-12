@@ -85,6 +85,12 @@
 # step prints a start-up note there (OBC_M2ORLANSKI, open edges without an
 # OBC_M2 type, OBC_Z2ORLANSKI, LEGACY_ORLANSKI, OBC_RAD_NORMAL, OBC_RAD_NPO)
 # do not exist in roms_gpu, so it prints none.
+# fs_gpu_opt is a bit mask in [0, 65535], default 65495 (was 471: bits
+# 512 .. 32768 are new); bit 512 sums the PCG's partials of four ranks on
+# one node in pairwise order instead of by MPI_Allreduce (GPU-only
+# rounding-level difference), every other bit is bit-identical to 0. The
+# solve stops the run on a NaN or Inf residual norm or <p,q>, with the
+# CPU's message.
 #
 # Half-resolution forcing: interp_bulk_frc, interp_flux_frc
 # (&surf_frc_settings) and interp_bgc_frc (&bgc_settings) are read but not

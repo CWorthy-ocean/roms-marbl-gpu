@@ -77,8 +77,10 @@ module fs_data
   integer :: fs_gpu_timers = 0
   character(len=8) :: fs_gpu_coarse = 'device'
   integer :: fs_gpu_graph = 0         ! 1: the device global levels' down and up legs as CUDA graphs
-  ! fs_gpu_opt (free-surface optimization session): bit mask of the latency levers of the solve,
-  ! none of which changes the arithmetic (each path bit-identical to the 0 path):
+  ! fs_gpu_opt (free-surface optimization sessions): bit mask of the latency levers of the solve.
+  ! Every bit except 512 leaves the arithmetic unchanged (each path bit-identical to the 0 path); 512
+  ! adds the PCG's partial sums of four ranks in a different order than MPI_Allreduce (rounding level,
+  ! GPU only: iteration counts unchanged, fields at most 1.5 times the CPU's regular-strict build spread):
   !   1 the ring exchanges through mapped pinned host memory (the pack kernel writes the host
   !     send buffers, host MPI, the unpack kernel reads the host receive buffers) instead of
   !     GPU-aware MPI on device buffers
@@ -113,14 +115,16 @@ module fs_data
   !     instead of one per colour, reading one array and writing the other; a second-colour cell forms
   !     its first-colour neighbours' new values itself with the same expression (bit-identical); the
   !     down leg's first sweep reads a plane of zeros instead of a zeroed level (no zeroing kernels)
-  ! 8192 the same for the fine level and the distributed coarse levels (fs_mg), the rings between the
-  !     sweeps on the array the next sweep reads
+  ! 8192 the same for the fine level and the distributed coarse levels (fs_mg) of at most 100000 cells
+  !     per tile, the rings between the sweeps on the array the next sweep reads
   ! 16384 with 256: a CUDA IPC ring's put and wait in one kernel instead of two (fs_ipc kring_f, kring_p)
   ! 32768 with 256: the multigrid gathers' IPC put by several blocks instead of one (kgput_m, kgput_vm)
-  ! Default 471 = all but 8 and 32, which were slower (sargasso and Pac FS window: 8 +0.2 / +0.15 ms,
+  ! Default 65495 = all but 8 and 32, which were slower (sargasso and Pac FS window: 8 +0.2 / +0.15 ms,
   ! 32 +0.2 / +0.3 ms with 128 on: graph-launched kernels beat the cooperative kernels' grid syncs).
+  ! (471 before bits 512 .. 32768: FS window sargasso 2x2 5.01 -> 3.43 ms, Iceland0 2x2 5.00 -> 3.60,
+  ! Pac 8x1 on two nodes 16.3 -> 14.8, with the converged-residual V-cycle skipped.)
   ! fs_gpu_timers 2: the FS window (device synchronised at entry and exit of fs_step) only.
-  integer :: fs_gpu_opt = 471
+  integer :: fs_gpu_opt = 65495
   ! fs_nsub (CPU b6325f06): implicit barotropic sub-steps of dt/fs_nsub per 3-D step (1..4); rufrc is
   ! held over the step, sub-steps after the first add the pressure gradient of their own sea-level
   ! change since n (weight beta1), the generalized-alpha rates are carried from sub-step to sub-step;
