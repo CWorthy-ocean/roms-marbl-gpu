@@ -96,7 +96,8 @@ contains
     if (.not. fs_on) return
     if (fs_theta < 0.5_rp .or. fs_theta > 1.0_rp .or. fs_theta_div < 0.5_rp .or. fs_theta_div > 1.0_rp) &
          error stop 'IMPLICIT_FS: fs_theta and fs_theta_div must lie in [0.5, 1]'
-    if (fs_rho_inf < 0.0_rp .or. fs_rho_inf > 1.0_rp) error stop 'IMPLICIT_FS: fs_rho_inf must lie in [0, 1]'
+    if (fs_rho_inf < 0.0_rp .or. fs_rho_inf >= 1.0_rp) error stop 'IMPLICIT_FS: fs_rho_inf must lie in [0, 1):'// &
+         " 1 (Crank-Nicolson) is resonant with the 3-D step's 2 dt mode"
     if (fs_nsub < 1 .or. fs_nsub > 4) error stop 'IMPLICIT_FS: fs_nsub must lie in [1, 4]'
     call fs_scheme_coef()
     alf = 1.0_rp / (1.0_rp + fs_rho_inf)

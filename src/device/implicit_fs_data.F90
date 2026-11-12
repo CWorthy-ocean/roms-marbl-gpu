@@ -27,7 +27,7 @@ module fs_data
   character(len=8) :: fs_mode = 'split'
   ! Defaults of ucla-roms implicit-fs-defaults (864969bd): two sub-steps at fs_rho_inf 0.5 with fs_pg_rho and
   ! fs_flather_zghost (the previous behaviour: fs_rho_inf = 0, fs_nsub = 1, both keys .false.)
-  real(rp) :: fs_rho_inf = 0.5_rp
+  real(rp) :: fs_rho_inf = 0.5_rp        ! in [0, 1) (0: L-stable; 1, Crank-Nicolson, rejected)
   real(rp) :: fs_theta = 0.5_rp
   real(rp) :: fs_theta_div = 0.5_rp
   real(rp) :: fs_tol = 1.e-8_rp
