@@ -50,7 +50,7 @@ module implicit_fs_gpu
   use formulas, only: g
   use halo_mod, only: halo_fill_zuv_n
   use geom, only: set_depth
-  use comm_mod, only: comm_allreduce_sum, comm_allreduce_max, comm_world_rank
+  use comm_mod, only: comm_allreduce_sum, comm_allreduce_max, comm_world_rank, comm_abort
   use rivers_mod, only: river_on, rf_flx, rivers_fs_map
   use cdr_src_mod, only: cdr_vol_on, cdr_fs_src
   use run_timers, only: wall_time
@@ -559,6 +559,7 @@ contains
     call fs_pcg(its, resid, conv)
     n_solve = n_solve + 1; n_its = n_its + its; its_last = its; res_last = resid
     if (.not. conv) n_unconv = n_unconv + 1
+    if (.not. conv) call fs_unconv_stop(k, its, resid)
     if (fs_nsub > 1) then                   ! the step's FS_SOLVE statistics
       if (k1) then
         its_sum = 0; its_max = 0; res_max = 0.0_rp; dz_max = 0.0_rp
@@ -942,6 +943,30 @@ contains
     if (fs_verbose >= 1) call fs_solve_line()
     if (iic == ntstart + ntimes - 1) call fs_cost_print()
   end subroutine fs_step
+
+  subroutine fs_unconv_stop(k, its, resid)
+    ! The solve of sub-step k reached fs_maxit without meeting fs_tol: stop the run (the CPU's
+    ! fs_unconv_stop, same message). conv comes from global reductions, so every compute rank comes
+    ! here: compute rank 0 writes the message, every compute rank meets the others once more (so the
+    ! message is out before any rank aborts) and stops all ranks, writers included, by comm_abort
+    ! (MPI_Abort), as the MARBL solver failure does.
+    integer(ip), intent(in) :: k
+    integer, intent(in) :: its
+    real(rp), intent(in) :: resid
+    character(len=320) :: msg
+    real(rp) :: x(1), y(1)
+    write(msg, '(A,I0,A,I0,A,I0,A,I0,A,ES9.2,A,ES9.2,A,I0,A)') 'IMPLICIT_FS: the free-surface solve did not'// &
+         ' converge (step ', iic, ', sub-step ', k, ' of ', fs_nsub, ': ', its, ' iterations, relative residual', &
+         resid, ', fs_tol =', fs_tol, ', fs_maxit = ', fs_maxit, '): the run is unstable, or fs_tol is below what'// &
+         ' rounding allows'
+    if (talk) then
+      write(*,'(1x,A)') trim(msg)
+      flush(6)
+    endif
+    x = 0.0_rp
+    call comm_allreduce_max(1, x, y)
+    call comm_abort(1)
+  end subroutine fs_unconv_stop
 
   subroutine fs_tang_bc(ks, kn, dts_)
     ! Tangential boundary velocities (FS_SPEC 3.7.5, the CPU's fs_tang_bc):
