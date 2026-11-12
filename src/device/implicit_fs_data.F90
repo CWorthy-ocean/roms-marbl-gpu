@@ -39,9 +39,7 @@ module fs_data
   integer :: fs_mg_lag = 1
   logical :: fs_drag_implicit = .false.
   integer :: fs_warm = 1
-  ! Fixed parts of the scheme (the CPU's development options removed 2026-11-07, IFS_TRIM.md; the
-  ! keys fs_pred_ext, fs_obc_flux, fs_tang, fs_mom_mem, fs_src_mem, fs_ga_start, fs_cor_est,
-  ! fs_coriolis_implicit, fs_cost_sync are no longer read): AB2 predictor transport, Flather flux
+  ! Fixed parts of the scheme: AB2 predictor transport, Flather flux
   ! with the generalized-alpha memory, the backward-Euler 'adv' tangential condition (inflow
   ! nudging rate times fs_tang_nudge), the momentum memory without the Coriolis estimate on U^n
   ! (fs_cor_metric: with the curvilinear metric terms of the stock rhs, .false. = a0e9e2be), the
@@ -145,8 +143,8 @@ module fs_data
   logical :: talk = .false., ready = .false., mg_on = .false., jac_sm = .false.
   logical :: ga_first = .true., dev_glob = .true.
   logical :: fs_srcdiag = .false.       ! fs_verbose >= 2: FS_SRC line per step (both fs_mode values)
-  integer, parameter :: mem_kind = 3    ! restart scalar 4: the memory kind of the rates (1, 2: the removed
-                                        ! fs_mom_mem 'all', 'pg')
+  integer, parameter :: rst_format = 3  ! restart scalar 4: format version of the stored state (rates,
+                                        ! delta, operators); a record of another version starts cold
   logical :: fs_capt = .false.          ! a CUDA graph capture is open on work_stream (no syncs)
   real(rp) :: beta1 = 1.0_rp, thp = 0.5_rp, thd = 0.5_rp, gam_a = 0.5_rp, ths = 0.5_rp
 

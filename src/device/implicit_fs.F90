@@ -80,9 +80,7 @@ contains
     rewind(unit)
     read(unit, nml=implicit_fs, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'IMPLICIT_FS: ', trim(msg)
-      write(*,*) 'IMPLICIT_FS: note: fs_mom_mem, fs_src_mem, fs_tang, fs_obc_flux, fs_pred_ext, fs_ga_start,'// &
-           ' fs_cor_est, fs_coriolis_implicit and fs_cost_sync were removed (2026-11-07); delete them'
+      write(*,*) 'IMPLICIT_FS: could not read the IMPLICIT_FS section of the namelist file ('//trim(msg)//')'
       error stop 'read_namelist: unreadable namelist group (see above)'
     endif
     if (ios < 0) then
@@ -1503,35 +1501,33 @@ contains
   end subroutine mg_replay
 
   subroutine fs_rst_scal_vals(sc)
-    ! fs_rst_scal of the record (the CPU's layout): 1 version (1), 2 fs_mg_lag, 3 phase of the
-    ! coarse-operator rebuild counter for the next step, 4 the memory kind of the rates (3; 1 and 2 were the
-    ! removed fs_mom_mem 'all' and 'pg'),
-    ! 5 the fine operator of the last build is in fs_mge0, fs_mgcu, fs_mgcv (1/0), 6 fs_nsub (0 in files
-    ! written before the key existed)
+    ! fs_rst_scal of the record (the CPU's layout): 1 the scalars are set (1), 2 fs_mg_lag, 3 phase of the
+    ! coarse-operator rebuild counter for the next step, 4 format version of the stored state (rst_format),
+    ! 5 the fine operator of the last build is in fs_mge0, fs_mgcu, fs_mgcv (1/0), 6 fs_nsub of the run
     real(8), intent(out) :: sc(fs_nsc)
     sc = 0.0d0
     if (.not. fs_on) return
     sc(1) = 1.0d0; sc(2) = dble(fs_mg_lag); sc(3) = dble(mod(n_solve + mg_ph0, fs_mg_lag))
-    sc(4) = dble(mem_kind)
+    sc(4) = dble(rst_format)
     if (mg_built > 0 .and. allocated(mg_se0)) sc(5) = 1.0d0
     sc(6) = dble(fs_nsub)
   end subroutine fs_rst_scal_vals
 
   subroutine fs_rst_scal_in(have, sc, take_rates, take_mg)
-    ! case_io, before the rates are read (the CPU's fs_rst_get): a record whose rates were made
-    ! with the removed fs_mom_mem 'all' or 'pg' gives a cold start of the memory (rates not read); with the same
+    ! case_io, before the rates are read (the CPU's fs_rst_get): a record whose stored state has another
+    ! format version than rst_format gives a cold start of the memory (rates not read); a file without
+    ! the scalars: the rates are used, the coarse operators are built at the first step; with the same
     ! fs_mg_lag > 1 and a phase /= 0 the stored fine operator is read (take_mg) and the coarse
     ! operators of the last build are rebuilt from it before the first solve
     logical, intent(in) :: have
     real(8), intent(in) :: sc(fs_nsc)
     logical, intent(out) :: take_rates, take_mg
-    character(len=4), parameter :: mem_name(2) = ['all ', 'pg  ']
     take_rates = .true.; take_mg = .false.
     if (.not. fs_on) return
-    if (have .and. nint(sc(1)) == 1 .and. nint(sc(4)) /= mem_kind) then
-      if (talk) write(*,'(1x,A)') 'IMPLICIT_FS: the restart record''s rates were made with the removed'// &
-           ' option fs_mom_mem = '''//trim(mem_name(max(1, min(2, nint(sc(4))))))//''': cold start of the'// &
-           ' generalized-alpha memory (not an exact restart)'
+    if (have .and. nint(sc(1)) == 1 .and. nint(sc(4)) /= rst_format) then
+      if (talk) write(*,'(1x,A,I0,A,I0,A)') 'IMPLICIT_FS: the restart record''s implicit free-surface'// &
+           ' state has format version ', nint(sc(4)), ', this model reads version ', rst_format, ': cold start'// &
+           ' of the generalized-alpha memory (not an exact restart)'
       take_rates = .false.
       return
     endif

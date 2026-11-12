@@ -58,11 +58,7 @@
 # .false. give the earlier single step). The CPU's MPI-layout keys fs_mg_gather,
 # fs_mg_global_on and fs_exch_thin are read and not used (the GPU's layout
 # keys are fs_gpu_gather, fs_gpu_coarse, fs_gpu_graph, fs_gpu_opt;
-# fs_gpu_timers for timing runs); fs_selftest is read and ignored. The
-# development keys fs_mom_mem, fs_src_mem, fs_tang, fs_obc_flux,
-# fs_pred_ext, fs_ga_start, fs_cor_est, fs_coriolis_implicit and
-# fs_cost_sync of earlier development versions are not read: a namelist
-# that sets one of them stops at start-up (the removed keys are listed).
+# fs_gpu_timers for timing runs); fs_selftest is read and ignored.
 #
 # Half-resolution forcing: interp_bulk_frc, interp_flux_frc
 # (&surf_frc_settings) and interp_bgc_frc (&bgc_settings) are read but not

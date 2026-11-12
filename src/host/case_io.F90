@@ -881,9 +881,8 @@ contains
     case_record = rec
 
     write(*,'(a,i0,a,i0)') 'exact-restart: reading current record ', rec, ' into slot 1; nrecs=', nrecs
-    ! implicit free surface scalars (CPU 22c05bc1 fs_rst_get): the memory kind of the rates (a removed
-    ! fs_mom_mem 'all'/'pg' gives a cold start of the memory),
-    ! the fs_mg_lag > 1 phase and stored fine operator
+    ! implicit free surface scalars (the CPU's fs_rst_get): the format version of the stored state
+    ! (another version gives a cold start of the memory), the fs_mg_lag > 1 phase and stored fine operator
     take_rates = .true.; take_mg = .false.
     if (fs_on) then
       have_sc = nc_has_var(ncid, 'fs_rst_scal')
