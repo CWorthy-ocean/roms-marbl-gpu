@@ -42,6 +42,12 @@ module fs_mg
   ! sweep reads zz0 / mz_, zeros that are never written (instead of zz, mx_ zeroed)
   real(rp), FSD allocatable :: zzb(:,:), zz0(:,:), mxb_(:,:,:), mz_(:,:,:)
   logical :: g2f = .false.
+  ! g2l(l): the fused sweep on level l (0 = fine). Only on levels of at most G2_MAXC cells per tile, where a
+  ! sweep kernel costs its launch latency: on larger tiles the fused kernel's extra arithmetic (a second-colour
+  ! cell evaluates five stencils) costs more than the saved launch (Pac 8 x 1, fine level 232 x 960: +0.2 ms
+  ! per step with every level fused)
+  integer, parameter :: G2_MAXC = 100000
+  logical :: g2l(0:mg_maxl) = .false.
 #ifdef USE_CUDA
   type(cudaGraphExec) :: vg_exec(VG_MAX)
 #endif
@@ -74,6 +80,10 @@ contains
              mt_(0:mgx + 1, 0:mgy + 1, mg_ld))
     mx_ = 0; mb_ = 0; me_ = 0; mw_ = 0; ms_ = 0; md_ = 0; mt_ = 0
     g2f = o_g2f .and. .not. jac_sm .and. mod(fs_mg_nu, 2) == 0
+    do l = 0, mg_ld
+      g2l(l) = g2f .and. int(mg_nx(l), 8) * int(mg_ny(l), 8) <= G2_MAXC
+    enddo
+    g2f = any(g2l(0:mg_ld))
     if (g2f) then
       allocate(zzb(decomp%is:decomp%ie, decomp%js:decomp%je), zz0(decomp%is:decomp%ie, decomp%js:decomp%je), &
                mxb_(0:mgx + 1, 0:mgy + 1, mg_ld), mz_(0:mgx + 1, 0:mgy + 1, 1))
@@ -429,7 +439,7 @@ contains
     endif
 #endif
     nx = decomp%nx; ny = decomp%ny
-    if (g2f) then
+    if (g2l(0)) then
       ! fs_gpu_opt 8192: sweep 1 zz0 -> zzb (no exchange: zz0's halo is zero, as zz's after zero2),
       ! then alternately zzb -> zz, zz -> zzb, each after the ring of the array it reads (ends in zz)
       do k = 1, fs_mg_nu
@@ -453,7 +463,7 @@ contains
     call ring_mg(0)
     call resid_restrict(0)
     do l = 1, mg_ld - 1
-      if (g2f) then
+      if (g2l(l)) then
         do k = 1, fs_mg_nu
           if (k == 1) then
             call sweep_c2(l, 1, mz_, 1, mxb_, int(l))
@@ -515,7 +525,7 @@ contains
     endif
     do l = mg_ld - 1, 1, -1
       call prolong(l)
-      if (g2f) then
+      if (g2l(l)) then
         do k = 1, fs_mg_nu                ! alternately mx_ -> mxb_, mxb_ -> mx_ (ends in mx_)
           if (mod(k, 2) == 1) then
             call ring_mg(l)
@@ -533,7 +543,7 @@ contains
       enddo
     enddo
     call prolong(0)
-    if (g2f) then
+    if (g2l(0)) then
       do k = 1, fs_mg_nu                  ! alternately zz -> zzb, zzb -> zz (ends in zz)
         if (mod(k, 2) == 1) then
           call ring_mg(0)
