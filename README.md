@@ -240,11 +240,15 @@ v0.1.2-beta, bit for bit.
   reduced to a symmetric positive-definite Helmholtz problem for the
   sea-level change and solved by multigrid-preconditioned conjugate
   gradients, replaces the split-explicit fast loop. Without the group, or
-  with `fs_mode = 'split'`, the model is unchanged. The keys are those of
-  UCLA ROMS (`fs_rho_inf`, `fs_nsub`, `fs_pg_rho`, `fs_flather_zghost`,
-  solver and multigrid keys); the GPU adds layout and latency keys
-  (`fs_gpu_gather`, `fs_gpu_coarse`, `fs_gpu_graph`, `fs_gpu_opt`). The
-  restart file holds the scheme's state, so a restart is exact.
+  with `fs_mode = 'split'`, the model is unchanged. The settings are those
+  of UCLA ROMS's namelist template: `fs_mode`, `fs_nsub` (2), `fs_rho_inf`
+  (0.5, in [0, 1)), `fs_tol` (1e-8) and `fs_verbose` (0). UCLA ROMS's
+  solver and development settings are read too, and the GPU adds tuning
+  settings (`fs_gpu_gather`, `fs_gpu_coarse`, `fs_gpu_graph`, `fs_gpu_opt`,
+  `fs_gpu_timers`); see `NAMELIST_COMPAT`. A solve that does not converge
+  stops the run. The restart file holds the scheme's state, so a restart
+  is exact, and the output files record the scheme (`fs_mode`,
+  `fs_rho_inf`, `fs_nsub`) as global attributes.
 
 ## Numerics
 
