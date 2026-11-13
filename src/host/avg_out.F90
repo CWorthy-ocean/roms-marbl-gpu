@@ -92,6 +92,12 @@ contains
                wrt_avg_Akv, wrt_avg_Akt, wrt_avg_Aks, wrt_avg_Hbls, wrt_avg_Hbbl
     logical :: wrt_bgc_dia_his, wrt_bgc_dia_avg, interp_bgc_frc
     real(rp) :: output_period_bgc_his, output_period_bgc_his_dia, output_period_bgc_avg_dia, xco2air_default
+    ! BGC tracer subcycling (UCLA ROMS after 0.14.0, #428): read so that a UCLA ROMS
+    ! namelist runs; not on the GPU yet, so .true. stops the run. The
+    ! testing keys bgc_subcycle_pos and bgc_subcycle_diag act only with it.
+    logical :: bgc_physics_subcycle, bgc_subcycle_pos
+    real(rp) :: bgc_physics_timestep
+    integer :: bgc_subcycle_diag
     namelist /basic_output_settings/ output_period_rst, output_period_his, nrpf_his, &
          output_period_avg, nrpf_avg, wrt_file_rst, wrt_file_avg, wrt_file_his, monthly_restarts, &
          wrt_Z, wrt_Ub, wrt_Vb, wrt_U, wrt_V, wrt_R, wrt_O, wrt_W, wrt_Akv, wrt_Akt, wrt_aks, wrt_Hbls, &
@@ -100,7 +106,8 @@ contains
     namelist /bgc_settings/ wrt_bgc_his, wrt_bgc_avg, wrt_bgc_dia_his, wrt_bgc_dia_avg, interp_bgc_frc, &
          output_period_bgc_his, nrpf_bgc_his, output_period_bgc_avg, nrpf_bgc_avg, &
          output_period_bgc_his_dia, nrpf_bgc_his_dia, output_period_bgc_avg_dia, nrpf_bgc_avg_dia, &
-         nbgc_flx, xco2air_default
+         nbgc_flx, xco2air_default, bgc_physics_subcycle, bgc_physics_timestep, bgc_subcycle_pos, &
+         bgc_subcycle_diag
     wrt_avg_Z = .true.; wrt_avg_Ub = .true.; wrt_avg_Vb = .true.; wrt_avg_U = .true.; wrt_avg_V = .true.
     wrt_avg_R = .true.; wrt_avg_O = .true.; wrt_avg_W = .true.; wrt_avg_Akv = .true.; wrt_avg_Akt = .true.
     wrt_avg_Aks = .true.; wrt_avg_Hbls = .true.; wrt_avg_Hbbl = .true.
@@ -110,9 +117,13 @@ contains
     wz = wrt_avg_Z; wub = wrt_avg_Ub; wvb = wrt_avg_Vb; wu = wrt_avg_U; wv = wrt_avg_V; wr = wrt_avg_R
     wo = wrt_avg_O; ww = wrt_avg_W; wakv = wrt_avg_Akv; wakt = wrt_avg_Akt; waks = wrt_avg_Aks
     whbl = wrt_avg_Hbls; whbbl = wrt_avg_Hbbl
+    bgc_physics_subcycle = .false.; bgc_physics_timestep = 0.0_rp
+    bgc_subcycle_pos = .false.; bgc_subcycle_diag = 0
     rewind(unit)
     read(unit, nml=bgc_settings, iostat=ios)
     if (ios > 0) error stop 'read_avg_namelist: bgc_settings'
+    if (bgc_physics_subcycle) error stop 'BGC_SETTINGS: bgc_physics_subcycle = .true.: BGC tracer '// &
+         'subcycling is not on the GPU yet; set bgc_physics_subcycle = .false. to run on the GPU'
     if (ios < 0) then
       wrt_bgc_avg = .false.; wrt_bgc_his = .false.
     endif

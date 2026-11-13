@@ -217,6 +217,13 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- Namelists written from UCLA ROMS's current template (after 0.14.0) run:
+  `&bgc_settings` `bgc_physics_subcycle` and `bgc_physics_timestep` (and the
+  testing keys `bgc_subcycle_pos`, `bgc_subcycle_diag`) and
+  `&marbl_biogeochemistry_settings` `marbl_balance` are read. Before, any
+  of them stopped the run at the namelist read. BGC tracer subcycling is
+  not on the GPU yet: `bgc_physics_subcycle = .true.` stops the run;
+  `marbl_balance = .true.` is ignored with a note (see `NAMELIST_COMPAT`).
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
   depth-integrated internal-tide energy flux `up`/`vp` of the parent,
   written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS

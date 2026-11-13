@@ -86,6 +86,7 @@ contains
   subroutine read_marbl_namelist(unit, nml_dir, nt_bgc)
     ! &marbl_biogeochemistry_settings as the CPU model; MARBL is on when
     ! nt_bgc > 0 in param_settings.
+    use comm_mod, only: comm_rank
     integer, intent(in) :: unit
     character(len=*), intent(in) :: nml_dir
     integer(ip), intent(in) :: nt_bgc
@@ -94,8 +95,13 @@ contains
     real(rp) :: tstep
     character(len=32) :: marbl_tracers_to_write(64)
     character(len=400) :: marbl_diagnostics_to_write(64)
+    ! marbl_balance (UCLA ROMS after 0.14.0, #430) ships MARBL columns between CPU
+    ! ranks and changes no result; here every GPU computes the wet columns
+    ! of its tile (&tile_settings balances them), so it is read and ignored.
+    logical :: marbl_balance
     namelist /marbl_biogeochemistry_settings/ marbl_config_file, marbl_timestep, &
-         marbl_tracers_to_write, marbl_diagnostics_to_write, use_constant_Fe, constant_Fe_value
+         marbl_tracers_to_write, marbl_diagnostics_to_write, use_constant_Fe, constant_Fe_value, &
+         marbl_balance
     marbl_on = (nt_bgc > 0)
     if (.not. marbl_on) return
     marbl_config_file = 'marbl_in'
@@ -104,9 +110,12 @@ contains
     marbl_diagnostics_to_write = ''
     use_constant_Fe = .false.
     constant_Fe_value = 3.0e-3_rp
+    marbl_balance = .false.
     rewind(unit)
     read(unit, nml=marbl_biogeochemistry_settings, iostat=ios)
     if (ios > 0) error stop 'marbl_biogeochemistry_settings: read error'
+    if (marbl_balance .and. comm_rank() == 0) write(*,'(a)') 'MARBL: marbl_balance = .true. is ignored '// &
+         'on the GPU (each GPU computes the wet columns of its tile; &tile_settings balances them)'
     marbl_trc_list = marbl_tracers_to_write
     if (use_constant_Fe) then
       if (constant_Fe_value < 0.0_rp) error stop 'use_constant_Fe: constant_Fe_value must be non-negative'

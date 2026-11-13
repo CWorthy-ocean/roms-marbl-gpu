@@ -12,6 +12,18 @@
 #   0.12.0  &cdr_lite_settings  cdr_carbonate_sensitivity_time_interpolation
 #   0.13.0  &v_sponge_settings  v_sponge_trc
 #
+# Keys of UCLA ROMS after 0.14.0 (dev) that roms_gpu reads, so that a
+# namelist written from its template runs:
+#   &bgc_settings  bgc_physics_subcycle, bgc_physics_timestep (BGC tracer
+#     subcycling, #428), and its testing keys bgc_subcycle_pos and
+#     bgc_subcycle_diag. Subcycling is not on the GPU yet:
+#     bgc_physics_subcycle = .true. stops the run at start-up; the other
+#     three keys act only with it.
+#   &marbl_biogeochemistry_settings  marbl_balance (#430), which ships MARBL
+#     columns between CPU ranks and changes no result. Each GPU computes
+#     the wet columns of its tile (&tile_settings balances them), so
+#     .true. is ignored, with a start-up note.
+#
 # GPU-only additions: the optional group &tile_settings (tile balancing),
 # &passive_tracers (n_passive, init_mode, write_passive), and in
 # &param_settings the keys n, nsub_x, nsub_e and ntrc_bio.
