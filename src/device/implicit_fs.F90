@@ -1307,15 +1307,16 @@ contains
   subroutine fs_nan_stop(what, it)
     ! A non-finite <p,q> or residual norm in fs_pcg (the reduced values are the same on every
     ! compute rank, so every rank comes here): the run is unstable. Stop it instead of iterating
-    ! to fs_maxit with NaNs (the same test and message as the CPU's fs_pcg): rank 0 writes the
+    ! to fs_maxit with NaNs (the same test and message as the CPU's fs_pcg, in the style of
+    ! fs_unconv_stop): rank 0 writes the
     ! message, every compute rank meets the others once more (so the message is out before any
     ! rank aborts) and stops all ranks, writers included, by comm_abort (MPI_Abort).
     character(len=*), intent(in) :: what
     integer, intent(in) :: it
     character(len=200) :: msg
     real(rp) :: x(1), y(1)
-    write(msg, '(A,A,A,I0,A,I0,A)') 'IMPLICIT_FS: non-finite ', what, ' in the free-surface solve (step ', &
-         iic, ', iteration ', it, '): the run is unstable, stopping'
+    write(msg, '(A,A,A,I0,A,I0,A)') 'IMPLICIT_FS: the free-surface solve met a non-finite ', what, ' (step ', &
+         iic, ', iteration ', it, '): the run is unstable'
     if (talk) then
       write(*,'(1x,A)') trim(msg)
       flush(6)
