@@ -63,7 +63,8 @@
 #   fs_verbose  1: FS_SOLVE line per step; 2: + FS_VOL, FS_SRC,      [0]
 #               FS_WALL lines (FS_SRC also with fs_mode = 'split')
 # Solver and development settings: read as in UCLA ROMS, where the
-# defaults are the recommended values and the keys may change: fs_theta,
+# defaults are the recommended values, the keys may change between
+# versions and C-Star and Forge do not expose them: fs_theta,
 # fs_theta_div, fs_maxit (a solve that reaches it without meeting fs_tol
 # stops the run), fs_precond, fs_mg_levels, fs_mg_nu, fs_mg_smoother,
 # fs_mg_lag, fs_mg_faces, fs_drag_implicit, fs_warm, fs_tang_nudge,
