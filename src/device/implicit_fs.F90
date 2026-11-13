@@ -50,13 +50,14 @@ module implicit_fs_gpu
   use formulas, only: g
   use halo_mod, only: halo_fill_zuv_n
   use geom, only: set_depth
-  use comm_mod, only: comm_allreduce_sum, comm_allreduce_max, comm_world_rank, comm_abort
+  use comm_mod, only: comm_allreduce_sum, comm_allreduce_max, comm_world_rank, comm_abort, comm_shm_init, comm_fs_sum, &
+       comm_fs_sum_stats
   use rivers_mod, only: river_on, rf_flx, rivers_fs_map
   use cdr_src_mod, only: cdr_vol_on, cdr_fs_src
   use run_timers, only: wall_time
   use fs_data
   use fs_mg, only: mg_build_layout, mg_setup, mg_vcycle
-  use fs_ipc, only: ipc_init, ipc_on
+  use fs_ipc, only: ipc_init, ipc_on, ipc_set_opts
 #ifdef USE_CUDA
   use cudafor
   use arch_mod, only: work_stream
@@ -132,7 +133,7 @@ contains
     if (trim(fs_gpu_coarse) /= 'device' .and. trim(fs_gpu_coarse) /= 'host') &
          error stop "IMPLICIT_FS: fs_gpu_coarse must be 'device' or 'host'"
     dev_glob = (trim(fs_gpu_coarse) == 'device')
-    if (fs_gpu_opt < 0 .or. fs_gpu_opt > 511) error stop 'IMPLICIT_FS: fs_gpu_opt must lie in [0, 511]'
+    if (fs_gpu_opt < 0 .or. fs_gpu_opt > 65535) error stop 'IMPLICIT_FS: fs_gpu_opt must lie in [0, 65535]'
     if (fs_gpu_timers < 0 .or. fs_gpu_timers > 2) error stop 'IMPLICIT_FS: fs_gpu_timers must be 0, 1 or 2'
     call fs_opt_flags()
     if (talk) then
@@ -156,7 +157,7 @@ contains
       write(*,'(1x,A,A,A,I6,A,A,A,L1,A)') 'IMPLICIT_FS: fs_mg_faces = ', trim(fs_mg_faces), &
            ' (CPU layout keys read, not used: fs_mg_gather =', fs_mg_gather, ' fs_mg_global_on = ', &
            trim(fs_mg_global_on), ' fs_exch_thin = ', fs_exch_thin, ')'
-      write(*,'(1x,A,A,A,I2,A,I3)') 'IMPLICIT_FS: fs_gpu_coarse = ', trim(fs_gpu_coarse), ' fs_gpu_graph =', &
+      write(*,'(1x,A,A,A,I2,A,I6)') 'IMPLICIT_FS: fs_gpu_coarse = ', trim(fs_gpu_coarse), ' fs_gpu_graph =', &
            fs_gpu_graph, ' fs_gpu_opt =', fs_gpu_opt
       if (fs_selftest > 0) write(*,'(1x,A)') 'IMPLICIT_FS: note: fs_selftest is not implemented on the GPU (ignored)'
     endif
@@ -199,6 +200,7 @@ contains
   subroutine fs_init()
     integer(ip) :: is, ie, js, je, nx, ny
     integer :: m
+    logical :: shm_ok
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     nx = decomp%nx; ny = decomp%ny
     allocate(unu(is:ie, js:je), unv(is:ie, js:je), usu(is:ie, js:je), usv(is:ie, js:je), &
@@ -232,10 +234,16 @@ contains
     m = int(RG_NF * (max(nx, ny) + 2))
     call fs_alloc_bufs(m)
     if (o_ipc) then
+      call ipc_set_opts(o_ipf, o_gmb)        ! fs_gpu_opt 16384, 32768
       call ipc_init(int(m), [int(decomp%nbr_w), int(decomp%nbr_e), int(decomp%nbr_s), int(decomp%nbr_n)], &
            int(nx), int(ny), int(is), int(ie), int(js), int(je), &
            [decomp%edge_w, decomp%edge_e, decomp%edge_s, decomp%edge_n], work_stream)
       if (talk) write(*,'(1x,A,L1)') 'IMPLICIT_FS: fs_gpu_opt 256: rings by CUDA IPC: ', ipc_on
+    endif
+    if (o_shm) then
+      ! fs_gpu_opt 512: the PCG's reductions through shared memory when all compute ranks share a node
+      call comm_shm_init(shm_ok)
+      if (talk) write(*,'(1x,A,L1)') 'IMPLICIT_FS: fs_gpu_opt 512: PCG reductions through shared memory: ', shm_ok
     endif
     if (mg_on) call mg_build_layout()
     ready = .true.
@@ -1165,12 +1173,20 @@ contains
   ! PCG (FS_SPEC 4)
   !======================================================================
   subroutine fs_pcg(its, resid, conv)
+    ! Multigrid (CPU 519365ab): the kernel of <p,q> also writes the area-weighted partials of <r,q>
+    ! and <q,q> (slots 2, 3, reduced with <p,q>), which give the new residual norm |r - alpha q|^2 =
+    ! |r|^2 - 2 alpha <r,q> + alpha^2 <q,q> before the preconditioner. When that estimate is at most
+    ! 4 tol2, the update kernel also writes the residual norm's partials (precond's expression), they
+    ! are summed and reduced, and a converged solve ends without the V-cycle of the final residual,
+    ! which would not be used. The stopping test uses the directly summed norm as before (each slot is
+    ! summed by its own fixed-order tree): same iterates, same iteration count, one V-cycle less.
     integer, intent(out) :: its
     real(rp), intent(out) :: resid
     logical, intent(out) :: conv
     integer(ip) :: i, j, nx, ny
     integer :: it
-    real(rp) :: loc(4), glob(4), rz, rznew, alpha, beta, pq, tol2, bn2
+    real(rp) :: loc(4), glob(4), rz, rznew, alpha, beta, pq, tol2, bn2, rn2
+    logical :: chk
     nx = decomp%nx; ny = decomp%ny
     conv = .true.; its = 0; resid = 0.0_rp
     call ring(1, xx, fdum, fdum, fdum, fdum, fdum, .true.)
@@ -1194,16 +1210,18 @@ contains
     enddo
     call tq(T_START)
     call fs_sum(4, loc)
-    call comm_allreduce_sum(4, loc, glob)
+    call comm_fs_sum(4, loc, glob)
     call tq(T_RED)
     rz = glob(1); bn2 = glob(4)
     if (bn2 <= 0.0_rp) then
       call zero2(xx)
       return
     endif
+    if (.not. fs_finite(glob(2))) call fs_nan_stop('residual norm', 0)
     tol2 = fs_tol * fs_tol * bn2
     resid = sqrt(glob(2) / bn2)
     if (glob(2) <= tol2) return
+    rn2 = glob(2)
     conv = .false.
     do it = 1, fs_maxit
       its = it
@@ -1211,20 +1229,33 @@ contains
       call tq(T_PEX)
       call fs_apply(pd, qq, .true.)
       call tq(T_OP)
-      call fs_sum(1, loc)
-      call comm_allreduce_sum(1, loc(1:1), glob(1:1))
+      call fs_sum(merge(3, 1, mg_on), loc)
+      call comm_fs_sum(merge(3, 1, mg_on), loc(1:3), glob(1:3))
       call tq(T_RED)
       pq = glob(1)
+      if (.not. fs_finite(pq)) call fs_nan_stop('<p,q>', it)
       alpha = rz / pq
       if (mg_on) then
+        chk = (rn2 - 2.0_rp * alpha * glob(2) + alpha * alpha * glob(3) <= 4.0_rp * tol2)
         CUF_DO2
         do j = 1, ny
           do i = 1, nx
             xx(i, j) = xx(i, j) + alpha * pd(i, j)
             rr(i, j) = rr(i, j) - alpha * qq(i, j)
+            if (chk) fs_part(i + (j - 1) * nx, 1) = act(i, j) * rr(i, j) * rr(i, j) * pm(i, j) * pn(i, j)
           enddo
         enddo
         call tq(T_VEC)
+        if (chk) then                       ! the norm of the new residual, summed as precond's slot 2
+          call fs_sum(1, loc)
+          call comm_fs_sum(1, loc(1:1), glob(1:1))
+          call tq(T_RED)
+          if (.not. fs_finite(glob(1))) call fs_nan_stop('residual norm', it)
+          if (glob(1) <= tol2) then
+            resid = sqrt(glob(1) / bn2)
+            conv = .true.; exit
+          endif
+        endif
         call precond()
       else
         CUF_DO2
@@ -1240,9 +1271,11 @@ contains
         call tq(T_PC)
       endif
       call fs_sum(merge(3, 2, mg_on), loc)
-      call comm_allreduce_sum(merge(3, 2, mg_on), loc(1:3), glob(1:3))
+      call comm_fs_sum(merge(3, 2, mg_on), loc(1:3), glob(1:3))
       call tq(T_RED)
       rznew = glob(1)
+      if (.not. fs_finite(glob(2))) call fs_nan_stop('residual norm', it)
+      rn2 = glob(2)
       resid = sqrt(glob(2) / bn2)
       if (glob(2) <= tol2) then
         conv = .true.; exit
@@ -1264,14 +1297,45 @@ contains
     its = min(its, fs_maxit)
   end subroutine fs_pcg
 
+  logical function fs_finite(x)
+    ! x is neither NaN nor +-Inf (exponent bits, not a comparison, so that no optimisation that
+    ! assumes finite values can remove the test)
+    real(rp), intent(in) :: x
+    fs_finite = (ibits(transfer(x, 0_8), 52, 11) /= 2047)
+  end function fs_finite
+
+  subroutine fs_nan_stop(what, it)
+    ! A non-finite <p,q> or residual norm in fs_pcg (the reduced values are the same on every
+    ! compute rank, so every rank comes here): the run is unstable. Stop it instead of iterating
+    ! to fs_maxit with NaNs (the same test and message as the CPU's fs_pcg, in the style of
+    ! fs_unconv_stop): rank 0 writes the
+    ! message, every compute rank meets the others once more (so the message is out before any
+    ! rank aborts) and stops all ranks, writers included, by comm_abort (MPI_Abort).
+    character(len=*), intent(in) :: what
+    integer, intent(in) :: it
+    character(len=200) :: msg
+    real(rp) :: x(1), y(1)
+    write(msg, '(A,A,A,I0,A,I0,A)') 'IMPLICIT_FS: the free-surface solve met a non-finite ', what, ' (step ', &
+         iic, ', iteration ', it, '): the run is unstable'
+    if (talk) then
+      write(*,'(1x,A)') trim(msg)
+      flush(6)
+    endif
+    x = 0.0_rp
+    call comm_allreduce_max(1, x, y)
+    call comm_abort(1)
+  end subroutine fs_nan_stop
+
   subroutine fs_apply(x, y, dot)
-    ! y = A x on the interior (FS_SPEC 3.6); dot: partial sums x y in slot 1
+    ! y = A x on the interior (FS_SPEC 3.6); dot: partial sums x y in slot 1 and, with multigrid,
+    ! act pm pn r y and act pm pn y y in slots 2, 3 (fs_pcg: the estimate of the new residual norm)
     real(rp), FSD intent(in) :: x(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), FSD intent(inout) :: y(decomp%is:decomp%ie, decomp%js:decomp%je)
     logical, intent(in) :: dot
     integer(ip) :: i, j, nx, ny
-    logical :: dt_
-    nx = decomp%nx; ny = decomp%ny; dt_ = dot
+    logical :: dt_, est
+    real(rp) :: w
+    nx = decomp%nx; ny = decomp%ny; dt_ = dot; est = dot .and. mg_on
     CUF_DO2
     do j = 1, ny
       do i = 1, nx
@@ -1279,6 +1343,11 @@ contains
              + cu(i + 1, j) * (x(i, j) - x(i + 1, j)) + cu(i, j) * (x(i, j) - x(i - 1, j)) &
              + cv(i, j + 1) * (x(i, j) - x(i, j + 1)) + cv(i, j) * (x(i, j) - x(i, j - 1)))
         if (dt_) fs_part(i + (j - 1) * nx, 1) = x(i, j) * y(i, j)
+        if (est) then
+          w = act(i, j) * pm(i, j) * pn(i, j)
+          fs_part(i + (j - 1) * nx, 2) = w * rr(i, j) * y(i, j)
+          fs_part(i + (j - 1) * nx, 3) = w * y(i, j) * y(i, j)
+        endif
       enddo
     enddo
   end subroutine fs_apply
@@ -1432,10 +1501,13 @@ contains
 
   subroutine fs_cost_print()
     ! end of the run: FS_STAT (as the CPU, always); with fs_verbose >= 1 also the GPU's communication
-    ! counts per solve (FS_STAT per solve); with fs_gpu_timers 1 the FS_COST pieces, with 2 FS_WIN
-    ! (their reductions only then)
-    real(8) :: gm(ntm), lm(ntm), x(2), y(2)
+    ! counts per solve (FS_STAT per solve); with ROMS_GPU_FS_SHM_CMP and the shared-memory sums on, their
+    ! comparison with MPI_Allreduce; with fs_gpu_timers 1 the FS_COST pieces, with 2 FS_WIN (their
+    ! reductions only then)
+    real(8) :: gm(ntm), lm(ntm), x(2), y(2), c(2), cg(2)
     integer :: i
+    logical :: son, scmp
+    integer(8) :: sn, sd
     if (talk) then
       write(*,'(1x,A,I7,A,F9.2,A,I6)') 'FS_STAT solves', n_solve, ' mean its', real(n_its, 8) / max(n_solve, 1), &
            ' unconverged', n_unconv
@@ -1443,6 +1515,13 @@ contains
       if (fs_verbose >= 1) write(*,'(1x,A,4(A,F9.2))') 'FS_STAT per solve:', ' ring rounds', &
            real(n_ring, 8) / max(n_solve, 1), ' reductions', real(n_red, 8) / max(n_solve, 1), &
            ' V-cycles', real(n_vc, 8) / max(n_solve, 1), ' host gathers', real(n_gath, 8) / max(n_solve, 1)
+    endif
+    call comm_fs_sum_stats(son, scmp, sn, sd)    ! son, scmp: the same on every compute rank
+    if (son .and. scmp) then
+      c(1) = real(sn, 8); c(2) = real(sd, 8)
+      call comm_allreduce_max(2, c, cg)
+      if (talk) write(*,'(1x,A,I12,A,I10,A)') 'FS_STAT shared-memory sums (ROMS_GPU_FS_SHM_CMP):', &
+           nint(cg(1), 8), ' reductions, ', nint(cg(2), 8), ' values differing from MPI_Allreduce (max over ranks)'
     endif
     if (fs_gpu_timers < 1) return
     lm = tm

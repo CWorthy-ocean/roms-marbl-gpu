@@ -77,8 +77,10 @@ module fs_data
   integer :: fs_gpu_timers = 0
   character(len=8) :: fs_gpu_coarse = 'device'
   integer :: fs_gpu_graph = 0         ! 1: the device global levels' down and up legs as CUDA graphs
-  ! fs_gpu_opt (free-surface optimization session): bit mask of the latency levers of the solve,
-  ! none of which changes the arithmetic (each path bit-identical to the 0 path):
+  ! fs_gpu_opt (free-surface optimization sessions): bit mask of the latency levers of the solve.
+  ! Every bit except 512 leaves the arithmetic unchanged (each path bit-identical to the 0 path); 512
+  ! adds the PCG's partial sums of four ranks in a different order than MPI_Allreduce (rounding level,
+  ! GPU only: iteration counts unchanged, fields at most 1.5 times the CPU's regular-strict build spread):
   !   1 the ring exchanges through mapped pinned host memory (the pack kernel writes the host
   !     send buffers, host MPI, the unpack kernel reads the host receive buffers) instead of
   !     GPU-aware MPI on device buffers
@@ -100,10 +102,29 @@ module fs_data
   !     kernels, no host synchronisation or MPI per exchange; fs_ipc), when every rank's
   !     neighbours are on its node, otherwise the MPI rings; and the multigrid vector gather the
   !     same way when all compute ranks (at most 4) share one node
-  ! Default 471 = all but 8 and 32, which were slower (sargasso and Pac FS window: 8 +0.2 / +0.15 ms,
+  ! 512 the PCG's reductions (fs_pcg) through an MPI-3 shared-memory window when all compute ranks
+  !     (1, 2 or 4) share one node (comm_fs_sum: pairwise sums in compute-rank order on every rank),
+  !     otherwise MPI_Allreduce
+  ! 1024 the host factor of the coarsest level (fs_mgg, after each rebuild of the coarse operators) made
+  !     in the first coarsest solve after the rebuild, while the device runs the PCG start and the
+  !     first down leg, instead of at the end of the rebuild with the device idle
+  ! 2048 with 256 and the vector gather by IPC: the coarse coefficients' gather of each rebuild
+  !     (fs_mgg) through the same IPC buffers (device-initiated, no host synchronisation) instead of
+  !     GPU-aware MPI
+  ! 4096 with even fs_mg_nu and the red-black smoother: one kernel per sweep of the global levels (fs_mgg)
+  !     instead of one per colour, reading one array and writing the other; a second-colour cell forms
+  !     its first-colour neighbours' new values itself with the same expression (bit-identical); the
+  !     down leg's first sweep reads a plane of zeros instead of a zeroed level (no zeroing kernels)
+  ! 8192 the same for the fine level and the distributed coarse levels (fs_mg) of at most 100000 cells
+  !     per tile, the rings between the sweeps on the array the next sweep reads
+  ! 16384 with 256: a CUDA IPC ring's put and wait in one kernel instead of two (fs_ipc kring_f, kring_p)
+  ! 32768 with 256: the multigrid gathers' IPC put by several blocks instead of one (kgput_m, kgput_vm)
+  ! Default 65495 = all but 8 and 32, which were slower (sargasso and Pac FS window: 8 +0.2 / +0.15 ms,
   ! 32 +0.2 / +0.3 ms with 128 on: graph-launched kernels beat the cooperative kernels' grid syncs).
+  ! (471 before bits 512 .. 32768: FS window sargasso 2x2 5.01 -> 3.43 ms, Iceland0 2x2 5.00 -> 3.60,
+  ! Pac 8x1 on two nodes 16.3 -> 14.8, with the converged-residual V-cycle skipped.)
   ! fs_gpu_timers 2: the FS window (device synchronised at entry and exit of fs_step) only.
-  integer :: fs_gpu_opt = 471
+  integer :: fs_gpu_opt = 65495
   ! fs_nsub (CPU b6325f06): implicit barotropic sub-steps of dt/fs_nsub per 3-D step (1..4); rufrc is
   ! held over the step, sub-steps after the first add the pressure gradient of their own sea-level
   ! change since n (weight beta1), the generalized-alpha rates are carried from sub-step to sub-step;
@@ -178,7 +199,8 @@ module fs_data
   real(rp), allocatable, target :: fs_hres0(:)
 #endif
   logical :: o_ring = .false., o_red = .false., o_cvec = .false., o_gath = .false., o_chol = .false.
-  logical :: o_fleg = .false., o_cc = .false., o_vgr = .false., o_ipc = .false.
+  logical :: o_fleg = .false., o_cc = .false., o_vgr = .false., o_ipc = .false., o_shm = .false.
+  logical :: o_fac = .false., o_cgi = .false., o_g2g = .false., o_g2f = .false., o_ipf = .false., o_gmb = .false.
   ! fs_gpu_opt 128: a V-cycle recording is open (the host actions go through vg_point_p, which
   ! closes the stretch's graph, launches it, does the action and opens the next stretch)
   logical :: vg_rec = .false.
@@ -266,7 +288,10 @@ contains
     o_ring = iand(fs_gpu_opt, 1) /= 0; o_red = iand(fs_gpu_opt, 2) /= 0; o_cvec = iand(fs_gpu_opt, 4) /= 0
     o_gath = iand(fs_gpu_opt, 8) /= 0; o_chol = iand(fs_gpu_opt, 16) /= 0
     o_fleg = iand(fs_gpu_opt, 32) /= 0; o_cc = iand(fs_gpu_opt, 64) /= 0; o_vgr = iand(fs_gpu_opt, 128) /= 0
-    o_ipc = iand(fs_gpu_opt, 256) /= 0
+    o_ipc = iand(fs_gpu_opt, 256) /= 0; o_shm = iand(fs_gpu_opt, 512) /= 0
+    o_fac = iand(fs_gpu_opt, 1024) /= 0; o_cgi = iand(fs_gpu_opt, 2048) /= 0
+    o_g2g = iand(fs_gpu_opt, 4096) /= 0; o_g2f = iand(fs_gpu_opt, 8192) /= 0
+    o_ipf = iand(fs_gpu_opt, 16384) /= 0; o_gmb = iand(fs_gpu_opt, 32768) /= 0
     if (fs_gpu_timers == 1) o_vgr = .false.
 #ifndef USE_CUDA
     o_ring = .false.; o_red = .false.; o_cvec = .false.; o_gath = .false.; o_fleg = .false.; o_vgr = .false.
@@ -544,7 +569,7 @@ contains
 #endif
     if (fs_gpu_timers /= 1 .or. fs_capt) return
 #ifdef USE_CUDA
-    ierr = cudaStreamSynchronize(work_stream)
+    ierr = cudaDeviceSynchronize()
 #endif
     tm_t0 = wall_time()
   end subroutine tq0
@@ -557,7 +582,7 @@ contains
 #endif
     if (fs_gpu_timers /= 1 .or. fs_capt) return
 #ifdef USE_CUDA
-    ierr = cudaStreamSynchronize(work_stream)
+    ierr = cudaDeviceSynchronize()
 #endif
     t = wall_time()
     tm(id) = tm(id) + (t - tm_t0)
@@ -566,14 +591,17 @@ contains
 
   subroutine tw(e)
     ! fs_gpu_timers 2: the FS window, device synchronised at entry (e = 0) and exit (e = 1) of
-    ! fs_step; steps after the first 10 of the run are summed
+    ! fs_step; steps after the first 10 of the run are summed. The whole device is synchronised
+    ! (here and in tq0, tq): the 3-D kernels run on the default stream, and a synchronisation of
+    ! work_stream alone let the clock start while the device was still working through them (one
+    ! GPU, where no exchange holds the host back: 14.3 ms reported for a 4.9 ms window)
     integer, intent(in) :: e
 #ifdef USE_CUDA
     integer :: ierr
 #endif
     if (fs_gpu_timers /= 2) return
 #ifdef USE_CUDA
-    ierr = cudaStreamSynchronize(work_stream)
+    ierr = cudaDeviceSynchronize()
 #endif
     if (e == 0) then
       tw_t0 = wall_time()

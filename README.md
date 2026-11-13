@@ -259,7 +259,15 @@ v0.1.2-beta, bit for bit.
     window is 5.0 ms per step on the 1-node cases and 16.3 ms on Pac: two
     solves of 4.6-6 iterations each, bound by latency (halo exchanges,
     reductions, V-cycles), so the second sub-step adds a fixed 2.4 ms
-    (1 node) to 5.5 ms (Pac) per step.
+    (1 node) to 5.5 ms (Pac) per step. With this branch's latency levers
+    (`fs_gpu_opt = 65495`, below; measured at 212c26f, this branch before
+    its rebase onto the ucla-roms review fixes, same settings): window 3.4,
+    3.6 and 14.8 ms, step 15.0, 24.7 and 114.3 ms (median 14.8, 24.5,
+    112.0), 0.41, 0.75 and 0.94 of the split step's median. In 2-day runs
+    of the same binary (median of three runs per configuration) the
+    implicit step takes 0.42 (sargasso), 0.45 (hawaii), 0.44 (warmpool),
+    0.74 (Iceland0, 1 node), 0.91 (MiniPac with MARBL, 1 node) and 0.95
+    (Pac, 2 nodes) of the split step.
   - Tiling: the implicit step is not bitwise independent of the tiling.
     Its results differ between tilings at about the level of `fs_tol`:
     sargasso, 20 steps, the rms differences between 1x1, 2x2 and 4x1 GPU
@@ -273,6 +281,16 @@ v0.1.2-beta, bit for bit.
     during the port's development, not on this branch's gate cases, of
     which only Pac has rivers. Pipe sources and MPI_MASKING are not
     available in the GPU model.
+  `fs_gpu_opt` is a bit mask of latency levers (documented in
+  `src/device/implicit_fs_data.F90`); the default 65495 turns on all that
+  were faster. All but one leave the result bit-identical to
+  `fs_gpu_opt = 0`; bit 512 (the solver's sums over the four ranks of one
+  node through shared memory) adds them in a different order than
+  `MPI_Allreduce`, a rounding-level difference (iteration counts unchanged;
+  fields in rms at most 2.1 times the CPU's regular-to-strict build spread,
+  at single points up to 3.6 times). A
+  solve that meets a NaN or Inf stops the run with a message (the same
+  test and message as the implicit free surface of UCLA ROMS).
 
 ## Numerics
 

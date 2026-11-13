@@ -37,6 +37,17 @@ module fs_mg
   ! FS_STAT: the ring rounds inside the recorded graphs (IPC rings and the IPC gather, which are
   ! kernels, not host actions); a replay adds them (the host actions count themselves in vg_act)
   integer(8) :: vg_ring0 = 0, vg_ring_g = 0
+  ! fs_gpu_opt 8192 (even fs_mg_nu, red-black): one kernel per sweep of the fine and the distributed
+  ! levels, reading one array and writing the other (zz <-> zzb, mx_ <-> mxb_); the down leg's first
+  ! sweep reads zz0 / mz_, zeros that are never written (instead of zz, mx_ zeroed)
+  real(rp), FSD allocatable :: zzb(:,:), zz0(:,:), mxb_(:,:,:), mz_(:,:,:)
+  logical :: g2f = .false.
+  ! g2l(l): the fused sweep on level l (0 = fine). Only on levels of at most G2_MAXC cells per tile, where a
+  ! sweep kernel costs its launch latency: on larger tiles the fused kernel's extra arithmetic (a second-colour
+  ! cell evaluates five stencils) costs more than the saved launch (Pac 8 x 1, fine level 232 x 960: +0.2 ms
+  ! per step with every level fused)
+  integer, parameter :: G2_MAXC = 100000
+  logical :: g2l(0:mg_maxl) = .false.
 #ifdef USE_CUDA
   type(cudaGraphExec) :: vg_exec(VG_MAX)
 #endif
@@ -68,6 +79,16 @@ contains
              mw_(0:mgx + 1, 0:mgy + 1, mg_ld), ms_(0:mgx + 1, 0:mgy + 1, mg_ld), md_(0:mgx + 1, 0:mgy + 1, mg_ld), &
              mt_(0:mgx + 1, 0:mgy + 1, mg_ld))
     mx_ = 0; mb_ = 0; me_ = 0; mw_ = 0; ms_ = 0; md_ = 0; mt_ = 0
+    g2f = o_g2f .and. .not. jac_sm .and. mod(fs_mg_nu, 2) == 0
+    do l = 0, mg_ld
+      g2l(l) = g2f .and. int(mg_nx(l), 8) * int(mg_ny(l), 8) <= G2_MAXC
+    enddo
+    g2f = any(g2l(0:mg_ld))
+    if (g2f) then
+      allocate(zzb(decomp%is:decomp%ie, decomp%js:decomp%je), zz0(decomp%is:decomp%ie, decomp%js:decomp%je), &
+               mxb_(0:mgx + 1, 0:mgy + 1, mg_ld), mz_(0:mgx + 1, 0:mgy + 1, 1))
+      zzb = 0; zz0 = 0; mxb_ = 0; mz_ = 0
+    endif
     l = mg_ld
     allocate(db_v(mg_nx(l) * mg_ny(l)), db_c(3 * mg_nx(l) * mg_ny(l) + mg_nx(l) + mg_ny(l)))
     allocate(hb_b(mg_nx(l) * mg_ny(l)), hb_x(mg_nx(l) * mg_ny(l)), hb_c(3 * mg_nx(l) * mg_ny(l) + mg_nx(l) + mg_ny(l)))
@@ -418,19 +439,49 @@ contains
     endif
 #endif
     nx = decomp%nx; ny = decomp%ny
+    if (g2l(0)) then
+      ! fs_gpu_opt 8192: sweep 1 zz0 -> zzb (no exchange: zz0's halo is zero, as zz's after zero2),
+      ! then alternately zzb -> zz, zz -> zzb, each after the ring of the array it reads (ends in zz)
+      do k = 1, fs_mg_nu
+        if (k == 1) then
+          call sweep_fine2(1, zz0, zzb)
+        else if (mod(k, 2) == 0) then
+          call ring_fine_a(zzb)
+          call sweep_fine2(1, zzb, zz)
+        else
+          call ring_mg(0)
+          call sweep_fine2(1, zz, zzb)
+        endif
+      enddo
+    else
     call zero2(zz)
     do k = 1, fs_mg_nu
       if (k > 1) call ring_mg(0)
       call smooth_fine(1)
     enddo
+    endif
     call ring_mg(0)
     call resid_restrict(0)
     do l = 1, mg_ld - 1
+      if (g2l(l)) then
+        do k = 1, fs_mg_nu
+          if (k == 1) then
+            call sweep_c2(l, 1, mz_, 1, mxb_, int(l))
+          else if (mod(k, 2) == 0) then
+            call ring_mg_a(l, mxb_)
+            call sweep_c2(l, 1, mxb_, int(l), mx_, int(l))
+          else
+            call ring_mg(l)
+            call sweep_c2(l, 1, mx_, int(l), mxb_, int(l))
+          endif
+        enddo
+      else
       call zero_plane(l)
       do k = 1, fs_mg_nu
         if (k > 1) call ring_mg(l)
         call smooth_c(l, 1)
       enddo
+      endif
       call ring_mg(l)
       call resid_restrict(l)
     enddo
@@ -474,16 +525,40 @@ contains
     endif
     do l = mg_ld - 1, 1, -1
       call prolong(l)
+      if (g2l(l)) then
+        do k = 1, fs_mg_nu                ! alternately mx_ -> mxb_, mxb_ -> mx_ (ends in mx_)
+          if (mod(k, 2) == 1) then
+            call ring_mg(l)
+            call sweep_c2(l, 2, mx_, int(l), mxb_, int(l))
+          else
+            call ring_mg_a(l, mxb_)
+            call sweep_c2(l, 2, mxb_, int(l), mx_, int(l))
+          endif
+        enddo
+        cycle
+      endif
       do k = 1, fs_mg_nu
         call ring_mg(l)
         call smooth_c(l, 2)
       enddo
     enddo
     call prolong(0)
+    if (g2l(0)) then
+      do k = 1, fs_mg_nu                  ! alternately zz -> zzb, zzb -> zz (ends in zz)
+        if (mod(k, 2) == 1) then
+          call ring_mg(0)
+          call sweep_fine2(2, zz, zzb)
+        else
+          call ring_fine_a(zzb)
+          call sweep_fine2(2, zzb, zz)
+        endif
+      enddo
+    else
     do k = 1, fs_mg_nu
       call ring_mg(0)
       call smooth_fine(2)
     enddo
+    endif
 #ifdef USE_CUDA
     if (rec) then
       ! the last stretch (no action after it)
@@ -706,12 +781,134 @@ contains
     ! as ring; >= 1: the coarse plane, rows 1..ny, columns 1..nx, a missing
     ! neighbour gives a zero halo: the CPU's mg_exch)
     integer, intent(in) :: l
-    integer(ip) :: nxl, nyl, m, mx, w, e, s, n, nb(4), ll
     if (l == 0) then
       call ring(1, zz, fdum, fdum, fdum, fdum, fdum, .true.)
       call tq(T_MEX)
       return
     endif
+    call ring_mg_a(l, mx_)
+  end subroutine ring_mg
+
+  subroutine ring_fine_a(x)
+    ! ring_mg(0) of the array x (zzb)
+    real(rp), FSD intent(inout) :: x(decomp%is:decomp%ie, decomp%js:decomp%je)
+    call ring(1, x, fdum, fdum, fdum, fdum, fdum, .true.)
+    call tq(T_MEX)
+  end subroutine ring_fine_a
+
+  subroutine sweep_fine2(mode, xs, xd)
+    ! fs_gpu_opt 8192: one red-black sweep of the fine level in one kernel, from xs (halo current) into
+    ! xd, as gsweep2 (fs_mgg) for the global levels: a second-colour cell forms the new values of its
+    ! four first-colour neighbours with smooth_fine's expression (xs's halo value where the neighbour
+    ! is a halo cell), then its own; bit-identical to smooth_fine
+    integer, intent(in) :: mode
+    real(rp), FSD intent(in) :: xs(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), FSD intent(inout) :: xd(decomp%is:decomp%ie, decomp%js:decomp%je)
+    integer(ip) :: i, j, nx, ny, p1
+    real(rp) :: vw, ve, vs, vn
+    nx = decomp%nx; ny = decomp%ny; p1 = mod(1 + mode, 2)
+    CUF_DO2
+    do j = 1, ny
+      do i = 1, nx
+        if (mod(i + j + p1, 2) == 1) then
+          xd(i, j) = dinv(i, j) * (rr(i, j) + cu(i, j) * xs(i - 1, j) &
+                 + cu(i + 1, j) * xs(i + 1, j) + cv(i, j) * xs(i, j - 1) &
+                 + cv(i, j + 1) * xs(i, j + 1))
+        else
+          if (i > 1) then
+            vw = dinv(i - 1, j) * (rr(i - 1, j) + cu(i - 1, j) * xs(i - 2, j) &
+                 + cu(i, j) * xs(i, j) + cv(i - 1, j) * xs(i - 1, j - 1) &
+                 + cv(i - 1, j + 1) * xs(i - 1, j + 1))
+          else
+            vw = xs(i - 1, j)
+          endif
+          if (i < nx) then
+            ve = dinv(i + 1, j) * (rr(i + 1, j) + cu(i + 1, j) * xs(i, j) &
+                 + cu(i + 2, j) * xs(i + 2, j) + cv(i + 1, j) * xs(i + 1, j - 1) &
+                 + cv(i + 1, j + 1) * xs(i + 1, j + 1))
+          else
+            ve = xs(i + 1, j)
+          endif
+          if (j > 1) then
+            vs = dinv(i, j - 1) * (rr(i, j - 1) + cu(i, j - 1) * xs(i - 1, j - 1) &
+                 + cu(i + 1, j - 1) * xs(i + 1, j - 1) + cv(i, j - 1) * xs(i, j - 2) &
+                 + cv(i, j) * xs(i, j))
+          else
+            vs = xs(i, j - 1)
+          endif
+          if (j < ny) then
+            vn = dinv(i, j + 1) * (rr(i, j + 1) + cu(i, j + 1) * xs(i - 1, j + 1) &
+                 + cu(i + 1, j + 1) * xs(i + 1, j + 1) + cv(i, j + 1) * xs(i, j) &
+                 + cv(i, j + 2) * xs(i, j + 2))
+          else
+            vn = xs(i, j + 1)
+          endif
+          xd(i, j) = dinv(i, j) * (rr(i, j) + cu(i, j) * vw + cu(i + 1, j) * ve &
+               + cv(i, j) * vs + cv(i, j + 1) * vn)
+        endif
+      enddo
+    enddo
+    call tq(T_MSM)
+  end subroutine sweep_fine2
+
+  subroutine sweep_c2(l, mode, xs, ks, xd, kd)
+    ! fs_gpu_opt 8192: sweep_fine2 for the distributed level l (smooth_c's expression), from
+    ! xs(:, :, ks) into xd(:, :, kd)
+    integer, intent(in) :: l, mode, ks, kd
+    real(rp), FSD intent(in) :: xs(0:mgx + 1, 0:mgy + 1, *)
+    real(rp), FSD intent(inout) :: xd(0:mgx + 1, 0:mgy + 1, *)
+    integer(ip) :: i, j, nxl, nyl, ll, p1, s1, d1
+    real(rp) :: vw, ve, vs, vn
+    nxl = mg_nx(l); nyl = mg_ny(l); ll = l; p1 = mod(1 + mode, 2); s1 = ks; d1 = kd
+    CUF_DO2
+    do j = 1, nyl
+      do i = 1, nxl
+        if (mod(i + j + p1, 2) == 1) then
+          xd(i, j, d1) = md_(i, j, ll) * (mb_(i, j, ll) + mw_(i, j, ll) * xs(i - 1, j, s1) &
+                 + mw_(i + 1, j, ll) * xs(i + 1, j, s1) + ms_(i, j, ll) * xs(i, j - 1, s1) &
+                 + ms_(i, j + 1, ll) * xs(i, j + 1, s1))
+        else
+          if (i > 1) then
+            vw = md_(i - 1, j, ll) * (mb_(i - 1, j, ll) + mw_(i - 1, j, ll) * xs(i - 2, j, s1) &
+                 + mw_(i, j, ll) * xs(i, j, s1) + ms_(i - 1, j, ll) * xs(i - 1, j - 1, s1) &
+                 + ms_(i - 1, j + 1, ll) * xs(i - 1, j + 1, s1))
+          else
+            vw = xs(i - 1, j, s1)
+          endif
+          if (i < nxl) then
+            ve = md_(i + 1, j, ll) * (mb_(i + 1, j, ll) + mw_(i + 1, j, ll) * xs(i, j, s1) &
+                 + mw_(i + 2, j, ll) * xs(i + 2, j, s1) + ms_(i + 1, j, ll) * xs(i + 1, j - 1, s1) &
+                 + ms_(i + 1, j + 1, ll) * xs(i + 1, j + 1, s1))
+          else
+            ve = xs(i + 1, j, s1)
+          endif
+          if (j > 1) then
+            vs = md_(i, j - 1, ll) * (mb_(i, j - 1, ll) + mw_(i, j - 1, ll) * xs(i - 1, j - 1, s1) &
+                 + mw_(i + 1, j - 1, ll) * xs(i + 1, j - 1, s1) + ms_(i, j - 1, ll) * xs(i, j - 2, s1) &
+                 + ms_(i, j, ll) * xs(i, j, s1))
+          else
+            vs = xs(i, j - 1, s1)
+          endif
+          if (j < nyl) then
+            vn = md_(i, j + 1, ll) * (mb_(i, j + 1, ll) + mw_(i, j + 1, ll) * xs(i - 1, j + 1, s1) &
+                 + mw_(i + 1, j + 1, ll) * xs(i + 1, j + 1, s1) + ms_(i, j + 1, ll) * xs(i, j, s1) &
+                 + ms_(i, j + 2, ll) * xs(i, j + 2, s1))
+          else
+            vn = xs(i, j + 1, s1)
+          endif
+          xd(i, j, d1) = md_(i, j, ll) * (mb_(i, j, ll) + mw_(i, j, ll) * vw + mw_(i + 1, j, ll) * ve &
+               + ms_(i, j, ll) * vs + ms_(i, j + 1, ll) * vn)
+        endif
+      enddo
+    enddo
+    call tq(T_MSM)
+  end subroutine sweep_c2
+
+  subroutine ring_mg_a(l, x)
+    ! ring_mg of level l >= 1 of the plane array x (mx_ or mxb_)
+    integer, intent(in) :: l
+    real(rp), FSD intent(inout) :: x(0:mgx + 1, 0:mgy + 1, *)
+    integer(ip) :: nxl, nyl, m, mx, w, e, s, n, nb(4), ll
     nxl = mg_nx(l); nyl = mg_ny(l); ll = l
     nb = [decomp%nbr_w, decomp%nbr_e, decomp%nbr_s, decomp%nbr_n]
     mx = max(nxl, nyl)
@@ -719,17 +916,17 @@ contains
       CUF_DO1
       do m = 1, mx
         if (m <= nyl) then
-          mx_(0, m, ll) = 0.0_rp; mx_(nxl + 1, m, ll) = 0.0_rp
+          x(0, m, ll) = 0.0_rp; x(nxl + 1, m, ll) = 0.0_rp
         endif
         if (m <= nxl) then
-          mx_(m, 0, ll) = 0.0_rp; mx_(m, nyl + 1, ll) = 0.0_rp
+          x(m, 0, ll) = 0.0_rp; x(m, nyl + 1, ll) = 0.0_rp
         endif
       enddo
       call tq(T_MEX)
       return
     endif
     if (ipc_on) then
-      call ipc_ring_plane(mx_, mgx, mgy, int(ll), int(nxl), int(nyl))
+      call ipc_ring_plane(x, mgx, mgy, int(ll), int(nxl), int(nyl))
       n_ring = n_ring + 1
       call tq(T_MEX)
       return
@@ -737,10 +934,10 @@ contains
     CUF_DO1
     do m = 1, mx
       if (m <= nyl) then
-        rg_sw(m) = mx_(1, m, ll); rg_se(m) = mx_(nxl, m, ll)
+        rg_sw(m) = x(1, m, ll); rg_se(m) = x(nxl, m, ll)
       endif
       if (m <= nxl) then
-        rg_ss(m) = mx_(m, 1, ll); rg_sn(m) = mx_(m, nyl, ll)
+        rg_ss(m) = x(m, 1, ll); rg_sn(m) = x(m, nyl, ll)
       endif
     enddo
     call ring_mpi(nb, int(nyl), int(nxl))
@@ -749,38 +946,38 @@ contains
     do m = 1, mx
       if (m <= nyl) then
         if (w == NBR_NONE) then
-          mx_(0, m, ll) = 0.0_rp
+          x(0, m, ll) = 0.0_rp
         else if (w == NBR_SELF) then
-          mx_(0, m, ll) = rg_se(m)
+          x(0, m, ll) = rg_se(m)
         else
-          mx_(0, m, ll) = rg_rw(m)
+          x(0, m, ll) = rg_rw(m)
         endif
         if (e == NBR_NONE) then
-          mx_(nxl + 1, m, ll) = 0.0_rp
+          x(nxl + 1, m, ll) = 0.0_rp
         else if (e == NBR_SELF) then
-          mx_(nxl + 1, m, ll) = rg_sw(m)
+          x(nxl + 1, m, ll) = rg_sw(m)
         else
-          mx_(nxl + 1, m, ll) = rg_re(m)
+          x(nxl + 1, m, ll) = rg_re(m)
         endif
       endif
       if (m <= nxl) then
         if (s == NBR_NONE) then
-          mx_(m, 0, ll) = 0.0_rp
+          x(m, 0, ll) = 0.0_rp
         else if (s == NBR_SELF) then
-          mx_(m, 0, ll) = rg_sn(m)
+          x(m, 0, ll) = rg_sn(m)
         else
-          mx_(m, 0, ll) = rg_rs(m)
+          x(m, 0, ll) = rg_rs(m)
         endif
         if (n == NBR_NONE) then
-          mx_(m, nyl + 1, ll) = 0.0_rp
+          x(m, nyl + 1, ll) = 0.0_rp
         else if (n == NBR_SELF) then
-          mx_(m, nyl + 1, ll) = rg_ss(m)
+          x(m, nyl + 1, ll) = rg_ss(m)
         else
-          mx_(m, nyl + 1, ll) = rg_rn(m)
+          x(m, nyl + 1, ll) = rg_rn(m)
         endif
       endif
     enddo
     call tq(T_MEX)
-  end subroutine ring_mg
+  end subroutine ring_mg_a
 
 end module fs_mg
