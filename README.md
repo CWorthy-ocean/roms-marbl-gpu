@@ -234,6 +234,45 @@ v0.1.2-beta, bit for bit.
   the `_spn` file.
 - CDR_LITE: where one of two bracketing carbonate-sensitivity records is
   missing (0), the gas flux now ramps linearly to zero instead of spiking.
+- Implicit free surface (`&implicit_fs fs_mode = 'implicit'`, the port of
+  ucla-roms' implicit free surface with its defaults): one generalized-alpha
+  barotropic step per baroclinic step (two sub-steps of dt/2 by default),
+  reduced to a symmetric positive-definite Helmholtz problem for the
+  sea-level change and solved by multigrid-preconditioned conjugate
+  gradients, replaces the split-explicit fast loop. Without the group, or
+  with `fs_mode = 'split'`, the model is unchanged. The settings are those
+  of UCLA ROMS's namelist template: `fs_mode`, `fs_nsub` (2), `fs_rho_inf`
+  (0.5, in [0, 1)), `fs_tol` (1e-8) and `fs_verbose` (0). UCLA ROMS's
+  solver and development settings are read too, and the GPU adds tuning
+  settings (`fs_gpu_gather`, `fs_gpu_coarse`, `fs_gpu_graph`, `fs_gpu_opt`,
+  `fs_gpu_timers`); see `NAMELIST_COMPAT`. A solve that does not converge
+  stops the run. The restart file holds the scheme's state, so a restart
+  is exact, and the output files record the scheme (`fs_mode`,
+  `fs_rho_inf`, `fs_nsub`) as global attributes.
+  - Cost (Derecho, A100, default settings, no output; measured with this
+    branch's implicit free surface before its optimization, 64e3bd2, whose
+    results this version reproduces bit for bit): mean time per step,
+    implicit against split, sargasso 2x2 (4 GPUs on 1 node, dt 480 s)
+    16.5 against 36-39 ms (0.44), Iceland0 2x2 (dt 120 s) 26.0 against
+    34-36 ms (0.75), Pac 8x1 (8 GPUs on 2 nodes, dt 900 s, tides, rivers)
+    115.6 against 121-135 ms (median 118-119; 0.86-0.96). The free-surface
+    window is 5.0 ms per step on the 1-node cases and 16.3 ms on Pac: two
+    solves of 4.6-6 iterations each, bound by latency (halo exchanges,
+    reductions, V-cycles), so the second sub-step adds a fixed 2.4 ms
+    (1 node) to 5.5 ms (Pac) per step.
+  - Tiling: the implicit step is not bitwise independent of the tiling.
+    Its results differ between tilings at about the level of `fs_tol`:
+    sargasso, 20 steps, the rms differences between 1x1, 2x2 and 4x1 GPU
+    tilings are 0.3-1.3 times the CPU model's own 2x2 against 4x1
+    difference (hbbl 1.8 times), and the GPU against the CPU at the same
+    tiling 0.6-1.05 times (hbbl 1.8).
+  - Not tested on the GPU: periodic domains (the GPU model cannot write
+    output on a periodic grid), `fs_drag_implicit`, sponge tuning
+    (`ub_tune`) together with the implicit free surface, more than two
+    nodes. A closed basin and river and CDR volume sources were checked
+    during the port's development, not on this branch's gate cases, of
+    which only Pac has rivers. Pipe sources and MPI_MASKING are not
+    available in the GPU model.
 
 ## Numerics
 
@@ -242,7 +281,7 @@ use with MARBL; other CPU options are not available. In ROMS terms:
 
 - SM09 s-coordinate, Shchepetkin pressure-gradient scheme
 - LF-AM3 predictor / corrector time stepping
-- Split-explicit barotropic mode (FB AB3-AM4) with the `weight(1:2,1:nfast)` filter
+- Split-explicit barotropic mode (FB AB3-AM4) with the `weight(1:2,1:nfast)` filter, or the implicit free surface (`&implicit_fs`)
 - Thickness-aware C4 predictor / U3 corrector vertical advection
 - UPSTREAM_TS horizontal tracer advection (`UPSTREAM_TS_LAND_CURV` always on)
 - LMD94 interior mixing and KPP surface and bottom boundary layers (SMOOTH_RIG, INT_AT_RHO_POINTS, SMOOTH_HBL, Jwt=1)

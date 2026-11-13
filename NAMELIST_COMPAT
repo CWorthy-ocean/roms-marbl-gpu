@@ -51,6 +51,41 @@
 # ub_west, ub_east, ub_south, ub_north are restart fields, written after
 # the step's tuning (exact restarts), as in that version of UCLA ROMS.
 #
+# Implicit free surface (&implicit_fs, fs_mode = 'implicit'; absent or
+# 'split': the split-explicit fast loop), as in ucla-roms
+# implicit-fs-defaults. The settings (the five keys of UCLA ROMS's
+# namelist template; defaults in brackets):
+#   fs_mode     'split' | 'implicit'                                ['split']
+#   fs_nsub     implicit sub-steps of dt/fs_nsub per step, 1..4     [2]
+#   fs_rho_inf  spectral radius at infinite omega dt, in [0, 1)     [0.5]
+#               (1, Crank-Nicolson, stops the run at the read)
+#   fs_tol      relative residual of the elliptic solve             [1e-8]
+#   fs_verbose  1: FS_SOLVE line per step; 2: + FS_VOL, FS_SRC,      [0]
+#               FS_WALL lines (FS_SRC also with fs_mode = 'split')
+# Solver and development settings: read as in UCLA ROMS, where the
+# defaults are the recommended values, the keys may change between
+# versions and C-Star and Forge do not expose them: fs_theta,
+# fs_theta_div, fs_maxit (a solve that reaches it without meeting fs_tol
+# stops the run), fs_precond, fs_mg_levels, fs_mg_nu, fs_mg_smoother,
+# fs_mg_lag, fs_mg_faces, fs_drag_implicit, fs_warm, fs_tang_nudge,
+# fs_cor_metric, fs_pot_time, fs_pg_rho, fs_flather_zghost (fs_rho_inf =
+# 0, fs_nsub = 1, fs_pg_rho = fs_flather_zghost = .false. give the earlier
+# single step); UCLA ROMS's MPI-layout keys fs_mg_gather, fs_mg_global_on
+# and fs_exch_thin are read and not used, fs_selftest is read and ignored.
+# GPU tuning settings (roms_gpu only): fs_gpu_gather, fs_gpu_coarse,
+# fs_gpu_graph and fs_gpu_opt (layout and latency of the solve),
+# fs_gpu_timers (timing runs: FS_COST, FS_WIN). fs_stress_time is no
+# longer read (as in UCLA ROMS): a namelist that sets it stops at the
+# read. Output files record fs_mode, and with 'implicit' fs_rho_inf and
+# fs_nsub, as global attributes.
+# Boundary options: roms_gpu's open edges have one barotropic type, UCLA
+# ROMS's OBC_M2FLATHER (Flather normal faces, the zetabc sea level, the
+# upwind tangential condition with inflow nudging), which the implicit
+# free surface implements. The UCLA ROMS options for which the implicit
+# step prints a start-up note there (OBC_M2ORLANSKI, open edges without an
+# OBC_M2 type, OBC_Z2ORLANSKI, LEGACY_ORLANSKI, OBC_RAD_NORMAL, OBC_RAD_NPO)
+# do not exist in roms_gpu, so it prints none.
+#
 # Half-resolution forcing: interp_bulk_frc, interp_flux_frc
 # (&surf_frc_settings) and interp_bgc_frc (&bgc_settings) are read but not
 # used; roms_gpu takes a forcing field as half resolution from its shape

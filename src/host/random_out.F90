@@ -15,6 +15,7 @@ module random_out
   use gpu_state
   use time_state
   use nc_io
+  use implicit_fs_gpu, only: fs_global_atts
   use io_server, only: IO_KIND_RND, io_init, io_init8, io_stage8_begin, io_stage8_2d, io_stage8_end
   use comm_mod, only: comm_rank, compute_barrier
   use passive_mod, only: ntp, tp, n_marbl, n_generic, passive_name
@@ -168,6 +169,7 @@ contains
       call nc_put_att_text(ncid, trim(name), 'units', 'tracer units')
     enddo
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu random output: surface passive tracers')
+    call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
     call nc_enddef(ncid)
     call nc_close(ncid)
     write(*,'(a,a)') 'created random file: ', trim(path)

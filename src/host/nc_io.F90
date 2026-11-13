@@ -28,6 +28,7 @@ module nc_io
   public :: nc_def_dim
   public :: nc_def_var
   public :: nc_def_var_i, nc_put_ints_rec
+  public :: nc_put_vec_rec_d, nc_get_vec_rec_d
   public :: nc_enddef
   public :: nc_put_2d
   public :: nc_put_3d
@@ -436,6 +437,32 @@ contains
     call nc_check(nf90_put_var(ncid, varid, vals, start=(/1, rec/), count=(/size(vals), 1/)), &
                   'putrec '//trim(name))
   end subroutine nc_put_ints_rec
+
+  subroutine nc_put_vec_rec_d(ncid, name, vals, rec, i0f)
+    ! Double vector vals(:) into record rec of a (n, time) variable (restart scalars), at
+    ! position i0f (default 1).
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    real(8),          intent(in) :: vals(:)
+    integer,          intent(in), optional :: i0f
+    integer :: varid, i0
+    i0 = 1
+    if (present(i0f)) i0 = i0f
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_put_var(ncid, varid, vals, start=(/i0, rec/), count=(/size(vals), 1/)), &
+                  'putrec '//trim(name))
+  end subroutine nc_put_vec_rec_d
+
+  subroutine nc_get_vec_rec_d(ncid, name, vals, rec)
+    ! Double vector of record rec of a (n, time) variable (restart scalars).
+    integer,          intent(in)  :: ncid, rec
+    character(len=*), intent(in)  :: name
+    real(8),          intent(out) :: vals(:)
+    integer :: varid
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_get_var(ncid, varid, vals, start=(/1, rec/), count=(/size(vals), 1/)), &
+                  'getrec '//trim(name))
+  end subroutine nc_get_vec_rec_d
 
   subroutine nc_put_2d_rec(ncid, name, arr, rec, i0f, j0f)
     integer,          intent(in) :: ncid, rec

@@ -146,24 +146,30 @@ contains
     write(*,'(a,i0,a,2l2)') 'tides: n = ', ntides, '  pot,bry =', pot_tides, bry_tides
   end subroutine init_tides
 
-  subroutine set_tides(bry_phase)
+  subroutine set_tides(bry_phase, pot_phase)
     ! One small device kernel per constituent and target (c, s are
     ! kernel arguments), in the same order as the host loops it replaces.
     ! bry_phase (units of dt, default 0.5): the boundary harmonics are at
-    ! time + bry_phase*dt; the potential is always at n+1/2, where prsgrd
-    ! uses it. Both calls of the step use n+1/2 (CPU tides.F90 since
-    ! ab490df8): the harmonics enter only the 2D boundary conditions of the
-    ! fast loop, which runs from n to n+1. The coefficients are
+    ! time + bry_phase*dt; pot_phase (default 0.5): the potential is at
+    ! time + pot_phase*dt (n+1/2, where prsgrd uses it; the implicit free
+    ! surface passes its forcing time, fs_pot_phase, from step_driver). Both
+    ! calls of the step use n+1/2 for the split fast loop (CPU tides.F90
+    ! since ab490df8), which runs from n to n+1 with the harmonics (2D
+    ! boundary conditions) held fixed; with the implicit free surface the
+    ! second call passes 1.0, its boundary data being at n+alpha_f (CPU
+    ! 6a2d56da; see the call in step_driver). The coefficients are
     ! host-written managed arrays; the corrector call overwrites the
     ! predictor's only after set_depth's device sync, so the predictor's
     ! kernels have used them by then.
-    real(rp), intent(in), optional :: bry_phase
+    real(rp), intent(in), optional :: bry_phase, pot_phase
     integer(ip) :: it, i, j, nx, ny, ip, is, ie, js, je, n
-    real(rp) :: omT, omTp, c, s, z0, v0, zw, ze, uw, ue, vw, ve, bphase
+    real(rp) :: omT, omTp, c, s, z0, v0, zw, ze, uw, ue, vw, ve, bphase, pphase
     logical :: want_dump
     if (.not. tides_ready) return
     bphase = 0.5_rp
     if (present(bry_phase)) bphase = bry_phase
+    pphase = 0.5_rp
+    if (present(pot_phase)) pphase = pot_phase
     nx = decomp%nx; ny = decomp%ny
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     ip = iprb_pt(1)
@@ -179,7 +185,7 @@ contains
     ! as the per-constituent kernels it replaces (same rounded products).
     do it = 1, ntides
       omT = ftide(it) * (time + bphase * dt)
-      omTp = ftide(it) * (time + 0.5_rp * dt)
+      omTp = ftide(it) * (time + pphase * dt)   ! n+1/2; implicit FS fs_pot_time 'af': n+alpha_f
       tide_c(it) = cos(omT)
       tide_s(it) = sin(omT)
       tide_cp(it) = cos(omTp)

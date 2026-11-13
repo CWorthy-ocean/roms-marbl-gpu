@@ -25,6 +25,7 @@ module cdr_lite_out
   use gpu_state
   use time_state
   use nc_io
+  use implicit_fs_gpu, only: fs_global_atts
   use io_server, only: IO_KIND_CDR, io_init, io_init8, io_stage8_begin, io_stage8_2d, io_stage8_3d, &
                        io_stage8_3d_pt, io_stage8_end
   use comm_mod, only: comm_rank, compute_barrier
@@ -347,6 +348,7 @@ contains
       enddo
     endif
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu CDR_LITE output')
+    call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
     call nc_enddef(ncid)
     call nc_close(ncid)
     write(*,'(a,a)') 'created cdr_lite file: ', trim(path)

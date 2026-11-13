@@ -49,9 +49,12 @@ module comm_mod
   public :: comm_sendrecv_raw
   public :: comm_sendrecv_dev
   public :: comm_post_dev, comm_wait_dev
+  public :: comm_ring_dev8, comm_ring_h8, comm_ipc_exchange, comm_ipc_allgather
   public :: comm_min_real
   public :: comm_reduce_maxsum
   public :: comm_reduce_sum
+  public :: comm_allreduce_sum, comm_allreduce_max, comm_allreduce_min
+  public :: comm_allgather_i4, comm_allgatherv_r8, comm_allgatherv_dev, comm_allgatherv_h8
   public :: comm_gpu_direct
   public :: comm_exchange3
   public :: have_io_server
@@ -428,6 +431,69 @@ contains
 #endif
   end subroutine comm_sendrecv_dev
 
+  subroutine comm_ring_dev8(nbr, nw, ns, sw, se, ss, sn, rw, re, rs, rn)
+    ! One-round exchange of the four edge rows of a real(8) field with the
+    ! four neighbours on DEVICE buffers (GPU-aware MPI): nbr = (west, east,
+    ! south, north), nw (ns) values in the west/east (south/north) buffers.
+    ! A non-MPI neighbour (NBR_NONE, NBR_SELF) is MPI_PROC_NULL here (the
+    ! caller handles the self-wrap). The caller has synchronized the stream
+    ! that packed the send buffers. Tags 321-324 (direction of travel),
+    ! distinct from the other exchanges. (The implicit free surface's
+    ! one-cell rings without corners, fs_data ring.)
+    integer(ip), intent(in) :: nbr(4)
+    integer,     intent(in) :: nw, ns
+#ifdef USE_CUDA
+    real(8), device, intent(in)    :: sw(*), se(*), ss(*), sn(*)
+    real(8), device, intent(inout) :: rw(*), re(*), rs(*), rn(*)
+#else
+    real(8), intent(in)    :: sw(*), se(*), ss(*), sn(*)
+    real(8), intent(inout) :: rw(*), re(*), rs(*), rn(*)
+#endif
+#ifdef USE_MPI
+    integer :: d(4), ierr, req(8), stats(MPI_STATUS_SIZE, 8)
+    if (.not. ready) call init_comm()
+    d = [mpi_dest(nbr(1)), mpi_dest(nbr(2)), mpi_dest(nbr(3)), mpi_dest(nbr(4))]
+    call MPI_Irecv(re, nw, MPI_DOUBLE_PRECISION, d(2), 321, compute_comm, req(1), ierr)   ! travelling west, from the east
+    call MPI_Irecv(rw, nw, MPI_DOUBLE_PRECISION, d(1), 322, compute_comm, req(2), ierr)   ! travelling east, from the west
+    call MPI_Irecv(rn, ns, MPI_DOUBLE_PRECISION, d(4), 323, compute_comm, req(3), ierr)   ! travelling south, from the north
+    call MPI_Irecv(rs, ns, MPI_DOUBLE_PRECISION, d(3), 324, compute_comm, req(4), ierr)   ! travelling north, from the south
+    call MPI_Isend(sw, nw, MPI_DOUBLE_PRECISION, d(1), 321, compute_comm, req(5), ierr)
+    call MPI_Isend(se, nw, MPI_DOUBLE_PRECISION, d(2), 322, compute_comm, req(6), ierr)
+    call MPI_Isend(ss, ns, MPI_DOUBLE_PRECISION, d(3), 323, compute_comm, req(7), ierr)
+    call MPI_Isend(sn, ns, MPI_DOUBLE_PRECISION, d(4), 324, compute_comm, req(8), ierr)
+    call MPI_Waitall(8, req, stats, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'comm_ring_dev8: waitall'
+#else
+    if (any(nbr >= 0)) error stop 'comm_ring_dev8: MPI neighbor without USE_MPI'
+#endif
+  end subroutine comm_ring_dev8
+
+  subroutine comm_ring_h8(nbr, nw, ns, sw, se, ss, sn, rw, re, rs, rn)
+    ! comm_ring_dev8 on HOST buffers (the implicit free surface's rings through mapped pinned
+    ! memory, fs_gpu_opt 1): same messages, tags and completion.
+    integer(ip), intent(in) :: nbr(4)
+    integer,     intent(in) :: nw, ns
+    real(8), intent(in)    :: sw(*), se(*), ss(*), sn(*)
+    real(8), intent(inout) :: rw(*), re(*), rs(*), rn(*)
+#ifdef USE_MPI
+    integer :: d(4), ierr, req(8), stats(MPI_STATUS_SIZE, 8)
+    if (.not. ready) call init_comm()
+    d = [mpi_dest(nbr(1)), mpi_dest(nbr(2)), mpi_dest(nbr(3)), mpi_dest(nbr(4))]
+    call MPI_Irecv(re, nw, MPI_DOUBLE_PRECISION, d(2), 321, compute_comm, req(1), ierr)
+    call MPI_Irecv(rw, nw, MPI_DOUBLE_PRECISION, d(1), 322, compute_comm, req(2), ierr)
+    call MPI_Irecv(rn, ns, MPI_DOUBLE_PRECISION, d(4), 323, compute_comm, req(3), ierr)
+    call MPI_Irecv(rs, ns, MPI_DOUBLE_PRECISION, d(3), 324, compute_comm, req(4), ierr)
+    call MPI_Isend(sw, nw, MPI_DOUBLE_PRECISION, d(1), 321, compute_comm, req(5), ierr)
+    call MPI_Isend(se, nw, MPI_DOUBLE_PRECISION, d(2), 322, compute_comm, req(6), ierr)
+    call MPI_Isend(ss, ns, MPI_DOUBLE_PRECISION, d(3), 323, compute_comm, req(7), ierr)
+    call MPI_Isend(sn, ns, MPI_DOUBLE_PRECISION, d(4), 324, compute_comm, req(8), ierr)
+    call MPI_Waitall(8, req, stats, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'comm_ring_h8: waitall'
+#else
+    if (any(nbr >= 0)) error stop 'comm_ring_h8: MPI neighbor without USE_MPI'
+#endif
+  end subroutine comm_ring_h8
+
   subroutine comm_post_dev(nbr_lo, nbr_hi, n, s_lo, s_hi, r_lo, r_hi, tag_lo, tag_hi, req)
     ! Non-blocking form of comm_sendrecv_dev: posts the four requests with
     ! the caller's tags (distinct from the blocking exchanges, which use
@@ -503,6 +569,238 @@ contains
     xsum = x
 #endif
   end subroutine comm_reduce_sum
+
+  subroutine comm_allreduce_sum(n, x, xsum)
+    ! Sum of x(1:n) over the compute ranks, on every compute rank.
+    integer, intent(in) :: n
+    real(8), intent(in) :: x(n)
+    real(8), intent(out) :: xsum(n)
+#ifdef USE_MPI
+    integer :: ierr
+    if (.not. ready) call init_comm()
+    call MPI_Allreduce(x, xsum, n, MPI_DOUBLE_PRECISION, MPI_SUM, compute_comm, ierr)
+#else
+    xsum = x
+#endif
+  end subroutine comm_allreduce_sum
+
+  subroutine comm_allreduce_max(n, x, xmax)
+    ! Max of x(1:n) over the compute ranks, on every compute rank.
+    integer, intent(in) :: n
+    real(8), intent(in) :: x(n)
+    real(8), intent(out) :: xmax(n)
+#ifdef USE_MPI
+    integer :: ierr
+    if (.not. ready) call init_comm()
+    call MPI_Allreduce(x, xmax, n, MPI_DOUBLE_PRECISION, MPI_MAX, compute_comm, ierr)
+#else
+    xmax = x
+#endif
+  end subroutine comm_allreduce_max
+
+  subroutine comm_allreduce_min(n, x, xmin)
+    ! Min of x(1:n) over the compute ranks, on every compute rank.
+    integer, intent(in) :: n
+    real(8), intent(in) :: x(n)
+    real(8), intent(out) :: xmin(n)
+#ifdef USE_MPI
+    integer :: ierr
+    if (.not. ready) call init_comm()
+    call MPI_Allreduce(x, xmin, n, MPI_DOUBLE_PRECISION, MPI_MIN, compute_comm, ierr)
+#else
+    xmin = x
+#endif
+  end subroutine comm_allreduce_min
+
+  subroutine comm_allgather_i4(n, x, xall)
+    ! Every compute rank's x(1:n) into xall(1:n, rank+1), on every rank
+    ! (implicit free surface: the multigrid gather layout).
+    integer, intent(in) :: n
+    integer, intent(in) :: x(n)
+    integer, intent(out) :: xall(n, *)
+#ifdef USE_MPI
+    integer :: ierr
+    if (.not. ready) call init_comm()
+    call MPI_Allgather(x, n, MPI_INTEGER, xall, n, MPI_INTEGER, compute_comm, ierr)
+#else
+    xall(1:n, 1) = x(1:n)
+#endif
+  end subroutine comm_allgather_i4
+
+  subroutine comm_allgatherv_r8(n, x, xall, cnt, dsp)
+    ! Host MPI_Allgatherv of real(8) on the compute ranks (implicit free
+    ! surface: the multigrid coarse gather). cnt, dsp per compute rank.
+    integer, intent(in) :: n
+    real(8), intent(in) :: x(*)
+    real(8), intent(inout) :: xall(*)
+    integer, intent(in) :: cnt(*), dsp(*)
+#ifdef USE_MPI
+    integer :: ierr
+    if (.not. ready) call init_comm()
+    call MPI_Allgatherv(x, n, MPI_DOUBLE_PRECISION, xall, cnt, dsp, MPI_DOUBLE_PRECISION, &
+                        compute_comm, ierr)
+#else
+    xall(1:n) = x(1:n)
+#endif
+  end subroutine comm_allgatherv_r8
+
+  subroutine comm_allgatherv_dev(n, x, xall, cnt, dsp)
+    ! Allgatherv of real(8) DEVICE buffers by point-to-point messages to and
+    ! from every other compute rank (GPU-aware MPI, as the halo exchanges);
+    ! this rank's own block is not copied (the caller places it). cnt, dsp
+    ! per compute rank (dsp 0-based). The caller has synchronized the stream
+    ! that wrote x. Tags 331 (implicit free surface: the multigrid gather).
+    integer, intent(in) :: n
+#ifdef USE_CUDA
+    real(8), device, intent(in) :: x(*)
+    real(8), device, intent(inout) :: xall(*)
+#else
+    real(8), intent(in) :: x(*)
+    real(8), intent(inout) :: xall(*)
+#endif
+    integer, intent(in) :: cnt(*), dsp(*)
+#ifdef USE_MPI
+    integer :: ierr, k, nr, me, np
+    integer, allocatable :: req(:), stats(:,:)
+    if (.not. ready) call init_comm()
+    me = int(my_rank); np = int(nproc)
+    if (np <= 1) return
+    allocate(req(2 * np), stats(MPI_STATUS_SIZE, 2 * np))
+    nr = 0
+    do k = 0, np - 1
+      if (k == me) cycle
+      nr = nr + 1
+      call irecv_dev8(xall(dsp(k + 1) + 1), cnt(k + 1), k, 331, req(nr))
+    enddo
+    do k = 0, np - 1
+      if (k == me) cycle
+      nr = nr + 1
+      call MPI_Isend(x, n, MPI_DOUBLE_PRECISION, k, 331, compute_comm, req(nr), ierr)
+    enddo
+    call MPI_Waitall(nr, req, stats, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'comm_allgatherv_dev: waitall'
+    deallocate(req, stats)
+#endif
+  end subroutine comm_allgatherv_dev
+
+  subroutine comm_ipc_exchange(nb, hb, hf, rhb, rhf, same)
+    ! The implicit free surface's CUDA IPC rings (fs_ipc): send this rank's two 64-byte IPC
+    ! handles and its host name to each MPI neighbour nb(d) (d = W, E, S, N; < 0: none) and
+    ! receive theirs; same(d): neighbour d runs on this rank's node. (MPI here, not in the device
+    ! modules: external MPI calls in the main compile command stop cross-file inlining.)
+    integer, intent(in) :: nb(4)
+    character(len=64), intent(in) :: hb, hf
+    character(len=64), intent(out) :: rhb(4), rhf(4)
+    logical, intent(out) :: same(4)
+#ifdef USE_MPI
+    character(len=MPI_MAX_PROCESSOR_NAME) :: me_host, nb_host(4)
+    integer :: d, od, ierr, nr, ln, req(24), stats(MPI_STATUS_SIZE, 24)
+    if (.not. ready) call init_comm()
+    me_host = ' '
+    call MPI_Get_processor_name(me_host, ln, ierr)
+    if (ln < len(me_host)) me_host(ln + 1:) = ' '
+    nb_host = ' '; rhb = ' '; rhf = ' '
+    nr = 0
+    do d = 1, 4
+      if (nb(d) < 0) cycle
+      nr = nr + 1; call MPI_Irecv(nb_host(d), MPI_MAX_PROCESSOR_NAME, MPI_CHARACTER, nb(d), 600 + d, compute_comm, req(nr), ierr)
+      nr = nr + 1; call MPI_Irecv(rhb(d), 64, MPI_CHARACTER, nb(d), 610 + d, compute_comm, req(nr), ierr)
+      nr = nr + 1; call MPI_Irecv(rhf(d), 64, MPI_CHARACTER, nb(d), 620 + d, compute_comm, req(nr), ierr)
+    enddo
+    do d = 1, 4
+      if (nb(d) < 0) cycle
+      od = merge(2, 1, d == 1)          ! the neighbour's direction toward this rank
+      if (d == 3) od = 4
+      if (d == 4) od = 3
+      nr = nr + 1; call MPI_Isend(me_host, MPI_MAX_PROCESSOR_NAME, MPI_CHARACTER, nb(d), 600 + od, compute_comm, req(nr), ierr)
+      nr = nr + 1; call MPI_Isend(hb, 64, MPI_CHARACTER, nb(d), 610 + od, compute_comm, req(nr), ierr)
+      nr = nr + 1; call MPI_Isend(hf, 64, MPI_CHARACTER, nb(d), 620 + od, compute_comm, req(nr), ierr)
+    enddo
+    call MPI_Waitall(nr, req, stats, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'comm_ipc_exchange: waitall'
+    do d = 1, 4
+      same(d) = (nb(d) >= 0 .and. nb_host(d) == me_host)
+    enddo
+#else
+    rhb = ' '; rhf = ' '; same = .false.
+#endif
+  end subroutine comm_ipc_exchange
+
+  subroutine comm_ipc_allgather(hb, hf, rhb, rhf, same)
+    ! fs_ipc's gather: every compute rank's two 64-byte IPC handles (rhb(:, rank+1)); same: all
+    ! compute ranks on this rank's node (host names equal)
+    character(len=64), intent(in) :: hb, hf
+    character(len=64), intent(out) :: rhb(*), rhf(*)
+    logical, intent(out) :: same
+#ifdef USE_MPI
+    character(len=MPI_MAX_PROCESSOR_NAME) :: me_host
+    character(len=MPI_MAX_PROCESSOR_NAME), allocatable :: hosts(:)
+    integer :: ierr, ln, k
+    if (.not. ready) call init_comm()
+    me_host = ' '
+    call MPI_Get_processor_name(me_host, ln, ierr)
+    if (ln < len(me_host)) me_host(ln + 1:) = ' '
+    allocate(hosts(nproc))
+    call MPI_Allgather(me_host, MPI_MAX_PROCESSOR_NAME, MPI_CHARACTER, hosts, MPI_MAX_PROCESSOR_NAME, &
+         MPI_CHARACTER, compute_comm, ierr)
+    call MPI_Allgather(hb, 64, MPI_CHARACTER, rhb, 64, MPI_CHARACTER, compute_comm, ierr)
+    call MPI_Allgather(hf, 64, MPI_CHARACTER, rhf, 64, MPI_CHARACTER, compute_comm, ierr)
+    same = .true.
+    do k = 1, int(nproc)
+      if (hosts(k) /= me_host) same = .false.
+    enddo
+    deallocate(hosts)
+#else
+    rhb(1) = hb; rhf(1) = hf; same = .true.
+#endif
+  end subroutine comm_ipc_allgather
+
+  subroutine comm_allgatherv_h8(xall, cnt, dsp)
+    ! comm_allgatherv_dev on one HOST buffer: this rank's block is already in place at
+    ! xall(dsp(me+1)+1 ...); the other blocks are received into theirs (tag 331).
+    real(8), intent(inout) :: xall(*)
+    integer, intent(in) :: cnt(*), dsp(*)
+#ifdef USE_MPI
+    integer :: ierr, k, nr, me, np
+    integer, allocatable :: req(:), stats(:,:)
+    if (.not. ready) call init_comm()
+    me = int(my_rank); np = int(nproc)
+    if (np <= 1) return
+    allocate(req(2 * np), stats(MPI_STATUS_SIZE, 2 * np))
+    nr = 0
+    do k = 0, np - 1
+      if (k == me) cycle
+      nr = nr + 1
+      call MPI_Irecv(xall(dsp(k + 1) + 1), cnt(k + 1), MPI_DOUBLE_PRECISION, k, 331, compute_comm, req(nr), ierr)
+    enddo
+    do k = 0, np - 1
+      if (k == me) cycle
+      nr = nr + 1
+      call MPI_Isend(xall(dsp(me + 1) + 1), cnt(me + 1), MPI_DOUBLE_PRECISION, k, 331, compute_comm, req(nr), ierr)
+    enddo
+    call MPI_Waitall(nr, req, stats, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'comm_allgatherv_h8: waitall'
+    deallocate(req, stats)
+#endif
+  end subroutine comm_allgatherv_h8
+
+  subroutine irecv_dev8(buf, n, src, tag, req)
+    ! MPI_Irecv into a device buffer that starts inside a larger array (the
+    ! explicit interface passes the element's device address)
+    integer, intent(in) :: n, src, tag
+#ifdef USE_CUDA
+    real(8), device :: buf(*)
+#else
+    real(8) :: buf(*)
+#endif
+    integer, intent(out) :: req
+#ifdef USE_MPI
+    integer :: ierr
+    call MPI_Irecv(buf, n, MPI_DOUBLE_PRECISION, src, tag, compute_comm, req, ierr)
+#else
+    req = 0
+#endif
+  end subroutine irecv_dev8
 
   subroutine comm_wait_dev(req)
     integer, intent(inout) :: req(4)

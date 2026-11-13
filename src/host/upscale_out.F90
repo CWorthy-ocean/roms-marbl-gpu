@@ -24,6 +24,7 @@ module upscale_out
   use gpu_state
   use time_state
   use nc_io
+  use implicit_fs_gpu, only: fs_global_atts
   use formulas, only: coef_up3
   use comm_mod, only: comm_rank, comm_reduce_sum
   use passive_mod, only: ntp, tp, passive_name, ncdr, cdr0
@@ -578,6 +579,7 @@ contains
       call nc_put_att_text(ncid, trim(vn), 'units', 'degrees')
     enddo
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu upscaling output')
+    call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
     call nc_enddef(ncid)
     c0 = 0
     do s = 1, 4

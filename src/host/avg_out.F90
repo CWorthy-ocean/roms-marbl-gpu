@@ -31,6 +31,7 @@ module avg_out
   use gpu_state
   use time_state
   use nc_io
+  use implicit_fs_gpu, only: fs_global_atts
   use io_server, only: IO_KIND_AVG, IO_KIND_BGCAVG, io_init, io_init8, io_stage8_begin, io_stage8_2d, &
                        io_stage8_3d, io_stage8_3d_pt, io_stage8_end
   use comm_mod, only: comm_rank, compute_barrier
@@ -607,6 +608,7 @@ contains
     call nc_put_att_text(ncid, '', 'type', 'ROMS averages file')
     call nc_put_att_text(ncid, '', 'averaging_timescale', trim(adjustl(ts))//' seconds')
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu averages')
+    call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
     call nc_enddef(ncid)
     call nc_close(ncid)
     write(*,'(a,a)') 'created averages file: ', trim(path)
@@ -631,6 +633,7 @@ contains
       call nc_put_att_text(ncid, trim(passive_name(bsrc(m))), 'units', trim(marbl_tracer_units(bsrc(m))))
     enddo
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu BGC averages')
+    call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
     call nc_enddef(ncid)
     call nc_close(ncid)
     write(*,'(a,a)') 'created BGC averages file: ', trim(path)

@@ -43,13 +43,14 @@ VERSION_DEF = -DROMS_GPU_VERSION=\"$(ROMS_GPU_VERSION)\"
 SRC_SHARED = src/shared/kinds.F90 src/shared/decomp.F90 src/shared/tile_balance.F90 src/shared/arch.F90 \
              src/shared/comm.F90 src/shared/formulas.F90 src/shared/time_state.F90 \
              src/shared/run_timers.F90
-SRC_DEV    = src/device/gpu_state.F90 src/device/column_solve.F90 src/device/halo.F90 src/device/pflx.F90 src/device/rivers.F90 src/device/cdr_src.F90 src/device/cdr_lite.F90 src/device/carb_sens.F90 \
+SRC_DEV    = src/device/implicit_fs_mgk.F90 src/device/gpu_state.F90 src/device/column_solve.F90 src/device/halo.F90 src/device/pflx.F90 src/device/rivers.F90 src/device/cdr_src.F90 src/device/cdr_lite.F90 src/device/carb_sens.F90 \
              src/device/geom.F90 src/device/obc.F90 src/device/step2d.F90 src/device/prsgrd.F90 \
              src/device/advect.F90 src/device/rho_eos.F90 src/device/uv_rhs.F90 \
              src/device/passive_column.F90 src/device/passive.F90 \
              src/device/pre_step3d.F90 src/device/step3d_uv.F90 src/device/visc3d.F90 \
              src/device/step3d_t.F90 src/device/t3dmix.F90 src/device/lmd.F90 \
-             src/device/bulk_coare.F90 src/device/wvlcty.F90
+             src/device/bulk_coare.F90 src/device/wvlcty.F90 \
+             src/device/implicit_fs_chol.F90 src/device/implicit_fs_host.F90 src/device/implicit_fs_ipc.F90 src/device/implicit_fs_data.F90 src/device/implicit_fs_mgg.F90 src/device/implicit_fs_mg.F90 src/device/implicit_fs.F90
 SRC_HOST   = src/host/step_driver.F90 src/host/feature_guard.F90
 SRC_IO     = src/host/nc_io.F90 src/host/host_buf.F90 src/host/par_read.F90 src/host/frc_io.F90 \
              src/host/river_io.F90 src/host/cdr_io.F90 src/host/cdr_lite_io.F90 src/host/bry_io.F90 src/host/tide_io.F90 src/host/io_server.F90 src/host/sponge_io.F90 src/host/marbl_step.F90 src/host/his_io.F90 src/host/cdr_lite_out.F90 src/host/random_out.F90 src/host/cdr_gas_out.F90 src/host/cdr_out.F90 src/host/upscale_out.F90 src/host/avg_out.F90 src/host/extract_out.F90 src/host/sponge_out.F90 \
@@ -172,6 +173,15 @@ run: $(MODDIR)/roms_gpu
 # 72-byte stack and a 1x1x1 launch grid, 265x slower). Its object is
 # linked in; the main command sees only comm_mod.mod.
 SRC_SHARED_NOCOMM = $(filter-out src/shared/comm.F90,$(SRC_SHARED))
+# The host part of the implicit free surface's multigrid (implicit_fs_host.F90,
+# MPI calls, plain host code) is compiled on its own like comm.F90, at -O1
+# (nvfortran -O2 host code was miscompiled twice in this code base).
+# The free surface's CUDA IPC rings (implicit_fs_ipc.F90, fs_ipc) are compiled on their own too:
+# adding the module to the main command re-triggered nvfortran 25.9's -g fort2 crash (heap
+# corruption in the main command).
+# The coarsest level's Cholesky factor and solve (implicit_fs_chol.F90, fs_chol, fs_gpu_opt 16) at
+# -O2 -Mnovect: no vectorization keeps the operation order (bit-identical to -O1), 4x faster.
+SRC_DEV_GPU = $(filter-out src/device/implicit_fs_chol.F90 src/device/implicit_fs_host.F90 src/device/implicit_fs_ipc.F90,$(SRC_DEV))
 
 $(GPUDIR)/marbl:
 	mkdir -p $(GPUDIR)/marbl
@@ -210,9 +220,14 @@ $(GPUDIR)/marbl_host.o: $(SRC_MARBL_HOST) $(GPUDIR)/kinds_pre.o $(MARBL_OBJS)
 
 gpu: $(GPUDIR)/kinds_pre.o $(GPUDIR)/marbl_host.o | $(GPUDIR)
 	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/shared/comm.F90 -o $(GPUDIR)/comm.o
+	$(FC_GPU) $(filter-out -O2 -O3,$(FFLAGS_GPU)) -O2 -Mnovect -module $(GPUDIR) -c src/device/implicit_fs_chol.F90 \
+	  -o $(GPUDIR)/implicit_fs_chol.o
+	$(FC_GPU) $(filter-out -O2 -O3,$(FFLAGS_GPU)) -O1 -module $(GPUDIR) -c src/device/implicit_fs_host.F90 \
+	  -o $(GPUDIR)/implicit_fs_host.o
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/device/implicit_fs_ipc.F90 -o $(GPUDIR)/implicit_fs_ipc.o
 	$(FC_GPU) $(FFLAGS_GPU) $(VERSION_DEF) -module $(GPUDIR) -o $(GPUDIR)/roms_gpu_cuda \
-	  $(SRC_SHARED_NOCOMM) $(SRC_DEV) $(SRC_MARBL_DEV) $(SRC_IO) $(SRC_HOST) src/host/main.F90 \
-	  $(GPUDIR)/comm.o $(GPUDIR)/marbl_host.o $(MARBL_OBJS) $(LIBS)
+	  $(SRC_SHARED_NOCOMM) $(SRC_DEV_GPU) $(SRC_MARBL_DEV) $(SRC_IO) $(SRC_HOST) src/host/main.F90 \
+	  $(GPUDIR)/comm.o $(GPUDIR)/implicit_fs_chol.o $(GPUDIR)/implicit_fs_host.o $(GPUDIR)/implicit_fs_ipc.o $(GPUDIR)/marbl_host.o $(MARBL_OBJS) $(LIBS)
 
 # Column-by-column check of the device MARBL interior kernels against the
 # unchanged MARBL code (host).

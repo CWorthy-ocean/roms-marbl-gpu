@@ -48,6 +48,7 @@ module rivers_mod
   public :: RIV_S2D, RIV_PRE, RIV_COR, RIV_S2DF, RIV_RNG
   ! for the fast-step override fused into step2d_mid's ubar/vbar kernel
   public :: rf_flx, riv_ufc, riv_vfc
+  public :: rivers_fs_map
 
   ! Stage bits of a face: the CPU's loop ranges differ by stage. A face in
   ! the fast-loop range gets RIV_S2DF when step2d_mid's ubar/vbar kernel
@@ -518,5 +519,30 @@ contains
       enddo
     enddo
   end subroutine rivers_tp
+
+  subroutine rivers_fs_map(mu, mv)
+    ! Implicit free surface (implicit_fs.F90): the face index of every
+    ! fast-loop river face (RIV_S2D or RIV_S2DF) in mu (u faces) / mv (v).
+#ifdef USE_CUDA
+    integer(ip), device, intent(inout) :: mu(decomp%is:decomp%ie, decomp%js:decomp%je)
+    integer(ip), device, intent(inout) :: mv(decomp%is:decomp%ie, decomp%js:decomp%je)
+#else
+    integer(ip), intent(inout) :: mu(decomp%is:decomp%ie, decomp%js:decomp%je)
+    integer(ip), intent(inout) :: mv(decomp%is:decomp%ie, decomp%js:decomp%je)
+#endif
+    integer(ip) :: f, n, sb
+    if (nrf == 0) return
+    n = nrf; sb = int(RIV_S2D + RIV_S2DF, ip)
+    CUF_DO1
+    do f = 1, n
+      if (iand(rf_s(f), sb) /= 0) then
+        if (rf_t(f) == 1) then
+          mu(rf_i(f), rf_j(f)) = f
+        else
+          mv(rf_i(f), rf_j(f)) = f
+        endif
+      endif
+    enddo
+  end subroutine rivers_fs_map
 
 end module rivers_mod

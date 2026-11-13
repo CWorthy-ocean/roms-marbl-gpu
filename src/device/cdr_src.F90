@@ -31,6 +31,7 @@ module cdr_src_mod
   public :: cdr_src_out
   public :: cdr_mode, CDR_MODE_FLUX, CDR_MODE_VOL, CDR_MODE_DP, CDR_MODE_3D
   public :: cdr_set_vol, cdr_set_record_vol, cdr_apply_ts, cdr_zsrc, cdr_vol_on
+  public :: cdr_fs_src
   public :: cdr_cmap, cd_vol, cq_w, cc_p0, cq_rel
   public :: cdr_set_3d, cdr_3d_buf, cdr_src_out3d
   public :: cdr_set_dp, cdr_dp_gather_hz, cdr_set_dp_weights, cdr_dp_hzc
@@ -554,5 +555,29 @@ contains
       enddo
     enddo
   end subroutine cdr_src_out
+
+  subroutine cdr_fs_src(qs)
+    ! Implicit free surface (implicit_fs.F90; CPU implicit_fs_mod, CDR_FORCING
+    ! cdr_volume): the volume releases as a source Q [m/s] of the step,
+    ! qs += pm pn vol sum_k(w) for every profile of the cell, in release order.
+#ifdef USE_CUDA
+    real(rp), device, intent(inout) :: qs(decomp%is:decomp%ie, decomp%js:decomp%je)
+#else
+    real(rp), intent(inout) :: qs(decomp%is:decomp%ie, decomp%js:decomp%je)
+#endif
+    integer(ip) :: c, i, j, q, n, r
+    if (.not. cdr_vol_on .or. ncc == 0) return
+    n = ncc
+#ifdef USE_CUDA
+    !$cuf kernel do(1) <<<*, *, 0, work_stream>>>
+#endif
+    do c = 1, n
+      i = cc_i(c); j = cc_j(c)
+      do q = cc_p0(c), cc_p0(c + 1) - 1
+        r = cq_rel(q)
+        qs(i, j) = qs(i, j) + pm(i, j) * pn(i, j) * cd_vol(r) * cq_qsum(q)
+      enddo
+    enddo
+  end subroutine cdr_fs_src
 
 end module cdr_src_mod
