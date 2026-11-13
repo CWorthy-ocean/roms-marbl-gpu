@@ -50,10 +50,10 @@ module fs_data
   integer :: fs_selftest = 0
   logical :: fs_cor_metric = .true.
   ! 8edf0a02 (FS_SPEC 9b item 8, 9b-D): time of the tidal potential in implicit mode, 'af' n+alpha_f =
-  ! n+1/(1+fs_rho_inf) (default), 'mid' n+1/2 (22c05bc1); pot_phase is read by tide_io's set_tides
-  ! (ptide at time + pot_phase dt; 0.5 in the split and without the group)
+  ! n+1/(1+fs_rho_inf) (default), 'mid' n+1/2 (22c05bc1); fs_pot_phase is passed to tide_io's set_tides
+  ! by step_driver and case_io (ptide at time + fs_pot_phase dt; 0.5 in the split and without the group)
   character(len=8) :: fs_pot_time = 'af'
-  real(rp) :: pot_phase = 0.5_rp
+  real(rp) :: fs_pot_phase = 0.5_rp
   ! 14233194 (FS_SPEC 5, 9b-E): coarse face factors of the multigrid, 'width' (default: (w_f(fi-1) +
   ! w_f(fi)) / (w_c(I-1) + w_c(I)), the aggregates' widths in fine cells; = 0.5 for full aggregates of
   ! equal cells) or 'half' (0.5, 6fc45b50). The CPU's MPI-layout keys fs_mg_gather, fs_mg_global_on

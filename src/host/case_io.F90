@@ -39,7 +39,7 @@ module case_io
   use marbl_gpu, only: marbl_gpu_init_diagnostics
   use marbl_gpu, only: marbl_on, read_marbl_namelist, marbl_gpu_setup_tracers, marbl_gpu_init_forcing, &
                        marbl_gpu_load_state
-  use fs_data, only: fs_alloc_rates, udu, udv, gru, grv, qd, xx, mg_se0, mg_scu, mg_scv, fs_nsc
+  use fs_data, only: fs_alloc_rates, udu, udv, gru, grv, qd, xx, mg_se0, mg_scu, mg_scv, fs_nsc, fs_pot_phase
   use implicit_fs_gpu, only: fs_rst_loaded, fs_on, fs_rst_scal_in, fs_mg_loaded
   implicit none
   private
@@ -761,7 +761,7 @@ contains
     call set_forces()
     call set_rivers(0)                ! river volume at time n for set_HUV (CPU: set_forces)
     call set_bry_all()
-    call set_tides()
+    call set_tides(pot_phase=fs_pot_phase)   ! the implicit free surface's potential time (0.5 otherwise)
     ! The CPU's start-up diagnostics before its initial history record
     ! (main.F90 after this set_forces: set_depth, set_HUV, omega,
     ! rho_eos): the initial record's rho, omega and w, and the depths the

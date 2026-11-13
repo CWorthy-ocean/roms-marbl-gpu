@@ -23,7 +23,7 @@ module step_driver
   use passive_mod, only: ntp, passive_t3dmix, passive_exchange_mid
   use lmd_mod, only: lmd_vmix
   use frc_io, only: set_forces, frc_prefetch
-  use fs_data, only: fs_bry_phase
+  use fs_data, only: fs_bry_phase, fs_pot_phase
   use river_io, only: set_rivers
   use cdr_io, only: set_cdr, set_cdr_pred
   use cdr_lite_io, only: set_cdr_lite
@@ -91,7 +91,7 @@ contains
     frc_slot = 1
     call set_bry_all()
     call step_mark('set_bry')
-    call set_tides()
+    call set_tides(pot_phase=fs_pot_phase)
     call dump_bry_north('after tide', frc_modtime())
     call step_mark('set_tides')
     call halo_fill_2d_s(zeta, STAGGER_RHO, knew)
@@ -156,7 +156,7 @@ contains
     ! fixed, so they are evaluated at the centre of that interval, n+1/2;
     ! at n+1 the boundary-forced tide leads by about omega*dt/2 (CPU
     ! ab490df8). The potential is at n+1/2 as well, where prsgrd uses it
-    ! (the implicit free surface moves it, see pot_phase). With the
+    ! (the implicit free surface moves it: fs_pot_phase). With the
     ! implicit free surface (fs_on) the same arrays are read by the
     ! implicit step, whose boundary face takes data at n+alpha_f, so fs_on
     ! keeps the harmonics at n+1 (CPU 6a2d56da; fs_bry_phase = 1); with
@@ -164,7 +164,7 @@ contains
     ! sub-steps' end times, (fs_nsub+1)/(2 fs_nsub).
     frc_slot = 2
     call set_bry_all()
-    call set_tides(merge(fs_bry_phase, 0.5_rp, fs_on))
+    call set_tides(merge(fs_bry_phase, 0.5_rp, fs_on), fs_pot_phase)
     call dump_bry_north('after tide', frc_modtime())
     call step_mark('corrector forces')
     call dump_vic('before uv1')

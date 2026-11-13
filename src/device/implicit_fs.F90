@@ -111,11 +111,11 @@ contains
     if (fs_nsub > 1) sft = (alf + 0.5_rp * real(fs_nsub - 1, rp)) / real(fs_nsub, rp)
     fs_bry_phase = 1.0_rp
     if (fs_nsub > 1) fs_bry_phase = 0.5_rp * real(fs_nsub + 1, rp) / real(fs_nsub, rp)
-    select case (trim(fs_pot_time))        ! the tidal potential at n+sft (tide_io: pot_phase)
+    select case (trim(fs_pot_time))        ! the tidal potential at n+sft (tide_io: fs_pot_phase)
     case ('af')
-      pot_phase = 1.0_rp / (1.0_rp + fs_rho_inf)
-      if (fs_nsub > 1) pot_phase = sft
-    case ('mid'); pot_phase = 0.5_rp
+      fs_pot_phase = 1.0_rp / (1.0_rp + fs_rho_inf)
+      if (fs_nsub > 1) fs_pot_phase = sft
+    case ('mid'); fs_pot_phase = 0.5_rp
     case default; error stop "IMPLICIT_FS: fs_pot_time must be 'af' or 'mid'"
     end select
     if (trim(fs_mg_faces) /= 'width' .and. trim(fs_mg_faces) /= 'half') &
@@ -152,7 +152,7 @@ contains
       write(*,'(1x,A,L1)') 'IMPLICIT_FS: fs_pg_rho = ', fs_pg_rho
       write(*,'(1x,A,L1)') 'IMPLICIT_FS: fs_flather_zghost = ', fs_flather_zghost
       write(*,'(1x,A,A,A,F7.4,A)') 'IMPLICIT_FS: fs_pot_time = ', trim(fs_pot_time), ' (tidal potential at time +', &
-           pot_phase, ' dt)'
+           fs_pot_phase, ' dt)'
       write(*,'(1x,A,A,A,I6,A,A,A,L1,A)') 'IMPLICIT_FS: fs_mg_faces = ', trim(fs_mg_faces), &
            ' (CPU layout keys read, not used: fs_mg_gather =', fs_mg_gather, ' fs_mg_global_on = ', &
            trim(fs_mg_global_on), ' fs_exch_thin = ', fs_exch_thin, ')'
