@@ -124,7 +124,8 @@ module fs_data
   ! cb w1, w1 = (1 + 2 cx)/(2 (1 + cx)), and an explicit term w0 zeta_b(ks), w0 = 1/(2 (1 + cx)), cx = dts
   ! pm sqrt(g h) at the first interior point. .false.: the first interior value alone (the boundary-forced
   ! tide later than the split's by about dx/(2 sqrt(g h))). cbu, cbv hold cb; the products cb w1 are formed
-  ! where they are used (the same rounded values as the CPU's stored cbu = cb w1).
+  ! where they are used (the same rounded values as the CPU's stored cbu = cb w1). cx, w1, w0 are stored per
+  ! open normal face in cxu, w1u, w0u (u faces 1, nx+1) and cxv, w1v, w0v (v faces 1, ny+1), once per step.
   logical :: fs_flather_zghost = .true.
   namelist /implicit_fs/ fs_mode, fs_rho_inf, fs_theta, fs_theta_div, fs_tol, fs_maxit, fs_precond, &
        fs_mg_levels, fs_mg_nu, fs_mg_smoother, fs_mg_lag, fs_drag_implicit, &
@@ -145,6 +146,7 @@ module fs_data
   ! per-face and per-cell fields (the CPU's names)
   real(rp), FSD allocatable, dimension(:,:) :: unu, unv, usu, usv, au, av, cu, cv, ftu, ftv, fbu, fbv, &
        u1u, u1v, cbu, cbv, wd, ar, rb, dinv, qs, act, bb, rr, zz, pd, qq, wk2, &
+       cxu, w1u, w0u, cxv, w1v, w0v, &
        du1o, dv1o, fdum, xru, xrv, cou, cov, fcr
   ! fs_nsub > 1: sums over the sub-steps of fbu, fbv (fsu, fsv) and of DU_avg2, DV_avg2 (asu, asv)
   real(rp), FSD allocatable, dimension(:,:) :: fsu, fsv, asu, asv

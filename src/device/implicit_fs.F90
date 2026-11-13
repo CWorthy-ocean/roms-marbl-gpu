@@ -205,12 +205,15 @@ contains
              au(is:ie, js:je), av(is:ie, js:je), cu(is:ie, js:je), cv(is:ie, js:je), &
              ftu(is:ie, js:je), ftv(is:ie, js:je), fbu(is:ie, js:je), fbv(is:ie, js:je), &
              u1u(is:ie, js:je), u1v(is:ie, js:je), cbu(is:ie, js:je), cbv(is:ie, js:je), &
+             cxu(is:ie, js:je), w1u(is:ie, js:je), w0u(is:ie, js:je), cxv(is:ie, js:je), w1v(is:ie, js:je), &
+             w0v(is:ie, js:je), &
              wd(is:ie, js:je), ar(is:ie, js:je), rb(is:ie, js:je), dinv(is:ie, js:je), &
              qs(is:ie, js:je), act(is:ie, js:je), bb(is:ie, js:je), &
              rr(is:ie, js:je), zz(is:ie, js:je), pd(is:ie, js:je), qq(is:ie, js:je), wk2(is:ie, js:je), &
              du1o(is:ie, js:je), dv1o(is:ie, js:je), fdum(is:ie, js:je), &
              xru(is:ie, js:je), xrv(is:ie, js:je), cou(is:ie, js:je), cov(is:ie, js:je), fcr(is:ie, js:je))
     xru = 0; xrv = 0; cou = 0; cov = 0; fcr = 0
+    cxu = 0; w1u = 0; w0u = 0; cxv = 0; w1v = 0; w0v = 0
     call fs_alloc_rates()      ! kept if a restart file supplied them
     if (fs_nsub > 1) then
       allocate(fsu(is:ie, js:je), fsv(is:ie, js:je), asu(is:ie, js:je), asv(is:ie, js:je))
@@ -273,6 +276,35 @@ contains
     zg = fs_flather_zghost
     call tw(0)
     call tq0()
+    ! Flather weights of the open normal faces (the CPU's fs_flather_wts): cx = dts pm sqrt(g h) at the first
+    ! interior rho point (the radiation condition of the boundary sea level), and with fs_flather_zghost
+    ! w1 = (1 + 2 cx)/(2 (1 + cx)), w0 = 1/(2 (1 + cx)); u faces 1 (west) and nx+1 (east), v faces 1 (south)
+    ! and ny+1 (north). Once per step (dts may change between runs), read by the setup, the Robin diagonal,
+    ! the boundary flux, the boundary sea level and the normal boundary velocity
+    nmax = max(nx, ny)
+    CUF_DO1
+    do m = 1, nmax
+      if (m <= ny) then
+        if (wf) then
+          cx = dtl * pm(1, m) * sqrt(gl * h(1, m)); cxu(1, m) = cx
+          w1u(1, m) = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx); w0u(1, m) = 0.5_rp / (1.0_rp + cx)
+        endif
+        if (ef) then
+          cx = dtl * pm(nx, m) * sqrt(gl * h(nx, m)); cxu(nx + 1, m) = cx
+          w1u(nx + 1, m) = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx); w0u(nx + 1, m) = 0.5_rp / (1.0_rp + cx)
+        endif
+      endif
+      if (m <= nx) then
+        if (sf) then
+          cx = dtl * pn(m, 1) * sqrt(gl * h(m, 1)); cxv(m, 1) = cx
+          w1v(m, 1) = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx); w0v(m, 1) = 0.5_rp / (1.0_rp + cx)
+        endif
+        if (nf) then
+          cx = dtl * pn(m, ny) * sqrt(gl * h(m, ny)); cxv(m, ny + 1) = cx
+          w1v(m, ny + 1) = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx); w0v(m, ny + 1) = 0.5_rp / (1.0_rp + cx)
+        endif
+      endif
+    enddo
 
     ! ---- (A) DU_avg_bak bookkeeping (EXTRAP_BAR_FLUXES): U^n for the end of the step
     CUF_DO2
@@ -427,8 +459,7 @@ contains
           if (zg) then
             ! fs_flather_zghost: the Flather sea level (zeta_1^n+1 + zeta_b^n+1)/2 with zeta_b^n+1 from the
             ! radiation condition = w1 zeta_1^n+1 + w0 zeta_b^n: Robin coefficient cb w1, w0 zeta_b explicit
-            cx = dtl * pm(1, j) * sqrt(gl * h(1, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
-            w0 = 0.5_rp / (1.0_rp + cx)
+            w1 = w1u(1, j); w0 = w0u(1, j)
             ftu(1, j) = mm * (b1 * unu(1, j) + (1.0_rp - b1) * gru(1, j) + td * (df * dn_u(1, j) * ubar_west(j) &
                  - cb * (w1 * zeta(1, j, ks) + w0 * zeta(0, j, ks) - zeta_west(j)) - unu(1, j)))
           endif
@@ -442,8 +473,7 @@ contains
                * ubar_east(j) + cb * (zeta(nx, j, ks) - zeta_east(j)) - unu(nx + 1, j)))
           cbu(nx + 1, j) = cb
           if (zg) then
-            cx = dtl * pm(nx, j) * sqrt(gl * h(nx, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
-            w0 = 0.5_rp / (1.0_rp + cx)
+            w1 = w1u(nx + 1, j); w0 = w0u(nx + 1, j)
             ftu(nx + 1, j) = mm * (b1 * unu(nx + 1, j) + (1.0_rp - b1) * gru(nx + 1, j) + td * (df * dn_u(nx + 1, j) &
                  * ubar_east(j) + cb * (w1 * zeta(nx, j, ks) + w0 * zeta(nx + 1, j, ks) - zeta_east(j)) - unu(nx + 1, j)))
           endif
@@ -457,8 +487,7 @@ contains
                - cb * (zeta(i, 1, ks) - zeta_south(i)) - unv(i, 1)))
           cbv(i, 1) = cb
           if (zg) then
-            cx = dtl * pn(i, 1) * sqrt(gl * h(i, 1)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
-            w0 = 0.5_rp / (1.0_rp + cx)
+            w1 = w1v(i, 1); w0 = w0v(i, 1)
             ftv(i, 1) = mm * (b1 * unv(i, 1) + (1.0_rp - b1) * grv(i, 1) + td * (df * dm_v(i, 1) * vbar_south(i) &
                  - cb * (w1 * zeta(i, 1, ks) + w0 * zeta(i, 0, ks) - zeta_south(i)) - unv(i, 1)))
           endif
@@ -472,8 +501,7 @@ contains
                * vbar_north(i) + cb * (zeta(i, ny, ks) - zeta_north(i)) - unv(i, ny + 1)))
           cbv(i, ny + 1) = cb
           if (zg) then
-            cx = dtl * pn(i, ny) * sqrt(gl * h(i, ny)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
-            w0 = 0.5_rp / (1.0_rp + cx)
+            w1 = w1v(i, ny + 1); w0 = w0v(i, ny + 1)
             ftv(i, ny + 1) = mm * (b1 * unv(i, ny + 1) + (1.0_rp - b1) * grv(i, ny + 1) + td * (df * dm_v(i, ny + 1) &
                  * vbar_north(i) + cb * (w1 * zeta(i, ny, ks) + w0 * zeta(i, ny + 1, ks) - zeta_north(i)) - unv(i, ny + 1)))
           endif
@@ -510,28 +538,28 @@ contains
         if (wf .and. i == 1) then
           rb(i, j) = rb(i, j) + dtl * td * cbu(1, j)
           if (zg) then
-            cx = dtl * pm(1, j) * sqrt(gl * h(1, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            w1 = w1u(1, j)
             rb(i, j) = rb(i, j) + dtl * td * cbu(1, j) * (w1 - 1.0_rp)
           endif
         endif
         if (ef .and. i == nx) then
           rb(i, j) = rb(i, j) + dtl * td * cbu(nx + 1, j)
           if (zg) then
-            cx = dtl * pm(nx, j) * sqrt(gl * h(nx, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            w1 = w1u(nx + 1, j)
             rb(i, j) = rb(i, j) + dtl * td * cbu(nx + 1, j) * (w1 - 1.0_rp)
           endif
         endif
         if (sf .and. j == 1) then
           rb(i, j) = rb(i, j) + dtl * td * cbv(i, 1)
           if (zg) then
-            cx = dtl * pn(i, 1) * sqrt(gl * h(i, 1)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            w1 = w1v(i, 1)
             rb(i, j) = rb(i, j) + dtl * td * cbv(i, 1) * (w1 - 1.0_rp)
           endif
         endif
         if (nf .and. j == ny) then
           rb(i, j) = rb(i, j) + dtl * td * cbv(i, ny + 1)
           if (zg) then
-            cx = dtl * pn(i, ny) * sqrt(gl * h(i, ny)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+            w1 = w1v(i, ny + 1)
             rb(i, j) = rb(i, j) + dtl * td * cbv(i, ny + 1) * (w1 - 1.0_rp)
           endif
         endif
@@ -602,7 +630,7 @@ contains
           fbu(1, j) = ftu(1, j)
           if (ow) then
             if (zg) then                     ! fs_flather_zghost: the Robin coefficient cb w1
-              cx = dtl * pm(1, j) * sqrt(gl * h(1, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+              w1 = w1u(1, j)
               fbu(1, j) = fbu(1, j) - td * (cbu(1, j) * w1) * xx(1, j)
             else
               fbu(1, j) = fbu(1, j) - td * cbu(1, j) * xx(1, j)
@@ -613,7 +641,7 @@ contains
           fbu(nx + 1, j) = ftu(nx + 1, j)
           if (oe) then
             if (zg) then
-              cx = dtl * pm(nx, j) * sqrt(gl * h(nx, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+              w1 = w1u(nx + 1, j)
               fbu(nx + 1, j) = fbu(nx + 1, j) + td * (cbu(nx + 1, j) * w1) * xx(nx, j)
             else
               fbu(nx + 1, j) = fbu(nx + 1, j) + td * cbu(nx + 1, j) * xx(nx, j)
@@ -624,7 +652,7 @@ contains
           fbv(i, 1) = ftv(i, 1)
           if (os) then
             if (zg) then
-              cx = dtl * pn(i, 1) * sqrt(gl * h(i, 1)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+              w1 = w1v(i, 1)
               fbv(i, 1) = fbv(i, 1) - td * (cbv(i, 1) * w1) * xx(i, 1)
             else
               fbv(i, 1) = fbv(i, 1) - td * cbv(i, 1) * xx(i, 1)
@@ -635,7 +663,7 @@ contains
           fbv(i, ny + 1) = ftv(i, ny + 1)
           if (on) then
             if (zg) then
-              cx = dtl * pn(i, ny) * sqrt(gl * h(i, ny)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
+              w1 = w1v(i, ny + 1)
               fbv(i, ny + 1) = fbv(i, ny + 1) + td * (cbv(i, ny + 1) * w1) * xx(i, ny)
             else
               fbv(i, ny + 1) = fbv(i, ny + 1) + td * cbv(i, ny + 1) * xx(i, ny)
@@ -683,7 +711,7 @@ contains
       if (m <= ny) then
         if (ew) then
           if (ow) then
-            cx = dtl * pm(1, m) * sqrt(gl * h(1, m))
+            cx = cxu(1, m)
             zeta(0, m, kn) = rmask(0, m) * (zeta(0, m, ks) + cx * zeta(1, m, kn)) / (1.0_rp + cx)
           else
             zeta(0, m, kn) = rmask(0, m) * zeta(1, m, kn)
@@ -691,7 +719,7 @@ contains
         endif
         if (ee) then
           if (oe) then
-            cx = dtl * pm(nx, m) * sqrt(gl * h(nx, m))
+            cx = cxu(nx + 1, m)
             zeta(nx + 1, m, kn) = rmask(nx + 1, m) * (zeta(nx + 1, m, ks) + cx * zeta(nx, m, kn)) / (1.0_rp + cx)
           else
             zeta(nx + 1, m, kn) = rmask(nx + 1, m) * zeta(nx, m, kn)
@@ -701,7 +729,7 @@ contains
       if (m <= nx) then
         if (es) then
           if (os) then
-            cx = dtl * pn(m, 1) * sqrt(gl * h(m, 1))
+            cx = cxv(m, 1)
             zeta(m, 0, kn) = rmask(m, 0) * (zeta(m, 0, ks) + cx * zeta(m, 1, kn)) / (1.0_rp + cx)
           else
             zeta(m, 0, kn) = rmask(m, 0) * zeta(m, 1, kn)
@@ -709,7 +737,7 @@ contains
         endif
         if (en) then
           if (on) then
-            cx = dtl * pn(m, ny) * sqrt(gl * h(m, ny))
+            cx = cxv(m, ny + 1)
             zeta(m, ny + 1, kn) = rmask(m, ny + 1) * (zeta(m, ny + 1, ks) + cx * zeta(m, ny, kn)) / (1.0_rp + cx)
           else
             zeta(m, ny + 1, kn) = rmask(m, ny + 1) * zeta(m, ny, kn)
@@ -754,8 +782,7 @@ contains
           mm = umask(1, j)
           dfn = 0.5_rp * (h(0, j) + zeta(0, j, ks) + h(1, j) + zeta(1, j, ks))
           if (zg) then                       ! fs_flather_zghost: zeta_1^n+1 -> w1 zeta_1^n+1 + w0 zeta_b(ks)
-            cx = dtl * pm(1, j) * sqrt(gl * h(1, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
-            w0 = 0.5_rp / (1.0_rp + cx)
+            w1 = w1u(1, j); w0 = w0u(1, j)
             ub = mm * (dfn * dn_u(1, j) * ubar_west(j) - (cbu(1, j) * w1) * (zeta(1, j, kn) &
                  + (w0 * zeta(0, j, ks) - zeta_west(j)) / w1))
           else
@@ -767,8 +794,7 @@ contains
           mm = umask(nx + 1, j)
           dfn = 0.5_rp * (h(nx, j) + zeta(nx, j, ks) + h(nx + 1, j) + zeta(nx + 1, j, ks))
           if (zg) then
-            cx = dtl * pm(nx, j) * sqrt(gl * h(nx, j)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
-            w0 = 0.5_rp / (1.0_rp + cx)
+            w1 = w1u(nx + 1, j); w0 = w0u(nx + 1, j)
             ub = mm * (dfn * dn_u(nx + 1, j) * ubar_east(j) + (cbu(nx + 1, j) * w1) * (zeta(nx, j, kn) &
                  + (w0 * zeta(nx + 1, j, ks) - zeta_east(j)) / w1))
           else
@@ -780,8 +806,7 @@ contains
           mm = vmask(i, 1)
           dfn = 0.5_rp * (h(i, 0) + zeta(i, 0, ks) + h(i, 1) + zeta(i, 1, ks))
           if (zg) then
-            cx = dtl * pn(i, 1) * sqrt(gl * h(i, 1)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
-            w0 = 0.5_rp / (1.0_rp + cx)
+            w1 = w1v(i, 1); w0 = w0v(i, 1)
             ub = mm * (dfn * dm_v(i, 1) * vbar_south(i) - (cbv(i, 1) * w1) * (zeta(i, 1, kn) &
                  + (w0 * zeta(i, 0, ks) - zeta_south(i)) / w1))
           else
@@ -793,8 +818,7 @@ contains
           mm = vmask(i, ny + 1)
           dfn = 0.5_rp * (h(i, ny) + zeta(i, ny, ks) + h(i, ny + 1) + zeta(i, ny + 1, ks))
           if (zg) then
-            cx = dtl * pn(i, ny) * sqrt(gl * h(i, ny)); w1 = 0.5_rp * (1.0_rp + 2.0_rp * cx) / (1.0_rp + cx)
-            w0 = 0.5_rp / (1.0_rp + cx)
+            w1 = w1v(i, ny + 1); w0 = w0v(i, ny + 1)
             ub = mm * (dfn * dm_v(i, ny + 1) * vbar_north(i) + (cbv(i, ny + 1) * w1) * (zeta(i, ny, kn) &
                  + (w0 * zeta(i, ny + 1, ks) - zeta_north(i)) / w1))
           else
