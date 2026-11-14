@@ -18,7 +18,7 @@ module pre_step3d_mod
   use passive_mod, only: ntp, tp, passive_predictor, passive_t3dbc
   use obc, only: u3dbc, v3dbc, t3dbc
   use rivers_mod, only: river_on, rivers_ts, rivers_uv, RIV_PRE
-  use imex_igw, only: imex_on, imex_solve_stage, imex_stage_pred, imex_predictor_transport
+  use imex_igw, only: imex_on, imex_solve_stage, imex_stage_pred, imex_predictor_transport, imex_obc_faces
   implicit none
   private
   public :: pre_step3d
@@ -573,6 +573,7 @@ contains
     if (river_on) call rivers_uv(RIV_PRE)
     call u3dbc()
     call v3dbc()
+    call imex_obc_faces(imex_stage_pred)                   ! 'modal': the normal open faces (CPU imex_obc_faces)
     call imex_predictor_transport()                        ! Flx_pred -> FlxU, FlxV; We, Wi
 
     ! ---- pass 2: tracer predictor with Flx_pred

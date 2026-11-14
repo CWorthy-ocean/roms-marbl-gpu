@@ -105,19 +105,31 @@
 # CPU's message.
 #
 # IMEX internal-wave step (&imex_igw_settings present: on; absent: the
-# stock step), as in ucla-roms #433 (IMEX_IGW; the 'fixed' open
-# boundary: open faces take the OBC's explicit value). The CPU's cpp
-# key IMEX_IGW is the presence of the group here. The settings (the keys
-# of UCLA ROMS's namelist template; defaults in brackets):
+# stock step), as in ucla-roms #433 and #434 (IMEX_IGW with its 'modal'
+# open boundary). The CPU's cpp key IMEX_IGW is the presence of
+# the group here. The settings (the keys of UCLA ROMS's namelist
+# template; defaults in brackets):
 #   imex_verbose     0 quiet; 1 solver statistics (IMEX line,           [0]
 #                    IMEX_SOLVE); 2 + the true FP64 residual of every
 #                    solve (IMEX_PCHK) and max |dp|; same results
 #   imex_bref_hours  rebuild interval (model hours) of the reference     [24]
-#                    stratification b_ref, the operator and its
-#                    preconditioner; 12 for strongly evolving
-#                    stratification
+#                    stratification b_ref, the operator, its
+#                    preconditioner and the 'modal' boundary modes; 12
+#                    for strongly evolving stratification
 #   imex_rst_state   1 the IMEX state in the restart files (exact        [1]
 #                    restart); 0 none (smaller files, inexact restart)
+#   imex_obc_mode    normal velocity at open faces: 'modal' the     ['auto']
+#                    characteristic (per-mode Flather) condition,
+#                    implicit in the stage solves; 'fixed' the OBC's
+#                    explicit value; 'auto' 'modal' when an open side
+#                    exists and every open side has 3-D boundary data
+#                    (normal velocity, temperature, salinity: the CPU's
+#                    M3_FRC_BRY and T_FRC_BRY), else 'fixed' (decided at
+#                    the first step and printed)
+#   imex_obc_tref    'modal': time scale (s) of the reference m(z),  [259200]
+#                    the low-passed baroclinic mismatch that is not
+#                    radiated; 0 none; >= ~3 inertial periods at the
+#                    open edges' lowest |f| and >= 1 d
 # Solver and development settings: read as in UCLA ROMS, where the
 # defaults are the recommended values, the keys may change between
 # versions and C-Star and Forge do not expose them: imex_theta_p,
@@ -127,13 +139,17 @@
 # GPU), imex_n2_ref, imex_n2_taper, imex_warm (0, 1), imex_setup_lag,
 # imex_pcg_start (0, 2, 3 on the GPU: 1 is CPU-only), imex_pcg_fused,
 # imex_solver_prec, imex_stage_fused (only 1 on the GPU), imex_redu (only
-# 0 on the GPU), imex_mix_split (0, 1). The values the GPU refuses stop
+# 0 on the GPU), imex_mix_split (0, 1), and of the boundary
+# imex_obc_nmodes, imex_obc_q0 (0 off, or 0.2-1: sqrt(1 - f^2/omega0^2)
+# where f/omega0 > 0.6 at the edges where the internal tide enters),
+# imex_obc_cmin, imex_obc_mprint (OBCM/OBCF lines). The values the GPU refuses stop
 # the run at start-up. GPU tuning settings (roms_gpu only; a namelist that
 # sets one stops UCLA ROMS): imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep
 # (on: deterministic sums, the fused stage, the restructured operator
-# sweep). The keys of the 'modal' open boundary (imex_obc_*, ucla-roms
-# #434) are not part of this version: a namelist that sets one stops at
-# the read.
+# sweep). 'modal' needs the fused solve (imex_pcg_start 2 or 3,
+# imex_pcg_fused 1, imex_warm 1) with imex_gpu_stage and imex_gpu_sweep on
+# (the defaults); with other values 'modal' stops and 'auto' runs 'fixed'
+# with a note (the CPU would run 'modal', e.g. with imex_pcg_start 0).
 # Keys removed from UCLA ROMS on 2026-11-13 (their former defaults are now
 # fixed) stop the run at the read with a message that lists them; this
 # GNU sed line deletes them, with their comment and value continuation
@@ -141,9 +157,10 @@
 # src/namelist.nml):
 # sed -E -i '/^[[:space:]]*(imex_force_mode|imex_n2_min|imex_bt_mode|imex_bt_passes|imex_s2d_check|imex_rhs_full|imex_probe_steps|imex_pcols|imex_win|imex_precond|imex_pcg_variant|imex_pcg_overlap|imex_adj_fused|imex_bref|imex_bref_floor|imex_bref_every|imex_bref_smooth|imex_n2_reg|imex_obc_rhs|imex_obc_op|imex_obc_zero|imex_obc_diag|imex_pred_btfix|imex_tsmix_n|imex_sponge_eq|imex_trim3d|imex_obc_eig|imex_obc_dcols|imex_obc_scrit|imex_obc_sband|imex_obc_fref|imex_obc_trelax|imex_obc_cslow|imex_obc_supercrit)[[:space:]]*[=(]/I{:a;$!{N;/\n([[:blank:]]*([A-Za-z_][A-Za-z0-9_%]*[[:blank:]]*[=(]|[\/&$])[^\n]*|[[:blank:]]*|![^\n]*)$/!ba};/\n([[:blank:]]*([A-Za-z_][A-Za-z0-9_%]*[[:blank:]]*[=(]|[\/&$])[^\n]*|[[:blank:]]*|![^\n]*)$/!d;s/^.*\n/\n/;D}' namelist.nml
 # The free surface takes &implicit_fs as without IMEX (no IMEX-specific
-# default). Restart files carry the IMEX state and 17 restart scalars as
-# the CPU's; a file written with a removed option, or with the 'modal'
-# boundary, is read as an inexact restart with a note.
+# default). Restart files carry the IMEX state, the 'modal' reference m
+# (imex_obcm) and 17 restart scalars as the CPU's; a file written with a
+# removed option, or with other boundary settings (e.g. 'fixed' to
+# 'modal'), is read as an inexact restart with a note.
 #
 # Half-resolution forcing: interp_bulk_frc, interp_flux_frc
 # (&surf_frc_settings) and interp_bgc_frc (&bgc_settings) are read but not

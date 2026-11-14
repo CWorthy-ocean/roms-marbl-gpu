@@ -3,9 +3,9 @@
 module imex_igw
   ! Implicit-explicit (IMEX) treatment of the internal-wave terms in the
   ! LF-AM3 baroclinic step: the GPU port of UCLA ROMS's IMEX_IGW (branch
-  ! imex-core, commit 640c086f, src/imex_igw.F90, the 'fixed' open boundary; design and history in
-  ! /glade/work/bachman/imex_internal_waves STATUS.md, IMPLEMENTATION_SPEC.md, IMEX_KEY_TRIM.md,
-  ! GPU_IMEX_MODAL_PORT.md). The CPU switches it on with the cpp key
+  ! imex-modal, commit 75d3b58b, src/imex_igw.F90, with its 'modal' open boundary (imex_obm.inc); design
+  ! and history in /glade/work/bachman/imex_internal_waves STATUS.md, IMPLEMENTATION_SPEC.md,
+  ! IMEX_KEY_TRIM.md, GPU_IMEX_MODAL_PORT.md). The CPU switches it on with the cpp key
   ! IMEX_IGW; here it is on when the namelist has an &imex_igw_settings
   ! group (same keys and defaults as the CPU). Without the group nothing in
   ! this module runs and the model is the stock one.
@@ -35,7 +35,10 @@ module imex_igw
   ! imex_allow_explicit (with the weights it allows), the weights, the
   ! tolerances, imex_maxit, imex_verbose 0/1/2, imex_mix_split 0/1,
   ! imex_n2_ref, imex_n2_taper, imex_bref_hours, imex_warm 0/1,
-  ! imex_setup_lag 0/1, imex_rst_state 0/1, and the solver paths
+  ! imex_setup_lag 0/1, imex_rst_state 0/1, imex_obc_mode 'fixed'/'modal'/'auto'
+  ! with imex_obc_nmodes, imex_obc_q0, imex_obc_tref, imex_obc_cmin,
+  ! imex_obc_mprint ('modal' needs the fused solve with imex_gpu_stage and
+  ! imex_gpu_sweep on; obm_decide), and the solver paths
   ! imex_pcg_start 0 (the CPU's imex_pcg_warm/imex_pcg) or imex_pcg_start 2/3
   ! with imex_pcg_fused 1 (imex_pcgf8/4, storage imex_solver_prec 8/4;
   ! imex_pf.inc). imex_am3_crv other than 1/6, imex_selftest 1,
@@ -61,9 +64,13 @@ module imex_igw
   use decomp_mod, only: decomp
   use gpu_state, only: u, v, t, Hz, z_r, z_w, FlxU, FlxV, We, Wi, pm, pn, dn_u, dm_v, dm_u, dn_v, &
                        rmask, umask, vmask, rho1, ru, rv, DU_avg1, DU_avg2, DU_avg_bak, &
-                       DV_avg1, DV_avg2, DV_avg_bak, h
+                       DV_avg1, DV_avg2, DV_avg_bak, h, &
+                       t_west, u_west, t_east, u_east, t_south, v_south, t_north, v_north
   use time_state, only: nstp, nnew, nrhs, iic, ntstart, ntimes, dt, is_first_time_step, ninfo_steps
-  use formulas, only: g, rho0, AM3_crv
+  use formulas, only: g, rho0, AM3_crv, qp2, eos_r00, eos_r01, eos_r02, eos_r03, eos_r04, eos_r05, eos_r10, &
+                      eos_r11, eos_r12, eos_r13, eos_r14, eos_rS0, eos_rS1, eos_rS2, eos_r20, eos_K00, eos_K01, &
+                      eos_K02, eos_K03, eos_K04, eos_K10, eos_K11, eos_K12, eos_K13, eos_KS0, eos_KS1, eos_KS2, &
+                      eos_Ttr, eos_Tsr
   use halo_mod, only: hg_begin, hg_add, hg_end, halo_fill_3d, halo_fill_3d_w, halo_fill_2d, &
                       F_U, F_V, F_FLXU, F_FLXV
   use comm_mod, only: comm_world_rank, comm_allreduce_sum, comm_allreduce_max, comm_allreduce_min, &
@@ -85,6 +92,10 @@ module imex_igw
   ! finish it, and the arrays are public for the two I/O paths
   public :: imex_rst_prepare, imex_rst_scal_vals, imex_rst_accept, imex_rst_loaded, imex_rst_has, imex_rst_alloc
   public :: imex_stage_on
+  ! 'modal' open boundary (imex_obm.inc): the face writes after u3dbc/v3dbc of pre_step3d and
+  ! step3d_uv2; the restart's reference m at the faces' ghost cells
+  public :: imex_obc_faces, imex_obm_rst_may
+  public :: obcm3
   public :: pgu, pgv, ipg_nm1, dpw, hs1, hs2, hsol, pf_mq, bref_sav, ad_n2raw, hz_op, dza, ad_n2o
   integer, parameter, public :: imex_nsc = 17
 
@@ -92,9 +103,9 @@ module imex_igw
 
   integer(ip), parameter, public :: imex_stage_pred = 1, imex_stage_corr = 2
 
-  ! Namelist IMEX_IGW_SETTINGS: the CPU's keys and defaults (UCLA ROMS imex-core 640c086f). The
-  ! template keys (the ones a user sets): imex_verbose, imex_bref_hours, imex_rst_state; the others
-  ! are solver and development settings (NAMELIST_COMPAT)
+  ! Namelist IMEX_IGW_SETTINGS: the CPU's keys and defaults (UCLA ROMS imex-modal 75d3b58b). The
+  ! template keys (the ones a user sets): imex_verbose, imex_bref_hours, imex_rst_state,
+  ! imex_obc_mode, imex_obc_tref; the others are solver and development settings (NAMELIST_COMPAT)
   real(rp)    :: imex_theta_p = 0.5_rp, imex_phi = 0.25_rp, imex_theta_c = 0.6_rp
   real(rp)    :: imex_mu = 0.0_rp, imex_nu = 0.3_rp, imex_rho = 0.1_rp
   real(rp)    :: imex_am3_crv = 1.0_rp / 6.0_rp
@@ -161,6 +172,16 @@ module imex_igw
   ! correction). With the additive form the explicit Laplacian of a sponge band made the IMEX step
   ! unstable at C_igw > ~2.
   integer, public, protected :: imex_mix_split = 1
+  ! The CPU's 'modal' open boundary (keys and defaults as the CPU's): 'auto' selects 'modal' with an
+  ! open edge and 3-D boundary data (obm_decide). imex_obc_mode, imex_obc_tref: template keys;
+  ! imex_obc_nmodes, imex_obc_q0 (0 off, else 0.2-1), imex_obc_cmin, imex_obc_mprint (OBCM/OBCF
+  ! lines): solver and development settings
+  character(len=8) :: imex_obc_mode = 'auto'
+  integer     :: imex_obc_nmodes = 3
+  real(rp)    :: imex_obc_q0 = 0.0_rp
+  real(rp)    :: imex_obc_tref = 259200.0_rp
+  integer     :: imex_obc_mprint = 0
+  real(rp)    :: imex_obc_cmin = 0.3_rp
 
   ! Former keys, fixed at their former defaults (removed from the namelist 2026-11-13, UCLA ROMS
   ! IMEX_KEY_TRIM): the N2 regularization of the diagonal [s-2], the b_ref smoothing passes along
@@ -185,6 +206,8 @@ module imex_igw
        imex_n2_ref, imex_n2_taper, imex_warm, &
        imex_bref_hours, imex_setup_lag, imex_pcg_start, imex_pcg_fused, imex_solver_prec, imex_stage_fused, &
        imex_redu, imex_rst_state, imex_mix_split, &
+       imex_obc_mode, imex_obc_nmodes, imex_obc_q0, imex_obc_tref, &
+       imex_obc_mprint, imex_obc_cmin, &
        imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep
 
   ! Weights (set_derived_weights): regular step and first step of a run
@@ -290,6 +313,36 @@ module imex_igw
   integer :: st_n(2) = 0, st_it(2) = 0, st_itmax(2) = 0, st_bad = 0
   real(rp) :: st_dp(2) = 0.0_rp, st_du(2) = 0.0_rp
   logical :: talk = .false.
+
+  ! 'modal' open boundary (imex_obm.inc; CPU names ob_* where they exist). imex_obc_modal: in effect
+  ! (obm_decide, first IMEX step); obm_gpu_ok: the solver path supports it (check_settings);
+  ! rst_md_file: imex_rst_scal(16) of the restart whose state was read
+  logical, public, protected :: imex_obc_modal = .false.
+  logical :: obm_decided = .false., obm_gpu_ok = .false.
+  integer :: rst_md_file = 1
+  integer, parameter :: OBM_MMAX = 20, OBM_NT = 64, OBM_BT = 32   ! OBM_BT: threads per column (per-stage, per-sweep kernels)
+  ! obm_modes_d (CPU obm_modes): multisection steps, Rayleigh-quotient passes, shifts per bracket and pass,
+  ! bracket and near-degeneracy tolerances
+  integer, parameter :: OBM_MBIS = 160, OBM_MRQ = 12, OBM_NSEC = 1
+  real(rp), parameter :: OBM_TOLB = 1.e-2_rp, OBM_TOLG = 1.e-6_rp
+  real(rp), parameter :: obm_tramp = 86400.0_rp
+  ! packed open-edge face columns (obm_init) and the cells next to the faces
+  integer :: ob_nc = 0, ob_np = 0, ob_m = 0, ob_nact = 0, ob_nbuild = 0, ob_mn = 0
+  logical :: ob_edge(4) = .false., ob_mr_ok = .false., ob_rst = .false.
+  integer(ip), WORK_ATTR allocatable :: ob_ce(:), ob_cl(:), ob_ci(:), ob_cj(:), ob_fi(:), ob_fj(:), ob_gi(:), ob_gj(:)
+  integer(ip), WORK_ATTR allocatable :: ob_pi(:), ob_pj(:), ob_pc(:,:), ob_wi(:,:,:), ob_dg(:,:)
+  ! the face columns' data (CPU ob_act, ob_yr, ob_w, ob_hn, ob_ub, ob_a, ob_c, ob_phi, ob_mr;
+  ! ob_kdc the Jacobi column of each face, ob_dd the mismatch for the OBCM lines, ob_pd diagnostics
+  ! partials), work arrays ob_gk, ob_sc, ob_z, ob_wr
+  real(rp), WORK_ATTR allocatable :: ob_act(:), ob_yr(:), ob_w(:,:), ob_hn(:,:), ob_ub(:,:), ob_kdc(:,:)
+  real(rp), WORK_ATTR allocatable :: ob_a(:,:), ob_c(:,:), ob_phi(:,:,:), ob_mr(:,:), ob_dd(:,:)
+  real(rp), WORK_ATTR allocatable :: ob_pd(:,:), ob_gk(:,:), ob_sc(:,:,:), ob_z(:,:,:,:), ob_wr(:,:,:)
+  ! the operator sweep's face coefficients (cxo, cyo, and dn_u, dm_v at the active open faces under
+  ! 'modal'); the column of each open face (0: none), always allocated (rhs_transport reads them)
+  real(rp), WORK_ATTR allocatable :: cxm(:,:), cym(:,:)
+  integer(ip), WORK_ATTR allocatable :: obcol_u(:,:), obcol_v(:,:)
+  ! restart: imex_obcm (the reference at the faces' ghost cells)
+  real(rp), WORK_ATTR allocatable :: obcm3(:,:,:)
 
 contains
 
@@ -424,6 +477,14 @@ contains
     if (imex_pcg_fused < 0 .or. imex_pcg_fused > 1) call bad('imex_pcg_fused must be 0 or 1')
     if (imex_solver_prec /= 4 .and. imex_solver_prec /= 8) call bad('imex_solver_prec must be 8 or 4')
     if (imex_rst_state < 0 .or. imex_rst_state > 1) call bad('imex_rst_state must be 0 or 1')
+    if (trim(imex_obc_mode) /= 'fixed' .and. trim(imex_obc_mode) /= 'modal' .and. trim(imex_obc_mode) /= 'auto') &
+      call bad("imex_obc_mode must be 'fixed', 'modal' or 'auto'")
+    ! (the CPU checks these when the run is 'modal'; here 'auto' is resolved at the first step)
+    if (trim(imex_obc_mode) /= 'fixed' .and. (imex_obc_nmodes < 1 .or. imex_obc_nmodes > 20 .or. &
+        (imex_obc_q0 /= 0.0_rp .and. (imex_obc_q0 < 0.2_rp .or. imex_obc_q0 > 1.0_rp)) .or. imex_obc_tref < 0.0_rp &
+        .or. imex_obc_mprint < 0)) call bad('imex_obc_nmodes must be in 1..20, imex_obc_q0 0 (off) or in [0.2, 1]' &
+         // ' (the admittances are divided by q0), imex_obc_tref >= 0 and imex_obc_mprint >= 0')
+    if (imex_obc_cmin < 0.0_rp) call bad('imex_obc_cmin must be >= 0')
     ! What the GPU port has (the CPU's default path); the other values of the CPU's solver and
     ! development settings are CPU-only
     if (abs(imex_am3_crv - AM3_crv) > tol) call bad('imex_am3_crv: only 1/6 (the stock LF-AM3) on the GPU')
@@ -454,6 +515,13 @@ contains
                .and. imex_theta_p > 0.0_rp .and. imex_theta_c > 0.0_rp
     if (imex_gpu_sweep < 0 .or. imex_gpu_sweep > 1) call bad('imex_gpu_sweep must be 0 or 1')
     sweep_on = (imex_gpu_sweep == 1) .and. pf_on
+    ! 'modal' on the GPU (obm_decide): the face term lives in the restructured sweep (PF_OPS), the face
+    ! values in the fused stage (solve_stage_fast); imex_pcg_start 0 (apply_m, CPU's unfused operator)
+    ! is not ported ('modal' stops, 'auto' runs 'fixed' with a note)
+    obm_gpu_ok = pf_on .and. sweep_on .and. stage_on .and. imex_solver_enabled
+    if (trim(imex_obc_mode) == 'modal' .and. .not. obm_gpu_ok) call bad("imex_obc_mode = 'modal' on the GPU" &
+         // ' needs imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm 1, theta_p, theta_c > 0, imex_gpu_stage 1' &
+         // ' and imex_gpu_sweep 1')
     if (nerr > 0) error stop 'imex_igw: unsupported &imex_igw_settings (see above)'
   contains
     subroutine bad(what)
@@ -506,6 +574,8 @@ contains
          '  imex_gpu_stage =', merge(1, 0, stage_on), '  imex_gpu_sweep =', merge(1, 0, sweep_on)
     write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_redu =', imex_redu, '  imex_rst_state =', imex_rst_state, &
          '  imex_mix_split =', imex_mix_split
+    write(*,'(3x,a,a,a)') "imex_obc_mode = '", trim(imex_obc_mode), "' (resolved at the first step: 'auto'" &
+         // " selects 'modal' with an open edge and 3-D boundary data)"
     if (imex_gpu_stage == 1 .and. .not. stage_on) write(*,'(3x,a)') 'imex_gpu_stage = 1 needs the fused solve,' &
          // ' imex_warm = 1 and theta_p, theta_c > 0: the session-2 stage is used'
     write(*,*)
@@ -529,6 +599,10 @@ contains
     allocate(act(is:ie, js:je), darea(is:ie, js:je), ad_act(is:ie, js:je))
     allocate(rshu(is:ie, js:je), rshv(is:ie, js:je))
     cx = 0.0_rp; cy = 0.0_rp; cxo = 0.0_rp; cyo = 0.0_rp; act = 0.0_rp; darea = 0.0_rp; ad_act = 0.0_rp
+    allocate(cxm(is:ie, js:je), cym(is:ie, js:je), obcol_u(is:ie, js:je), obcol_v(is:ie, js:je))
+    cxm = 0.0_rp; cym = 0.0_rp; obcol_u = 0; obcol_v = 0
+    allocate(ob_ub(nz, 1), ob_act(1)); ob_ub = 0.0_rp; ob_act = 0.0_rp   ! (read by rhs_transport; obm_init
+                                                                         ! reallocates them)
     rshu = 0.0_rp; rshv = 0.0_rp
     allocate(dza(is:ie, js:je, nz)); dza = 0.0_rp
     allocate(ad_bb(is:ie, js:je, nz), bref_sav(is:ie, js:je, nz), ad_n2raw(is:ie, js:je, nz))
@@ -593,6 +667,7 @@ contains
     ! the first-step weights and u_nm1, v_nm1 := level n.
     if (.not. imex_on) return
     if (.not. allocated(pgu)) call imex_alloc()
+    if (.not. obm_decided) call obm_decide()        ! 'modal' or 'fixed' (may turn the restart inexact)
     ! (exact restart with the IMEX state read, rst_read: an ordinary step; u^n-1 is the
     ! restart's earlier record, in slot 3-nstp; pg_nm1 and the solver state come from the file)
     first_step = ((iic == ntstart) .and. .not. rst_read) .or. is_first_time_step()
@@ -1073,6 +1148,9 @@ contains
       theta = imex_theta_p; tol = imex_tol_pred
       call u3dbc()                         ! 'fixed': OBC values of the explicit u*
       call v3dbc()
+      ! 'modal': the explicit face values, written into u, v(nnew) at the open faces (CPU obm_explicit,
+      ! imex_obc_faces in imex_obc_pre; obm_explicit reads nothing u3dbc/v3dbc write)
+      if (imex_obc_modal) call obm_explicit(imex_stage_pred, .true.)
       call hg_begin()
       call hg_add(F_U, nnew)
       call hg_add(F_V, nnew)
@@ -1082,6 +1160,7 @@ contains
       is_ = 2
       dts = dt; cb = 0.0_rp
       theta = imex_theta_c; tol = imex_tol_corr
+      if (imex_obc_modal) call obm_explicit(imex_stage_corr, .false.)   ! 'modal': face values (rhs bfix)
       call hg_begin()
       call hg_add(F_U, nnew)
       call hg_add(F_V, nnew)
@@ -1129,8 +1208,8 @@ contains
     real(rp), intent(in) :: w(3), wm
     integer(ip), intent(in) :: sa, sb, sm
     logical, intent(in) :: mom
-    integer(ip) :: i, j, k, nx, ny, nz, s_a, s_b, s_m, imo, bnd, skp
-    real(rp) :: w1, w2, w3, wmom, sf, d, hf
+    integer(ip) :: i, j, k, nx, ny, nz, s_a, s_b, s_m, imo, bnd, skp, mdl, oc
+    real(rp) :: w1, w2, w3, wmom, sf, d, hf, ua
     logical :: ew, ee, es, en
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     s_a = sa; s_b = sb; s_m = max(sm, 1_ip)
@@ -1138,6 +1217,7 @@ contains
     imo = merge(1_ip, 0_ip, mom); wmom = wm
     ew = decomp%edge_w; ee = decomp%edge_e; es = decomp%edge_s; en = decomp%edge_n
     skp = merge(1_ip, 0_ip, stage_on)    ! imex_gpu_stage: closed faces (F = 0 on every call) skipped
+    mdl = merge(1_ip, 0_ip, imex_obc_modal)   ! 'modal': the face's explicit value instead of u* (CPU bfix)
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
@@ -1155,9 +1235,15 @@ contains
         if (ew .and. i == 1) bnd = 1
         if (ee .and. i == nx + 1) bnd = 1
         if (imo == 1 .and. bnd == 1) then
+          oc = 0
+          if (mdl == 1) oc = obcol_u(i, j)
           do k = 1, nz
             hf = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k))
-            d = wmom * dn_u(i, j) * (hf * u(i, j, k, s_a) - u(i, j, k, s_m))
+            ua = u(i, j, k, s_a)
+            if (oc > 0) then
+              if (ob_act(oc) > 0.0_rp) ua = ob_ub(k, oc)
+            endif
+            d = wmom * dn_u(i, j) * (hf * ua - u(i, j, k, s_m))
             wk_fu(i, j, k) = wk_fu(i, j, k) + d
             sf = sf + d
           enddo
@@ -1189,9 +1275,15 @@ contains
         if (es .and. j == 1) bnd = 1
         if (en .and. j == ny + 1) bnd = 1
         if (imo == 1 .and. bnd == 1) then
+          oc = 0
+          if (mdl == 1) oc = obcol_v(i, j)
           do k = 1, nz
             hf = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k))
-            d = wmom * dm_v(i, j) * (hf * v(i, j, k, s_a) - v(i, j, k, s_m))
+            ua = v(i, j, k, s_a)
+            if (oc > 0) then
+              if (ob_act(oc) > 0.0_rp) ua = ob_ub(k, oc)
+            endif
+            d = wmom * dm_v(i, j) * (hf * ua - v(i, j, k, s_m))
             wk_fv(i, j, k) = wk_fv(i, j, k) + d
             sf = sf + d
           enddo
@@ -1348,6 +1440,7 @@ contains
           cxo(i, j) = cx(i, j)
           if (ew .and. i == 1) cxo(i, j) = 0.0_rp
           if (ee .and. i == nx + 1) cxo(i, j) = 0.0_rp
+          cxm(i, j) = cxo(i, j)
         endif
         if (i <= nx) then
           cy(i, j) = 0.0_rp
@@ -1357,6 +1450,7 @@ contains
           cyo(i, j) = cy(i, j)
           if (es .and. j == 1) cyo(i, j) = 0.0_rp
           if (en .and. j == ny + 1) cyo(i, j) = 0.0_rp
+          cym(i, j) = cyo(i, j)
         endif
       enddo
     enddo
@@ -1452,6 +1546,7 @@ contains
     call adj_diag_coef()
     ! eta_setup(2): 1/N2
     call recip3(ad_n2t, ad_n2c)
+    if (imex_obc_modal) call obm_build()  ! 'modal': modes, admittances and the Jacobi term (CPU obm_build)
   end subroutine adj_setup
 
   subroutine bref_build()
@@ -2656,6 +2751,7 @@ contains
           enddo
         enddo
       enddo
+      if (imex_obc_modal) call obm_dinv(s, c2, hv, 8)   ! 'modal': + theta dt ob_kd on the boundary cells
       pf_dver8(s) = coef_version; pf_dc28(s) = c2
     endif
   end subroutine pf_setup8
@@ -2733,6 +2829,7 @@ contains
           enddo
         enddo
       enddo
+      if (imex_obc_modal) call obm_dinv(s, c2, hv, 4)   ! 'modal': + theta dt ob_kd on the boundary cells
       pf_dver4(s) = coef_version; pf_dc24(s) = c2
     endif
   end subroutine pf_setup4
@@ -2777,6 +2874,8 @@ contains
     if (talk) write(*,'(1x,a,i2,i5,a,i2,3es24.16)') 'IMEX_PCHK', stage, iters, ' prec', pf_prec, &
          resid, sqrt(glob(1) / max(glob(3), 1.e-300_8)), sqrt(glob(2) / max(glob(3), 1.e-300_8))
   end subroutine pf_check
+
+#include "imex_obm.inc"
 
 #define PFK 8
 #define PF_SOLVE pf_solve8
@@ -2931,8 +3030,10 @@ contains
   ! dimension (one copy per file) and are written with the second record of the EXACT_RESTART pair
   ! only (rec 2, the record a restart continues from); imex_rst_scal stays per record, flag 1 = 1
   ! only on the record whose state is in the file, 15 = layout (2; 0 in the files of e8fca7b-aeceaec,
-  ! a copy per record, still read), 16 = mode (rst_mode: 1; files with removed options or the 'modal'
-  ! boundary are read as inexact restarts, with a note), 17 = 0 (the CPU's 'modal' ramp count).
+  ! a copy per record, still read), 16 = mode (rst_mode: 1, 'modal' + 100 + its settings; files with
+  ! removed options are read as inexact restarts, with a note; the boundary part is checked by
+  ! obm_decide), 17 = the 'modal' reference's update count (ob_mn).
+  !   imex_obcm           'modal': the reference m at the ghost cell beyond each open face
   ! Only the variables the settings in effect use are written (imex_rst_has): x with imex_warm > 0,
   ! mx with imex_pcg_start 3 + imex_warm 1 + the setup lag, n2raw whenever the taper uses it (CPU
   ! 72539140; before it, with the lag and 'coef', n2raw was recomputed on read from imex_bref and
@@ -2964,8 +3065,28 @@ contains
       imex_rst_has = lag_on
     case ('imex_n2o')
       imex_rst_has = .not. lag_on
+    case ('imex_obcm')                             ! 'modal' with the reference (CPU rst_has_obcm)
+      if (.not. obm_decided) call obm_decide()
+      imex_rst_has = imex_obc_modal .and. imex_obc_tref > 0.0_rp
     end select
   end function imex_rst_has
+
+  logical function imex_obm_rst_may(name)
+    ! reading the initial file (before obm_decide): imex_obcm is read when the run may be 'modal' with
+    ! the reference; obm_decide keeps it only for a 'modal' run of the same settings
+    character(len=*), intent(in) :: name
+    imex_obm_rst_may = imex_on .and. imex_solver_enabled .and. imex_rst_state == 1 .and. &
+         trim(imex_obc_mode) /= 'fixed' .and. imex_obc_tref > 0.0_rp .and. trim(name) == 'imex_obcm'
+  end function imex_obm_rst_may
+
+  subroutine imex_obc_faces(stage)
+    ! 'modal' (CPU imex_obc_faces after u3dbc/v3dbc): pre_step3d (stage 1, with the barotropic mean of
+    ! the predictor transport) and step3d_uv2 (stage 2); the stage's face increment (CPU obm_correct)
+    ! is applied here, fused with the face write
+    integer, intent(in) :: stage
+    if (.not. imex_on) return
+    if (imex_obc_modal) call obm_correct_faces(stage)
+  end subroutine imex_obc_faces
 
   logical function imex_stage_on()
     ! imex_gpu_stage = 1 in effect: the stage solutions are hs1, hs2 (else hsol(:,:,:,1:2))
@@ -2978,6 +3099,9 @@ contains
     if (.not. allocated(pgu)) call imex_alloc()
     if (.not. allocated(pf_mq)) then
       allocate(pf_mq(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)); pf_mq = 0.0_rp
+    endif
+    if (.not. allocated(obcm3) .and. imex_obm_rst_may('imex_obcm')) then
+      allocate(obcm3(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz)); obcm3 = 0.0_rp
     endif
   end subroutine imex_rst_alloc
 
@@ -3002,6 +3126,7 @@ contains
         enddo
       enddo
     endif
+    if (imex_rst_has('imex_obcm')) call obm_m_to3()   ! 'modal': m at the faces' ghost cells
 #ifdef USE_CUDA
     ierr = cudaDeviceSynchronize()
 #endif
@@ -3012,8 +3137,8 @@ contains
     ! (only with rec 2, the record the 3-D state is written with, and imex_rst_state 1), 2 lag on,
     ! 3 b_ref age in steps, 4 eta_old, 5-6 warm-start history count, 7-8 stored W M x valid for the
     ! operator in use, 9-10 its c2, 11 imex_warm, 12 imex_pcg_start in effect, 13 b_ref cadence,
-    ! 14 solver storage, 15 layout (2: one time-less copy per file), 16 mode (rst_mode), 17 0 (the CPU's
-    ! 'modal' reference update count)
+    ! 14 solver storage, 15 layout (2: one time-less copy per file), 16 mode (rst_mode), 17 'modal'
+    ! reference: predictor updates of m since it was set (ob_mn)
     real(8), intent(out) :: sc(imex_nsc)
     integer, intent(in) :: rec
     integer :: s
@@ -3030,32 +3155,53 @@ contains
     sc(9:10) = ps_mc2
     sc(11) = dble(imex_warm); sc(12) = dble(pcg_start); sc(13) = dble(imex_nbref())
     sc(14) = dble(merge(pf_prec, 0, pf_on))
-    sc(15) = 2.0d0; sc(16) = dble(rst_mode()); sc(17) = 0.0d0
+    sc(15) = 2.0d0; sc(16) = dble(rst_mode()); sc(17) = dble(ob_mn)
   end subroutine imex_rst_scal_vals
 
   integer function rst_mode()
-    ! imex_rst_scal(16) (CPU rst_mode): 1. Older files may carry options that this version does not
-    ! have, so that a restart from them is refused as inexact (obc_mode_change): written before the
-    ! key trim of 2026-11-13, 2 in place of 1 imex_force_mode 'gradient', + 10 imex_bt_mode 'step2d';
-    ! written with the 'modal' open boundary, + 100 and its settings in the higher digits
+    ! imex_rst_scal(16) (CPU rst_mode): 1; 'modal' + 100 + 1000 imex_obc_nmodes + 1000000 imex_obc_tref in
+    ! hours (at least 1 for tref > 0), so that a restart across a change of these is refused as inexact
+    ! (imex_obc_q0 is not encoded: it changes Y, which the replay rebuilds with the new value). Files
+    ! written before the key trim of 2026-11-13 may also carry the removed options: 2 in place of 1
+    ! imex_force_mode 'gradient', + 10 imex_bt_mode 'step2d', + 200000 imex_obc_fref = 2 (obc_mode_change)
     rst_mode = 1
+    if (imex_obc_modal) rst_mode = rst_mode + 100 + 1000 * imex_obc_nmodes &
+         + 1000000 * merge(max(1, nint(imex_obc_tref / 3600.0_rp)), 0, imex_obc_tref > 0.0_rp)
   end function rst_mode
 
-  function obc_mode_change(mold) result(txt)
-    ! the rst_mode of an older file in words (CPU obc_mode_change, the inexact-restart note)
+  logical function rst_removed(mold)
+    ! the rst_mode of a file written with an option removed on 2026-11-13
     integer, intent(in) :: mold
+    rst_removed = mod(mold, 10) == 2 .or. mod(mold / 10, 10) == 1 .or. &
+                  (mod(mold / 100, 10) == 1 .and. mod(mold / 100000, 10) == 2)
+  end function rst_removed
+
+  function obc_mode_change(mold, mnew) result(txt)
+    ! a rst_mode change in words (CPU obc_mode_change, the inexact-restart note): the removed options of
+    ! an older file, or the open-boundary settings
+    integer, intent(in) :: mold, mnew
     character(len=256) :: txt
     character(len=128) :: rm
+    logical :: mo, mn
     rm = ''
     if (mod(mold, 10) == 2) rm = "imex_force_mode 'gradient'"
     if (mod(mold / 10, 10) == 1) rm = trim(rm) // "  imex_bt_mode 'step2d'"
-    txt = ''
-    if (len_trim(rm) > 0) txt = 'the file was written with options removed on 2026-11-13: ' // trim(adjustl(rm))
-    if (mod(mold / 100, 10) == 1) then
-      if (len_trim(txt) > 0) txt = trim(txt) // '; '
-      txt = trim(txt) // "the file was written with the 'modal' open boundary, which this version does not have"
+    if (mod(mold / 100, 10) == 1 .and. mod(mold / 100000, 10) == 2) rm = trim(rm) // "  imex_obc_fref = 2"
+    if (len_trim(rm) > 0) then
+      txt = 'the file was written with options removed on 2026-11-13: ' // trim(adjustl(rm))
+      return
     endif
-    if (len_trim(txt) == 0) txt = 'restart mode'
+    mo = mod(mold / 100, 10) == 1; mn = mod(mnew / 100, 10) == 1
+    if (mo .neqv. mn) then
+      txt = "the open-boundary condition changes from imex_obc_mode '" // trim(merge('modal', 'fixed', mo)) &
+            // "' to '" // trim(merge('modal', 'fixed', mn)) // "'"
+      if (mn) txt = trim(txt) // " (the default 'auto' selects 'modal')"
+    else if (mn) then
+      txt = "the 'modal' boundary settings differ (imex_obc_nmodes or imex_obc_tref): the reference m" &
+            // ' restarts from the current mismatch'
+    else
+      txt = 'restart mode'
+    endif
   end function obc_mode_change
 
   logical function imex_rst_accept(exact, have, sc)
@@ -3081,11 +3227,11 @@ contains
       why = 'the record has no IMEX state (written with imex_rst_state = 0, incomplete, or not the second'// &
             ' record of an exact-restart pair)'
     else if (nint(sc(2)) /= merge(1, 0, lag_on) .or. nint(sc(11)) /= imex_warm .or. nint(sc(12)) /= pcg_start &
-             .or. nint(sc(13)) /= imex_nbref() .or. nint(sc(14)) /= merge(pf_prec, 0, pf_on) .or. md /= rst_mode()) then
+             .or. nint(sc(13)) /= imex_nbref() .or. nint(sc(14)) /= merge(pf_prec, 0, pf_on) .or. rst_removed(md)) then
       why = 'IMEX settings differ from the run that wrote it (setup lag, warm start, b_ref cadence, solver, mode'
       if (nint(sc(11)) >= 2) why = trim(why) // '; the file was written with imex_warm = 2 or 3, removed on' // &
            ' 2026-11-13'
-      if (md /= rst_mode()) why = trim(why) // '; ' // trim(obc_mode_change(md))
+      if (rst_removed(md)) why = trim(why) // '; ' // trim(obc_mode_change(md, rst_mode()))
       why = trim(why) // ')'
     endif
     if (why /= '') then
@@ -3094,17 +3240,20 @@ contains
       return
     endif
     call imex_rst_alloc()
+    ! the boundary part of the mode (CPU rst_mode: 'modal' and its settings) is checked by obm_decide at
+    ! the first step, when the open sides and the boundary data are known
+    rst_md_file = md
     imex_rst_accept = .true.
   end function imex_rst_accept
 
-  subroutine imex_rst_loaded(sc, n2raw_read)
+  subroutine imex_rst_loaded(sc, n2raw_read, obcm_read)
     ! after case_io has read the fields (imex_rst_accept true): halos, the scalars; the
     ! frozen operator is rebuilt at the first imex_step_setup (rst_replay). n2raw_read: imex_n2raw
     ! was in the file (else, with a taper, it is recomputed from b_ref and dza on the tile and its
     ! ring, as bref_build made it: files written with the setup lag before CPU 72539140; exact only
     ! when the restart step rebuilds b_ref, logged)
     real(8), intent(in) :: sc(imex_nsc)
-    logical, intent(in) :: n2raw_read
+    logical, intent(in) :: n2raw_read, obcm_read
     integer(ip) :: i, j, k, nx, ny, nz
     if (imex_warm > 0) then
       if (stage_on) then
@@ -3146,6 +3295,19 @@ contains
             enddo
           enddo
         enddo
+      endif
+    endif
+    ! 'modal' reference (CPU imex_rst_get): taken over by the first obm_explicit; the ramp count continues
+    ! (0, a file without it: past the ramp); without imex_obcm m restarts from the current mismatch
+    ob_rst = .false.
+    if (imex_obm_rst_may('imex_obcm')) then
+      if (obcm_read) then
+        ob_rst = .true.
+        ob_mn = nint(sc(17))
+        if (ob_mn <= 0) ob_mn = 1000000000 - 1
+      else if (talk .and. mod(nint(sc(16)) / 100, 10) == 1) then
+        write(*,'(1x,A)') "IMEX_IGW: no imex_obcm in the initial file: the 'modal' reference starts from the" &
+             // ' current mismatch'
       endif
     endif
     rst_read = .true.; rst_pend = .true.

@@ -419,8 +419,10 @@
     !     (x update, p, zc = rczk p, dbar), land columns (ad_act = 0: p, zc,
     !     dbar are 0 there) skipped;
     ! (2) u- and v-faces: g into op_fu, op_fv and its Hz_f-weighted column
-    !     mean into op_sgu, op_sgv; closed faces (cxo, cyo = 0) skipped;
-    ! (3) cells (land skipped: q = 0): F = Hz_f cxo (g - mean) formed here at
+    !     mean into op_sgu, op_sgv; closed faces (cxm, cym = 0) skipped;
+    !     'modal': then g := (Y g)/sqrt(c2), mean 0, at the active open faces
+    !     (obm_face_op; cxm, cym = dn_u, dm_v there, else cxo, cyo);
+    ! (3) cells (land skipped: q = 0): F = Hz_f cxm (g - mean) formed here at
     !     the four faces (a closed face's F is 0 whatever its stored g), D
     !     with the vertical recursion of W, q, <p,q>.
     integer, intent(in) :: mode
@@ -489,7 +491,7 @@
     do j = 1, ny + 1
       do i = 1, nx + 1
         if (j <= ny) then
-          if (cxo(i, j) > 0.0_rp) then
+          if (cxm(i, j) > 0.0_rp) then
             sg = 0.0_rp
             do k = 1, nz
               g = real(cu(i, j, k), 8) * (op_zc(i - 1, j, k) - op_zc(i, j, k)) + op_db(i - 1, j, k) - op_db(i, j, k)
@@ -500,7 +502,7 @@
           endif
         endif
         if (i <= nx) then
-          if (cyo(i, j) > 0.0_rp) then
+          if (cym(i, j) > 0.0_rp) then
             sg = 0.0_rp
             do k = 1, nz
               g = real(cv(i, j, k), 8) * (op_zc(i, j - 1, k) - op_zc(i, j, k)) + op_db(i, j - 1, k) - op_db(i, j, k)
@@ -512,6 +514,7 @@
         endif
       enddo
     enddo
+    if (imex_obc_modal) call obm_face_op(c2l)   ! 'modal': the open faces' term (CPU obm_ufx, obm_vfx)
     a = 0.0_rp
     if (redu_on) then
 #ifdef USE_CUDA
@@ -523,13 +526,13 @@
           if (act(i, j) > 0.0_rp) then
             wm = 0.0_rp
             do k = 1, nz
-              fe = 0.5_rp * (real(hz(i + 1, j, k), 8) + real(hz(i, j, k), 8)) * cxo(i + 1, j) &
+              fe = 0.5_rp * (real(hz(i + 1, j, k), 8) + real(hz(i, j, k), 8)) * cxm(i + 1, j) &
                    * (op_fu(i + 1, j, k) - op_sgu(i + 1, j))
-              fw = 0.5_rp * (real(hz(i, j, k), 8) + real(hz(i - 1, j, k), 8)) * cxo(i, j) &
+              fw = 0.5_rp * (real(hz(i, j, k), 8) + real(hz(i - 1, j, k), 8)) * cxm(i, j) &
                    * (op_fu(i, j, k) - op_sgu(i, j))
-              fn = 0.5_rp * (real(hz(i, j + 1, k), 8) + real(hz(i, j, k), 8)) * cyo(i, j + 1) &
+              fn = 0.5_rp * (real(hz(i, j + 1, k), 8) + real(hz(i, j, k), 8)) * cym(i, j + 1) &
                    * (op_fv(i, j + 1, k) - op_sgv(i, j + 1))
-              fs = 0.5_rp * (real(hz(i, j, k), 8) + real(hz(i, j - 1, k), 8)) * cyo(i, j) &
+              fs = 0.5_rp * (real(hz(i, j, k), 8) + real(hz(i, j - 1, k), 8)) * cym(i, j) &
                    * (op_fv(i, j, k) - op_sgv(i, j))
               dv = fe - fw + fn - fs
               w = 0.0_rp
@@ -566,13 +569,13 @@
         if (act(i, j) > 0.0_rp) then
           wm = 0.0_rp
           do k = 1, nz
-            fe = 0.5_rp * (real(hz(i + 1, j, k), 8) + real(hz(i, j, k), 8)) * cxo(i + 1, j) &
+            fe = 0.5_rp * (real(hz(i + 1, j, k), 8) + real(hz(i, j, k), 8)) * cxm(i + 1, j) &
                  * (op_fu(i + 1, j, k) - op_sgu(i + 1, j))
-            fw = 0.5_rp * (real(hz(i, j, k), 8) + real(hz(i - 1, j, k), 8)) * cxo(i, j) &
+            fw = 0.5_rp * (real(hz(i, j, k), 8) + real(hz(i - 1, j, k), 8)) * cxm(i, j) &
                  * (op_fu(i, j, k) - op_sgu(i, j))
-            fn = 0.5_rp * (real(hz(i, j + 1, k), 8) + real(hz(i, j, k), 8)) * cyo(i, j + 1) &
+            fn = 0.5_rp * (real(hz(i, j + 1, k), 8) + real(hz(i, j, k), 8)) * cym(i, j + 1) &
                  * (op_fv(i, j + 1, k) - op_sgv(i, j + 1))
-            fs = 0.5_rp * (real(hz(i, j, k), 8) + real(hz(i, j - 1, k), 8)) * cyo(i, j) &
+            fs = 0.5_rp * (real(hz(i, j, k), 8) + real(hz(i, j - 1, k), 8)) * cym(i, j) &
                  * (op_fv(i, j, k) - op_sgv(i, j))
             dv = fe - fw + fn - fs
             w = 0.0_rp

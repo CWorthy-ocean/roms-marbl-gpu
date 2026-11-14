@@ -107,6 +107,10 @@ module formulas
   real(rp), parameter, public :: eos_KS0 = -5.587545_rp
   real(rp), parameter, public :: eos_KS1 = 0.7390729_rp
   real(rp), parameter, public :: eos_KS2 = -1.909078e-2_rp
+  ! DUKO_2001: the reference temperature and salinity of K0_Duk (jackett_qp1; also IMEX_IGW's
+  ! boundary density, imex_obm.inc obm_rho_d)
+  real(rp), parameter, public :: eos_Ttr = 3.8_rp
+  real(rp), parameter, public :: eos_Tsr = 34.5_rp
 
   public :: csf
   public :: sm09_z
@@ -454,8 +458,8 @@ contains
   function jackett_qp1(Tt, Ts, rho1_in) result(qp1_out)
     real(rp), intent(in) :: Tt, Ts, rho1_in
     real(rp) :: qp1_out, sqrtTs, K0, K0_Duk, Ttr, Tsr
-    Ttr = 3.8_rp
-    Tsr = 34.5_rp
+    Ttr = eos_Ttr
+    Tsr = eos_Tsr
     K0_Duk = Ttr * (eos_K01 + Ttr * (eos_K02 + Ttr * (eos_K03 + Ttr * eos_K04))) &
            + Tsr * (eos_K10 + Ttr * (eos_K11 + Ttr * (eos_K12 + Ttr * eos_K13)) &
            + sqrt(Tsr) * (eos_KS0 + Ttr * (eos_KS1 + Ttr * eos_KS2)))

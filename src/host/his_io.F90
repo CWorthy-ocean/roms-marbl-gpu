@@ -23,6 +23,7 @@ module his_io
   use fs_data, only: fs_on, udu, udv, gru, grv, qd, xx, mg_on, fs_mg_lag, mg_se0, mg_scu, mg_scv, fs_nsc
   use implicit_fs_gpu, only: fs_rst_prepare, fs_rst_scal_vals, fs_global_atts
   use imex_igw, only: imex_rst_has, imex_rst_prepare, imex_rst_scal_vals, imex_nsc, imex_stage_on, &
+                      im_obcm => obcm3, &
                       im_pgu => pgu, im_pgv => pgv, ipg_nm1, im_dpw => dpw, im_hs1 => hs1, im_hs2 => hs2, &
                       im_hsol => hsol, im_mq => pf_mq, im_bref => bref_sav, im_n2raw => ad_n2raw, &
                       im_hzop => hz_op, im_dza => dza, im_n2o => ad_n2o
@@ -376,6 +377,8 @@ contains
           else
             call io_stage8_3d('imex_n2o', im_n2o(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
           endif
+          if (imex_rst_has('imex_obcm')) &
+               call io_stage8_3d('imex_obcm', im_obcm(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
         endif
       endif
       call io_stage8_2d('rufrc', rufrc_bak(is, js, max(nstp, 1)), iu0, iu1, jr0, jr1, 0, jr0)
@@ -466,6 +469,7 @@ contains
         else
           call put_r3(ncid, 'imex_n2o', im_n2o, rec_rst)
         endif
+        if (imex_rst_has('imex_obcm')) call put_r3(ncid, 'imex_obcm', im_obcm, rec_rst)
       endif
     endif
     call put_u2(ncid, 'rufrc', rufrc_bak(:,:,max(nstp,1)), rec_rst)
@@ -610,6 +614,7 @@ contains
         else
           id = nc_def_var(ncid, 'imex_n2o', (/d_xi, d_eta, d_s/))
         endif
+        if (imex_rst_has('imex_obcm')) id = nc_def_var(ncid, 'imex_obcm', (/d_xi, d_eta, d_s/))
       endif
     endif
     id = nc_def_var(ncid, 'rufrc', (/d_xiu, d_eta, d_t/))
@@ -655,9 +660,9 @@ contains
     if (wrt_file_his .or. wrt_file_rst) call io_init(cap_rec, cap_field)
     ! double-precision capacity for one restart record of this tile
     ! (+ the implicit free surface's rates, scalars and fs_mg_lag fields, when on: 8 2-D fields and 64 values;
-    ! + the IMEX state, when on: 11 3-D fields and the scalars)
+    ! + the IMEX state, when on: 11 3-D fields, 'modal' 1 more, and the scalars)
     n3x = 0
-    if (imex_rst_has('imex_rst_scal')) n3x = 12
+    if (imex_rst_has('imex_rst_scal')) n3x = 13
     if (wrt_file_rst) call io_init8((15 + 2 + 8) * nxy + (4 + ntp + 2 + merge(3, 0, calc_pflx) + n3x) * nxy * nh &
          + 4 * (max(nxi, neta) + 2) + 64, nxy * nh)
   end subroutine init_staging

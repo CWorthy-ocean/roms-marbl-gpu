@@ -16,7 +16,7 @@ module step3d_uv_mod
   use rivers_mod, only: river_on, rivers_uv, RIV_COR
   use arch_mod, only: sync_arch
   use geom, only: dump_rufrc_build, dump_rv3d
-  use imex_igw, only: imex_on, wflx_corr, u_nm1, v_nm1
+  use imex_igw, only: imex_on, wflx_corr, u_nm1, v_nm1, imex_obc_faces, imex_stage_corr
   implicit none
   private
   public :: step3d_uv1
@@ -801,6 +801,7 @@ contains
 
     call u3dbc()
     call v3dbc()
+    if (imex_on) call imex_obc_faces(imex_stage_corr)    ! 'modal': the normal open faces (CPU imex_obc_faces)
     call dump_vn3('after corr v3dbc')
     call dump_uv2_b('after v3dbc')
 

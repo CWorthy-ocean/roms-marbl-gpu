@@ -74,7 +74,7 @@ contains
   subroutine init_bry()
     integer(ip) :: m, nmiss
     have_bry = .false.
-    obc_west = .false.; obc_east = .false.; obc_south = .false.; obc_north = .false.
+    obc_west = .false.; obc_east = .false.; obc_south = .false.; obc_north = .false.; obc_3d = .false.
     if (case_nfrc < 1) return
     call bind1(ser_zw, 'zeta_west', 'j'); call bind1(ser_ubw, 'ubar_west', 'j'); call bind1(ser_vbw, 'vbar_west', 'j')
     call bind1(ser_ze, 'zeta_east', 'j'); call bind1(ser_ube, 'ubar_east', 'j'); call bind1(ser_vbe, 'vbar_east', 'j')
@@ -93,6 +93,10 @@ contains
     obc_south = ser_zs%ready .or. ser_vbs%ready
     obc_north = ser_zn%ready .or. ser_vbn%ready
     have_bry = obc_west .or. obc_east .or. obc_south .or. obc_north
+    obc_3d = [obc_west .and. ser_uw%ready .and. ser_tw%ready .and. ser_sw%ready, &
+              obc_east .and. ser_ue%ready .and. ser_te%ready .and. ser_se%ready, &
+              obc_south .and. ser_vs%ready .and. ser_ts%ready .and. ser_ss%ready, &
+              obc_north .and. ser_vn%ready .and. ser_tn%ready .and. ser_sn%ready]
     if (ub_tune) then
       call bind1(ser_upw, 'up_west', 'j'); call bind1(ser_upe, 'up_east', 'j')
       call bind1(ser_vps, 'vp_south', 'i'); call bind1(ser_vpn, 'vp_north', 'i')

@@ -300,32 +300,49 @@ v0.1.2-beta, bit for bit.
   test and message as the implicit free surface of UCLA ROMS).
 - IMEX internal-wave step (`&imex_igw_settings`; without the group the
   model is unchanged): the port of UCLA ROMS's IMEX_IGW (ucla-roms
-  #433), which treats the internal-wave terms of the
+  #433, with the 'modal' open boundary of #434), which treats the
+  internal-wave terms of the
   LF-AM3 baroclinic step implicitly (an elliptic solve per stage, Jacobi
   PCG with FP32 storage) so that the baroclinic step can be several times
   longer than the internal-wave limit. It runs on the implicit free
-  surface with its defaults. Open faces take the boundary condition's
-  explicit value ('fixed'). Lateral mixing is a split step from the
+  surface with its defaults. The open boundary is the CPU's 'modal' one
+  (the characteristic, per-mode Flather condition of the internal modes,
+  implicit in the stage solves), which the default `imex_obc_mode =
+  'auto'` selects on a domain whose open sides have 3-D boundary data, as
+  on the CPU; 'fixed' keeps the boundary condition's explicit values. Its
+  mode build runs on the device at every b_ref rebuild (one thread per
+  face column), and the boundary density is the model's EOS. Lateral mixing is a split step from the
   corrected state (`imex_mix_split = 1`). The reference stratification,
   and with it the operator, is rebuilt every 24 model hours
   (`imex_bref_hours`). Restarts are exact (`imex_rst_state = 1`). The
   settings are those of UCLA ROMS's namelist template (`imex_verbose`,
-  `imex_bref_hours`, `imex_rst_state`); keys removed from UCLA ROMS on
+  `imex_bref_hours`, `imex_rst_state`, `imex_obc_mode`,
+  `imex_obc_tref`); keys removed from UCLA ROMS on
   2026-11-13 stop the run with a message, and `NAMELIST_COMPAT` gives
   the sed line that deletes them.
-  - Checked against UCLA ROMS #433 (strict build, FP64 solver storage,
-    tolerances 1e-12, 20 steps) on sargasso (dt 1440 s, sponge) and a
-    closed basin with walls and lateral viscosity: identical IMEX and
-    free-surface iteration counts; prognostic fields within 2.1 times
-    the CPU's own regular-to-strict build difference, every restart
-    variable within 5.3 times (the largest: the surface boundary-layer
-    depth, at a mixing threshold).
+  - Checked against UCLA ROMS #433 and #434 (strict build, FP64 solver
+    storage, tolerances 1e-12) on sargasso (dt 1440 s, sponge, 20
+    steps; 'fixed' and 'modal'), a closed basin with walls and lateral
+    viscosity ('fixed', 20 steps) and a California Current nest
+    ('modal', 36 steps of 600 s, three boundary settings): identical
+    IMEX and free-surface iteration counts. With 'fixed', prognostic
+    fields are within 2.1 times the CPU's own regular-to-strict build
+    difference and every restart variable within 5.3 times (the
+    largest: the surface boundary-layer depth, at a mixing threshold).
+    With 'modal', prognostic fields are within 3.5 times on sargasso
+    (8.6 in a free-surface solver variable) and every restart variable
+    within 4.1 times on the nest, except in its last steps with all
+    boundary settings at non-defaults: up to 9.5 times, and 36 times at
+    single points next to the San Francisco Bay estuary, where the
+    CPU's own build difference is largest.
   - Cost (Derecho, A100, no output, one 2-day run each, reference
     stratification rebuilt every 6 hours): sargasso 2x2
     (1 node) 1.61 s per simulated day at dt 1440 s against 6.88 for the
     split step at 480 s (0.23) and 2.68 for the implicit free surface
     alone at 480 s; Pac 8x1 (2 nodes, tides, rivers) 10.4 s per day at
     1440 s against 12.5 (split, 900 s; 0.83) and 11.0 (implicit, 900 s).
+    'modal' adds 0.3 % per step to 'fixed' on Pac and 5.7-6.8 % on the
+    California Current nest (2x2, 1 node).
 
 ## Numerics
 

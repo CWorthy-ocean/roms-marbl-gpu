@@ -77,6 +77,9 @@ module gpu_state
   logical,  public :: obc_east = .false.
   logical,  public :: obc_south = .false.
   logical,  public :: obc_north = .false.
+  ! the open sides W, E, S, N with 3-D boundary data (normal velocity, temperature, salinity; init_bry):
+  ! the CPU's M3_FRC_BRY and T_FRC_BRY for IMEX_IGW's 'modal' open boundary
+  logical,  public :: obc_3d(4) = .false.
   logical,  public :: have_flux = .false.
   logical,  public :: have_bry = .false.
   logical,  public :: have_bulk = .false.
