@@ -29,7 +29,7 @@ module pflx_mod
   use kinds
   use decomp_mod, only: decomp
   use gpu_state
-  use formulas, only: g, rho0, qp2
+  use formulas, only: g, qp2
   use halo_mod, only: halo_fill_3d
   use time_state, only: dt
   implicit none
@@ -119,7 +119,7 @@ contains
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     ir = 3                       ! nrhs of the corrector
     a = alpha; b = beta
-    grho = g / rho0
+    grho = g / rho0_case
     hgrho = 0.5_rp * grho
 
     ! p' at rho points 0..nx x 0..ny (the CPU's range): running mean,

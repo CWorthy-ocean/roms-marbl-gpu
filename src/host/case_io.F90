@@ -234,12 +234,7 @@ contains
     case_grdname = resolve_path(nml_dir, grdname)
     case_inifile = resolve_path(nml_dir, inifile)
     case_nrrec = nrrec
-    rho0_case = rho0_in
-    if (abs(rho0_in - rho0_eos) > 1.0e-6_rp) then
-      write(*,'(a,f10.4,a,f10.4,a)') 'case_io: namelist rho0 =', rho0_in, &
-           ' but build uses rho0 =', rho0_eos, '; rebuild with -DROMS_RHO0=<value>'
-      error stop 1
-    endif
+    call set_rho0(rho0_in)
     case_title = trim(title)
     case_output_root = resolve_path(nml_dir, output_root_name)
     call set_cdr_lite_output_root(case_output_root)
@@ -580,6 +575,14 @@ contains
     ntimes_in = ntimes
   end subroutine read_time_stepping
 
+  subroutine set_rho0(r)
+    ! The run's rho0: formulas' rho0 (managed; the EOS and pressure functions
+    ! read it in kernels) and gpu_state's rho0_case (host copy for host code).
+    real(rp), intent(in) :: r
+    rho0_eos = r
+    rho0_case = r
+  end subroutine set_rho0
+
   subroutine read_optional_scalars(unit, zob_in, rdrg_in, rdrg2_in, visc2_in, &
                                    akv_bak_in, akt_bak_in, rho0_in)
     integer, intent(in) :: unit
@@ -612,6 +615,8 @@ contains
     call nml_stop(ios, msg, 'TRACER_DIFF2')
     rewind(unit); read(unit, nml=rho0_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'RHO0_SETTINGS')
+    ! UCLA ROMS has no default rho0 and stops without the group.
+    if (ios < 0) error stop 'read_namelist: the namelist has no &rho0_settings (rho0), which UCLA ROMS requires too'
     zob_in = zob; rdrg_in = rdrg; rdrg2_in = rdrg2; visc2_in = visc2
     akv_bak_in = akv_bak; akt_bak_in = akt_bak(1:2)
     case_tnu2 = tnu2

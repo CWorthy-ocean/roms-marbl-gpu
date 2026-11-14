@@ -6,12 +6,18 @@ module formulas
   private
 
   real(rp), parameter, public :: g = 9.81_rp
-  ! Used in host+device EOS/prsgrd math, so fixed at build time; the
-  ! namelist rho0 must match (checked in case_io).
-#ifndef ROMS_RHO0
-#define ROMS_RHO0 1000.0
+  ! Boussinesq reference density [kg/m^3]: &rho0_settings rho0, set at run
+  ! time by case_io (set_rho0), as UCLA ROMS reads it. The EOS and pressure
+  ! functions below use it in device and host code, so it is managed memory.
+  ! Host code outside these functions uses gpu_state's rho0_case (the same
+  ! value), so that the host does not pull the page back from the GPU every
+  ! step. No initializer (nvfortran 25.9's fort2 has crashed on real
+  ! initializers in this code base).
+#ifdef USE_CUDA
+  real(rp), managed, public :: rho0
+#else
+  real(rp), public :: rho0
 #endif
-  real(rp), parameter, public :: rho0 = real(ROMS_RHO0, rp)
   real(rp), parameter, public :: AM3_crv = 1.0_rp / 6.0_rp
 
   ! PAC/MiniPac EXTRAP_BAR_FLUXES coefficients (set_HUV1 / step2d).

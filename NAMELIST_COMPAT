@@ -28,6 +28,11 @@
 # &passive_tracers (n_passive, init_mode, write_passive), and in
 # &param_settings the keys n, nsub_x, nsub_e and ntrc_bio.
 #
+# &rho0_settings rho0: read at run time and required, as in UCLA ROMS (a
+# namelist without the group stops the run). Up to v0.1.3-beta roms_gpu fixed
+# rho0 at build time (-DROMS_RHO0, default 1000) and stopped when the
+# namelist differed.
+#
 # Surface restoring: UCLA ROMS selects it with cpp keys, which the GPU model
 # cannot see; roms_gpu switches it on with GPU-only logical keys in
 # &surf_frc_settings (default .false., bulk forcing only), and reads the

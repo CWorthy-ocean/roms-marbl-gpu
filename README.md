@@ -231,6 +231,12 @@ v0.1.2-beta, bit for bit.
   periodic direction, `io_server.F90` `add_var`), and initial and
   restart files were read with u and v points one point off
   (`case_io.F90`). Non-periodic runs are unchanged, bit for bit.
+- `rho0` (`&rho0_settings`) is read at run time, as UCLA ROMS reads it:
+  one binary runs any reference density. Before, it was a build constant
+  (`-DROMS_RHO0`, default 1000), and a namelist with another value
+  stopped the run with a request to rebuild; `-DROMS_RHO0` is now
+  ignored. A namelist without `&rho0_settings` stops the run, as in UCLA
+  ROMS. Runs at rho0 = 1000 are unchanged, bit for bit.
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
   depth-integrated internal-tide energy flux `up`/`vp` of the parent,
   written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS
