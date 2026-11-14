@@ -15,16 +15,9 @@
 # Keys of UCLA ROMS after 0.14.0 (dev) that roms_gpu reads, so that a
 # namelist written from its template runs:
 #   &bgc_settings  bgc_physics_subcycle, bgc_physics_timestep (BGC tracer
-#     subcycling, #428), and its testing keys bgc_subcycle_pos and
-#     bgc_subcycle_diag, with UCLA ROMS's checks, restart rule and messages.
-#     Rivers, CDR releases (all four modes), CDR_LITE and CFLX_CORR
-#     fluxes, and passive tracers with or without MARBL are subcycled as on
-#     the CPU. Refused at start-up: bgc_subcycle_pos = .true.,
-#     bgc_subcycle_diag >= 2, the IMEX internal-wave step
-#     (&imex_igw_settings; no UCLA ROMS reference for the combination),
-#     UPSCALING output, ub_tune, the mirror_salt test tracer and builds
-#     without -DPASSIVE_FP64. bgc_subcycle_diag = 1 prints the BGCSUB
-#     window lines.
+#     subcycling, #428 and #430), and its testing keys bgc_subcycle_pos and
+#     bgc_subcycle_diag; supported values and refusals in the BGC tracer
+#     subcycling section below.
 #   &marbl_biogeochemistry_settings  marbl_balance (#430), which ships MARBL
 #     columns between CPU ranks and changes no result. Each GPU computes
 #     the wet columns of its tile (&tile_settings balances them), so
@@ -117,6 +110,41 @@
 # rounding-level difference), every other bit is bit-identical to 0. The
 # solve stops the run on a NaN or Inf residual norm or <p,q>, with the
 # CPU's message.
+#
+# BGC tracer subcycling (&bgc_settings; ucla-roms #428 and #430): the
+# BGC tracers (every tracer after temperature and salinity) are
+# transported, mixed and forced once per window from the transports summed
+# over the window, as UCLA ROMS does it, with its checks, restart rule and
+# start-up messages. Keys (defaults in brackets):
+#   bgc_physics_subcycle  .true. subcycles the BGC tracers             [.false.]
+#   bgc_physics_timestep  window length in s; a whole multiple of dt,      [0]
+#                         and with MARBL it must divide marbl_timestep
+#                         (MARBL runs at the end of a window); 0 =
+#                         marbl_timestep; > 0 is required without MARBL
+#   bgc_subcycle_diag     0 none; 1 the BGCSUB / BGCSUBNEG window lines    [0]
+#                         (Courant numbers, sub-passes, continuity,
+#                         shadow tracer, per-tracer budget, new
+#                         negatives); >= 2 is refused (see below)
+#   bgc_subcycle_pos      only .false. (the positivity limiter is      [.false.]
+#                         refused, see below)
+# Restarts only on window boundaries: with subcycling, output_period_rst
+# must be a multiple of the window and the run must start on a window
+# boundary (the time step of the initial file a multiple of the window in
+# steps); monthly_restarts is not on the GPU at all. A window length that
+# is shorter than dt, not a whole multiple of dt, or does not divide
+# marbl_timestep stops the run, naming the nearest valid lengths.
+# Subcycled as on the CPU: rivers (including river faces in the 2-point
+# halo of a tile), CDR releases in all four modes (parameterized tracer
+# fluxes, volume releases, depth profiles, 3D forcing), the CDR_LITE and
+# CFLX_CORR surface fluxes, any number of passive tracers, with or
+# without MARBL, split or implicit free surface.
+# Refused at start-up (each with its own message): bgc_subcycle_pos =
+# .true. and bgc_subcycle_diag >= 2 (the positivity limiter and its test;
+# not on the GPU yet); the IMEX internal-wave step (&imex_igw_settings
+# present; enabling the combination is planned as a follow-up); UPSCALING
+# output and ub_tune (refused by UCLA ROMS too); the GPU-only
+# &passive_tracers init_mode = 'mirror_salt' test tracer; builds without
+# -DPASSIVE_FP64.
 #
 # IMEX internal-wave step (&imex_igw_settings present: on; absent: the
 # stock step), as in ucla-roms #433 and #434 (IMEX_IGW with its 'modal'
