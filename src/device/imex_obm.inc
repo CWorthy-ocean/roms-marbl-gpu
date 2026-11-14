@@ -34,12 +34,31 @@
   !   barotropic mean) and of step3d_uv2 (corrector): the face increment of
   !   the stage solution and the face write [obm_correct + imex_obc_faces];
   ! - the Jacobi term in pf_setup8/4 (per stage and coefficient set), over
-  !   the cells next to open faces; the diagnostics (OBCM, OBCF lines)
-  !   through imex_red's deterministic sums;
+  !   the cells next to open faces; the diagnostics (OBCM, OBCF lines, the
+  !   start note) through imex_red's deterministic sums;
   ! - the density of both sides of the mismatch d through the model's EOS
   !   (obm_rho_d = rho_eos's rho at one point, the CPU's rho_eos_point).
   ! Work arrays (fixed per column, no automatic arrays in device code):
   ! ob_sc(nz, 6, nc), ob_z(nz, m, 4, nc), ob_wr(m, 9, nc), ob_wi(m, 5, nc).
+  !
+  ! Recommended use of 'modal' (the CPU's; nest and Pacific tests, IMEX_OBC_REMAINING.md sec. 6.6):
+  ! - defaults: imex_obc_mode 'auto' (selects 'modal'), imex_obc_nmodes 3, imex_obc_cmin 0.3 m/s,
+  !   imex_obc_tref 3 d;
+  ! - imex_obc_q0 is off by default; where the semidiurnal tide is close to inertial (f/omega0 > 0.6) it
+  !   has been set to sqrt(1 - f^2/omega_M2^2). It returns part of a Kelvin wave that leaves along a
+  !   coast (13 % at 0.5);
+  ! - sponge: a nest whose boundary data carry the internal tide runs best with a quarter of the v_sponge
+  !   used with the stock boundary (the sponge damps the tide that comes in); an outermost domain, whose
+  !   boundary data have no internal tide, keeps the stock value. Keep v_sponge dt/dx^2 <= 0.1;
+  ! - SPONGE_TUNE's ub_tune has no effect on the normal velocity under 'modal': leave it off;
+  ! - start: a run that does not begin from the state its boundary data come from (a nest not initialised
+  !   from its parent) should take its first ~10 days with imex_obc_mode = 'fixed' and switch to 'modal'
+  !   at a restart (inexact by design: m restarts from the mismatch of that day); see obm_startnote;
+  ! - step: the limit is explicit horizontal advection, not the boundary. Keep the horizontal part of the
+  !   Courant number below about 0.8 over the whole run;
+  ! - known limits: a wave that the boundary data do not contain and that leaves at more than about 60
+  !   degrees from the normal returns at the rate of any one-direction condition (36 % at 75 degrees);
+  !   the child's depths must match the parent's along the open edges.
   !======================================================================
 
   subroutine obm_decide()
@@ -1174,6 +1193,30 @@
     ob_pd(5, c) = 1.0_rp; ob_pd(6, c) = ubt**2; ob_pd(7, c) = s
   end subroutine obm_fdiag_k
 
+  attributes(global) subroutine obm_start_k(nc, nz, m)
+    ! start-note partials (CPU obm_startnote): 1 column, 2 sum w m^2, 3 sum w (Y m)^2
+    integer, value :: nc, nz, m
+    integer :: c, k
+    real(rp) :: s2, s3
+    c = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    if (c > nc) return
+    do k = 1, 3
+      ob_pd(k, c) = 0.0_rp
+    enddo
+    if (ob_act(c) <= 0.0_rp) return
+    do k = 1, nz
+      ob_sc(k, 1, c) = ob_mr(k, c)
+    enddo
+    call obm_y_d(nz, m, ob_yr(c), ob_w(1, c), ob_a(1, c), ob_phi(1, 1, c), ob_sc(1, 1, c), ob_sc(1, 2, c), &
+         ob_wr(1, 9, c))
+    s2 = 0.0_rp; s3 = 0.0_rp
+    do k = 1, nz
+      s2 = s2 + ob_w(k, c) * ob_mr(k, c)**2
+      s3 = s3 + ob_w(k, c) * ob_sc(k, 2, c)**2
+    enddo
+    ob_pd(1, c) = 1.0_rp; ob_pd(2, c) = s2; ob_pd(3, c) = s3
+  end subroutine obm_start_k
+
   attributes(global) subroutine obm_red_k(n, nc, i1, e1, i2, e2, i3, e3, i4, e4)
     ! red_part(:, s) = ob_pd(i_s, c) on the columns of edge e_s (0 elsewhere), s = 1..4
     integer, value :: n, nc, i1, e1, i2, e2, i3, e3, i4, e4
@@ -1247,7 +1290,7 @@
   !----------------------------------------------------------------------
   subroutine obm_explicit(stage, wface)
     ! the stage's explicit face values (obm_expl_k); the reference's bookkeeping on the host (CPU
-    ! obm_explicit: ramped weight, restart copy, cold start, the OBCM lines)
+    ! obm_explicit: ramped weight, restart copy, cold start and its note, the OBCM lines)
     integer, intent(in) :: stage
     logical, intent(in) :: wface
     logical :: mref, minit, rcp, pred, mpr
@@ -1285,6 +1328,7 @@
     endif
     if (rcp) ob_rst = .false.
     if (mref) ob_mr_ok = .true.
+    if (mref .and. minit) call obm_startnote()
     if (mpr) call obm_mdiag()
   end subroutine obm_explicit
 
@@ -1349,6 +1393,40 @@
   end subroutine obm_m_to3
 
   !----------------------------------------------------------------------
+  subroutine obm_startnote()
+    ! CPU obm_startnote (the reference was set to the present mismatch): per open edge the rms of the
+    ! held mismatch and of Y m; the start NOTE; the WARNING above 0.7 m2/s2
+    real(rp), parameter :: obm_dwarn = 0.7_rp
+    character(len=1), parameter :: en(4) = ['W', 'E', 'S', 'N']
+    real(8) :: sm(3, 4)
+    real(rp) :: rd, ry
+    integer :: e
+    logical :: big
+#ifdef USE_CUDA
+    if (ob_nc > 0) call obm_start_k<<<(ob_nc + OBM_NT - 1) / OBM_NT, OBM_NT, 0, work_stream>>>(ob_nc, &
+         int(decomp%nz), ob_m)
+#endif
+    call obm_edge_sums(3, [1, 2, 3], sm)
+    if (.not. talk) return
+    big = .false.
+    write(*,'(1x,A)') "IMEX_OBC start: the 'modal' reference is set to the present difference between the" &
+         // ' model and its boundary data (held, not radiated)'
+    do e = 1, 4
+      if (sm(1, e) <= 0.0d0) cycle
+      rd = sqrt(sm(2, e) / sm(1, e)); ry = sqrt(sm(3, e) / sm(1, e))
+      write(*,'(1x,A,A,A,F9.4,A,F8.4,A)') 'IMEX_OBC start: edge ', en(e), ': held pressure difference, rms', &
+           rd, ' m2/s2; as a face velocity', ry, ' m/s'
+      big = big .or. rd > obm_dwarn
+    enddo
+    write(*,'(1x,A)') "IMEX_IGW NOTE: a run that does not start from the state its boundary data come from" &
+         // " (a nest not initialised from its parent) should take its first ~10 days with imex_obc_mode =" &
+         // " 'fixed' and switch to 'modal' at a restart; otherwise the adjustment of the edge zones is" &
+         // ' carried into the interior as a low-frequency error'
+    if (big) write(*,'(1x,A,F5.1,A)') 'IMEX_IGW WARNING: the held pressure difference exceeds', obm_dwarn, &
+         ' m2/s2 on an open edge: check the boundary data and that the depths of this grid match those of' &
+         // ' the grid the boundary data come from along the open edges'
+  end subroutine obm_startnote
+
   subroutine obm_mdiag()
     ! CPU obm_mdiag (imex_obc_mprint, predictor, after the reference update): an OBCM line per open edge
     use time_state, only: time
