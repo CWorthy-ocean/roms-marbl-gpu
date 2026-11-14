@@ -36,6 +36,7 @@ module upscale_out
   implicit none
   private
   public :: read_upscale_namelist, set_upscale_root, init_upscale_output, wrt_upscale, wrt_upscale_final
+  public :: do_upscale          ! bgc_subcycle: refused with subcycling
 
   integer  :: nrpf_uscl = 48
   real(rp) :: output_period_uscl = 100.0_rp

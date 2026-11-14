@@ -79,6 +79,22 @@ first, on the smallest case that exercises it.
 - **Timing.** With probes off (the default) and no output, run base and new as
   A B B A in one job on the same nodes, and report the median steady step.
   Do not claim a gain you did not measure.
+- **BGC tracer subcycling** (`src/device/bgc_subcycle.F90`,
+  `bgc_window.F90`): `tools/bgcsub_gates.py` runs the fast gate set on a
+  small MARBL case, as UCLA ROMS's pytest cases do (built on its
+  `bgc_real_marbl` test domain, 39 x 19 x 10, where each run takes seconds):
+  k = 2, k = 4, k = 4 implicit, k = 2 with MARBL every 4 steps, an exact
+  restart, the three rejected window lengths, a restart period that is not a
+  multiple of the window and a start inside a window, and 2x2 against 1x1
+  with `--tiles2x2`. `setup --nml <GPU namelist of the case> --exe <binary>
+  --dir <dir>` writes the run directories, `run --dir <dir>` runs them inside
+  a GPU job, `check --dir <dir> [--ref <dir of the base binary or an earlier
+  commit>]` prints one PASS/FAIL line per gate (G-RUN, G-PHYS, G-BUD, G-RST,
+  G-TILE, G-MSG, and G-REF bit identity with the reference runs). After a
+  change to the window kernels, also run MiniPac k = 4 (two sub-passes per
+  window on some levels) and a case with rivers and CDR releases, and compare
+  with UCLA ROMS as above (the `BGCSUB` lines' m and Courant numbers must
+  equal the CPU's).
 
 ## Repository layout
 
@@ -104,9 +120,9 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
 - When ucla-roms adds a key, the GPU must read it or stop clearly. Declare it
   with the CPU default in the GPU reader. Then implement it, or accept its
   "off" value and stop on any other value, naming the key. Update
-  `NAMELIST_COMPAT`. Example: `bgc_physics_subcycle` and
-  `bgc_physics_timestep` (`&bgc_settings`, `src/host/avg_out.F90`) are read,
-  and `.true.` stops with "not on the GPU yet"; `marbl_balance`
+  `NAMELIST_COMPAT`. Examples: `bgc_subcycle_pos` (`&bgc_settings`,
+  `src/host/avg_out.F90`) is read, and `.true.` stops in
+  `src/device/bgc_subcycle.F90` with "not on the GPU yet"; `marbl_balance`
   (`src/host/marbl_step.F90`) has no effect on the GPU, so `.true.` is
   ignored with a start-up note.
 - A CPU cpp key becomes a GPU-only logical, such as `&surf_frc_settings

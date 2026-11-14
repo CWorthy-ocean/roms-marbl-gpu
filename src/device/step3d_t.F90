@@ -12,7 +12,7 @@ module step3d_t_mod
                     fuse_tracers, cor_tracers_fused
   use obc, only: t3dbc
   use pre_step3d_mod, only: ncol_probe, icol_probe, jcol_probe
-  use passive_mod, only: ntp, passive_corrector
+  use passive_mod, only: ntp, passive_corrector, tp_subcycled
   use rivers_mod, only: river_on, rivers_ts, RIV_COR
   use cdr_src_mod, only: cdr_vol_on, cdr_apply_ts
   implicit none
@@ -147,7 +147,7 @@ contains
       ! no exchange here: MARBL and t3dmix read t(nnew) at the point only
       ! (t3dmix's stencil is slot nrhs) and rho_eos(nnew) exchanges it
     enddo
-    if (ntp > 0) call passive_corrector(dt_loc)
+    if (ntp > 0 .and. .not. tp_subcycled) call passive_corrector(dt_loc)   ! subcycled: at BGC window ends
   end subroutine step3d_t
 
   subroutine dump_cor_col(tag, stage)

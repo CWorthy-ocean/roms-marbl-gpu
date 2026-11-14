@@ -29,6 +29,7 @@ module river_io
   use rivers_mod
   use comm_mod, only: comm_rank
   use arch_mod, only: sync_arch
+  use halo_mod, only: halo_fill_2d
   use netcdf
   implicit none
   private
@@ -73,8 +74,11 @@ contains
       error stop 'read_river_namelist: analytical rivers are not available on the GPU model'
   end subroutine read_river_namelist
 
-  subroutine init_rivers(grdname)
+  subroutine init_rivers(grdname, win_faces)
+    ! win_faces (BGC subcycling): also list the faces of the window's
+    ! river override out to the 2-point halo (RIV_WIN, add_win_faces).
     character(len=*), intent(in) :: grdname
+    logical, intent(in) :: win_faces
     integer :: i, j, k, nx, ny, nf, nc, m, ifile, ncid, varid, ierr, ntr_model, nrec, l
     integer :: nfmax, rfile, gi, gj, ir
     logical :: have_sep, riv_cdr
@@ -87,7 +91,7 @@ contains
     real(rp), allocatable :: ffrac(:), csg(:,:)
     integer, allocatable :: fglob(:), cell_of(:,:)
     integer(ip) :: iu_s2d0, iu_s2d1, jv_s2d0, jv_s2d1, iu_pre0, jv_pre0
-    integer :: nbad, maxidx
+    integer :: nbad, maxidx, nwf
     character(len=16) :: what
     real(rp) :: cyc
     logical :: lcyc
@@ -184,6 +188,7 @@ contains
     ! --- the faces (CPU calc_river_flux over the cells 0:nx+1, 0:ny+1)
     call sync_masks_to_host(rm, nx, ny)
     nfmax = 4 * count(rfrc > 0.0_rp) + 1
+    if (win_faces) nfmax = nfmax + 2 * (nx + 1) + 2 * (ny + 1)
     allocate(fi(nfmax), fj(nfmax), ft(nfmax), fr(nfmax), fs(nfmax), ffrac(nfmax), fglob(nfmax))
     nf = 0; nbad = 0
     iu_s2d0 = merge(2, 1, decomp%edge_w); iu_s2d1 = merge(nx, nx + 1, decomp%edge_e)
@@ -213,6 +218,8 @@ contains
       enddo
     enddo
     if (nbad > 0) error stop 'init_rivers: invalid river locations (see above)'
+    nwf = 0
+    if (win_faces) call add_win_faces()
 
     ! --- local rivers (the order of first appearance)
     allocate(loc_of(nriver_f), glob(max(nf, 1)))
@@ -314,9 +321,91 @@ contains
     write(*,'(a,i0,a,i0,a,i0,a,i0,a,i0,a,a,a,i0,a)') 'rivers: rank ', comm_rank(), '  faces ', nf, &
          '  cells ', nc, '  rivers ', nloc, '  fast-loop faces next to an edge ', nrf_s2d, &
          '  (', trim(what), ', ', ncat, ' records)'
+    if (win_faces) write(*,'(a,i0,a,i0,a,i0,a)') 'rivers: rank ', comm_rank(), '  BGC window faces ', nrf_win, &
+         ' (', nwf, ' of them in the outer halo, from the neighbours)'
     deallocate(ridx, rfrc, rm, loc_of, cell_of)
 
   contains
+
+    subroutine add_win_faces()
+      ! BGC subcycling (UCLA ROMS bgcsub_window_tile): the window overrides
+      ! the swept fluxes of the river faces among u faces 1:nx+1 x jlo:jhi
+      ! and v faces ilo:ihi x 1:ny+1 (gpu_state window_ranges: the 2-point
+      ! halo, or the boundary row at a physical edge). The scan above
+      ! reaches the faces of the cells 0:nx+1 x 0:ny+1, so the u faces of
+      ! the rows -1 and ny+2 and the v faces of the columns -1 and nx+2 are
+      ! missing: as the CPU (river markers exchanged once), the codes
+      ! riv_uflx/riv_vflx (10*iriver + frac) of every scanned face are
+      ! exchanged, and the halo faces take the neighbours' codes, so that
+      ! iriver and frac are the owner's bit for bit. Every rank then forms
+      ! the window's river transport of its halo faces itself, from the
+      ! same river data (the CPU exchanges the sums instead: the same
+      ! values). Scanned faces in the window's ranges get RIV_WIN, the
+      ! halo faces RIV_WIN alone.
+      real(rp), WORK_ATTR allocatable :: ucode(:,:), vcode(:,:)
+      real(rp), allocatable :: uh(:,:), vh(:,:)
+      integer(ip) :: ilo, ihi, jlo, jhi
+      integer :: mm, ii, jj, nf0
+      call window_ranges(ilo, ihi, jlo, jhi)
+      do mm = 1, nf
+        ii = fi(mm); jj = fj(mm)
+        if (ft(mm) == 1) then
+          if (ii >= 1 .and. ii <= nx + 1 .and. jj >= jlo .and. jj <= jhi) fs(mm) = ior(fs(mm), int(RIV_WIN, ip))
+        else
+          if (ii >= ilo .and. ii <= ihi .and. jj >= 1 .and. jj <= ny + 1) fs(mm) = ior(fs(mm), int(RIV_WIN, ip))
+        endif
+      enddo
+      allocate(ucode(decomp%is:decomp%ie, decomp%js:decomp%je), vcode(decomp%is:decomp%ie, decomp%js:decomp%je))
+      allocate(uh(decomp%is:decomp%ie, decomp%js:decomp%je), vh(decomp%is:decomp%ie, decomp%js:decomp%je))
+      uh = 0.0_rp; vh = 0.0_rp
+      do mm = 1, nf
+        if (ft(mm) == 1) then
+          uh(fi(mm), fj(mm)) = ffrac(mm) + 10 * fglob(mm)
+        else
+          vh(fi(mm), fj(mm)) = ffrac(mm) + 10 * fglob(mm)
+        endif
+      enddo
+      call sync_arch()
+      ucode = uh; vcode = vh
+      call halo_fill_2d(ucode, int(STAGGER_RHO, ip))
+      call halo_fill_2d(vcode, int(STAGGER_RHO, ip))
+      call sync_arch()
+      uh = ucode; vh = vcode
+      deallocate(ucode, vcode)
+      nf0 = nf
+      do jj = int(jlo), int(jhi)
+        if (jj >= 0 .and. jj <= ny + 1) cycle
+        do ii = 1, nx + 1
+          if (abs(uh(ii, jj)) > 1.0e-3_rp) call add_halo_face(1, ii, jj, uh(ii, jj))
+        enddo
+      enddo
+      do jj = 1, ny + 1
+        do ii = int(ilo), int(ihi)
+          if (ii >= 0 .and. ii <= nx + 1) cycle
+          if (abs(vh(ii, jj)) > 1.0e-3_rp) call add_halo_face(2, ii, jj, vh(ii, jj))
+        enddo
+      enddo
+      nwf = nf - nf0
+      deallocate(uh, vh)
+    end subroutine add_win_faces
+
+    subroutine add_halo_face(typ, ii, jj, flx)
+      ! A face of the window's halo with the owner's code flx (RIV_WIN only:
+      ! no river mask, no other stage, no cell)
+      integer,  intent(in) :: typ, ii, jj
+      real(rp), intent(in) :: flx
+      integer :: iriver
+      iriver = nint(flx / 10)
+      if (iriver < 1 .or. iriver > nriver_f) then
+        write(*,'(a,i0,a,i0,a,i0)') 'init_rivers: halo river face with river index ', iriver, ' at local i,j = ', &
+             ii, ',', jj
+        error stop 'init_rivers: halo river face'
+      endif
+      nf = nf + 1
+      fi(nf) = ii; fj(nf) = jj; ft(nf) = typ; fs(nf) = int(RIV_WIN, ip)
+      fglob(nf) = iriver
+      ffrac(nf) = flx - 10 * iriver
+    end subroutine add_halo_face
 
     subroutine add_face(typ, ii, jj, flx)
       ! One face as the CPU's riv_uflx/riv_vflx: iriver = nint(flx/10),

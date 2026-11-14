@@ -45,7 +45,8 @@ module rivers_mod
   public :: river_on, rivers_set_lists, rivers_set_record, rivers_copy_upper, rivers_set_weights
   public :: rivers_set_map
   public :: rivers_ubar, rivers_uv, rivers_ts, rivers_tp, rivers_huv, rivers_duon
-  public :: RIV_S2D, RIV_PRE, RIV_COR, RIV_S2DF, RIV_RNG
+  public :: RIV_S2D, RIV_PRE, RIV_COR, RIV_S2DF, RIV_RNG, RIV_WIN
+  public :: rivers_win_faces, rivers_win_acc, nrf_win
   ! for the fast-step override fused into step2d_mid's ubar/vbar kernel
   public :: rf_flx, riv_ufc, riv_vfc
   public :: rivers_fs_map, rivers_pred_flx
@@ -58,11 +59,17 @@ module rivers_mod
   ! RIV_RNG: every face of the river scan (cells 0:nx+1 x 0:ny+1, as the
   ! CPU's calc_river_flux); rivers_huv and rivers_duon test the ranges of
   ! the loops they follow (set_HUV's, step2d's DUon/DVom) themselves.
-  integer, parameter :: RIV_S2D = 1, RIV_PRE = 2, RIV_COR = 4, RIV_S2DF = 8, RIV_RNG = 16
+  ! RIV_WIN (BGC subcycling only): the faces of the window's river
+  ! override (UCLA ROMS bgcsub_window_tile: u faces istr..iend+1 x
+  ! jlo..jhi, v faces ilo..ihi x jstr..jend+1, i.e. out to the 2-point
+  ! halo); faces beyond the scan carry RIV_WIN alone, so no other kernel
+  ! sees them.
+  integer, parameter :: RIV_S2D = 1, RIV_PRE = 2, RIV_COR = 4, RIV_S2DF = 8, RIV_RNG = 16, RIV_WIN = 32
 
   logical :: river_on = .false.
   integer(ip) :: nrf = 0, nrc = 0, nrl = 0, nrt = 0   ! faces, cells, rivers, tracers of the river data
   integer(ip), public :: nrf_s2d = 0, nrf_s2df = 0      ! fast-loop faces done by rivers_ubar / fused
+  integer(ip) :: nrf_win = 0                            ! faces with RIV_WIN (rf_win: their indices)
   real(rp) :: w_pre(2) = (/1.0_rp, 0.0_rp/), w_cor(2) = (/1.0_rp, 0.0_rp/)
   integer :: geo_stage = 0          ! stage whose face geometry rg_h/rg_v hold (rivers_ts)
   integer, parameter :: RIV_NKB = 4  ! level chunks per column in rivers_tp
@@ -89,6 +96,7 @@ module rivers_mod
   ! tracer axis (the CPU's tracer order), or the extra zero row for a
   ! CDR_LITE tracer the file does not carry (see river_io)
   integer(ip), device, allocatable :: rv_map(:)
+  integer(ip), device, allocatable :: rf_win(:)
 #else
   integer(ip), allocatable :: riv_ufc(:,:), riv_vfc(:,:)
   real(rp),    allocatable :: rf_flx(:), rg_h(:,:,:), rg_v(:,:)
@@ -99,6 +107,7 @@ module rivers_mod
   real(rp),    allocatable :: rc_sg(:,:)
   real(rp),    allocatable :: rv_vol(:,:), rv_trc(:,:,:)
   integer(ip), allocatable :: rv_map(:)
+  integer(ip), allocatable :: rf_win(:)
 #endif
 
 contains
@@ -111,13 +120,25 @@ contains
     real(rp),    intent(in) :: ffrac(:)
     integer(ip), intent(in) :: ci(:), cj(:), ccol(:), cn(:), cf(:,:)
     real(rp),    intent(in) :: csg(:,:)
-    integer(ip), allocatable :: mu(:,:), mv(:,:), cr(:,:)
+    integer(ip), allocatable :: mu(:,:), mv(:,:), cr(:,:), lw(:)
     integer(ip) :: m, c
     nrf = nf; nrc = nc; nrl = nloc; nrt = ntrr
     allocate(mu(decomp%is:decomp%ie, decomp%js:decomp%je), mv(decomp%is:decomp%ie, decomp%js:decomp%je))
     mu = 0; mv = 0
     nrf_s2d = count(iand(fs(1:nf), int(RIV_S2D, ip)) /= 0)
     nrf_s2df = count(iand(fs(1:nf), int(RIV_S2DF, ip)) /= 0)
+    nrf_win = count(iand(fs(1:nf), int(RIV_WIN, ip)) /= 0)
+    allocate(lw(max(nrf_win, 1_ip)))
+    lw = 1
+    c = 0
+    do m = 1, nf
+      if (iand(fs(m), int(RIV_WIN, ip)) == 0) cycle
+      c = c + 1
+      lw(c) = m
+    enddo
+    allocate(rf_win(max(nrf_win, 1_ip)))
+    rf_win = lw
+    deallocate(lw)
     do m = 1, nf
       if (iand(fs(m), int(RIV_S2DF, ip)) == 0) cycle
       if (ft(m) == 1) then
@@ -157,6 +178,46 @@ contains
     rv_trc = 0.0_rp
     river_on = .true.
   end subroutine rivers_set_lists
+
+  subroutine rivers_win_faces(n, wi, wj, wt)
+    ! BGC subcycling: the window's river faces (RIV_WIN), in list order:
+    ! location and type (1 = u, 2 = v); host copies.
+    integer(ip), intent(out) :: n
+    integer(ip), allocatable, intent(out) :: wi(:), wj(:), wt(:)
+    integer(ip), allocatable :: f(:), a(:), b(:), t(:)
+    n = nrf_win
+    allocate(wi(max(n, 1_ip)), wj(max(n, 1_ip)), wt(max(n, 1_ip)))
+    wi = 0; wj = 0; wt = 1
+    if (n == 0) return
+    allocate(f(n), a(max(nrf, 1_ip)), b(max(nrf, 1_ip)), t(max(nrf, 1_ip)))
+    f = rf_win(1:n); a = rf_i; b = rf_j; t = rf_t
+    wi = a(f); wj = b(f); wt = t(f)
+    deallocate(f, a, b, t)
+  end subroutine rivers_win_faces
+
+  subroutine rivers_win_acc(rua, ntr, dtp)
+    ! BGC subcycling, every step (UCLA ROMS bgcsub_accumulate): the tracer
+    ! transport through each window river face, summed over the window,
+    !   RUA(itr, w) = RUA(itr, w) + dt*riv_trc*rflx,
+    ! rflx = riv_vol*frac (rf_flx, the corrector's n+1/2) and riv_trc at
+    ! n+1/2 (the corrector's weights); passive tracer itr takes row
+    ! rv_map(itr) of the river data.
+    integer(ip), intent(in) :: ntr
+    real(rp), WORK_ATTR intent(inout) :: rua(ntr, max(nrf_win, 1_ip))
+    real(rp), intent(in) :: dtp
+    integer(ip) :: w, itr, n, nta, f, r, rw
+    real(rp) :: c1, c2, dtl, tr
+    if (nrf_win == 0 .or. ntr <= 0) return
+    n = nrf_win; nta = ntr; dtl = dtp; c1 = w_cor(1); c2 = w_cor(2)
+    CUF_DO2
+    do w = 1, n
+      do itr = 1, nta
+        f = rf_win(w); r = rf_r(f); rw = rv_map(itr)
+        tr = c1 * rv_trc(rw, r, 1) + c2 * rv_trc(rw, r, 2)
+        rua(itr, w) = rua(itr, w) + dtl * tr * rf_flx(f)
+      enddo
+    enddo
+  end subroutine rivers_win_acc
 
   subroutine rivers_set_map(map)
     ! rv_trc row of each passive tracer (river_io).

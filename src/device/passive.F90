@@ -37,6 +37,10 @@ module passive_mod
   character(len=16), public :: passive_init = 'zero'           ! zero | blob | mirror_salt
   logical, public :: passive_mirror = .false.
   logical, public :: wrt_passive = .true.
+  ! BGC subcycling (bgc_subcycle_mod): the passives are not stepped every
+  ! step; predictor, corrector, open boundaries, lateral mixing and their
+  ! exchanges are skipped, and bgc_subcycle_mod updates them at window ends.
+  logical, public :: tp_subcycled = .false.
   ! MARBL mode: the passives start with the MARBL tracers (names from
   ! MARBL, read from the initial file by name, external boundary values from
   ! the boundary data below instead of 0), followed by the generic tracers.

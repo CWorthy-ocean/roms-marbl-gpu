@@ -35,9 +35,10 @@ The GPU model runs the full ROMS time step (dynamics, vertical mixing,
 tracer advection and mixing, tides, surface forcing, rivers and open
 boundaries), MARBL, passive tracers, and the CDR_LITE alkalinity and DIC
 tracers with all CDR release types, on one GPU or on many GPUs across
-nodes. It writes the same output files as the CPU model. A namelist that
-switches on a CPU feature the GPU model does not have yet stops the run at
-start-up and lists the switches.
+nodes, optionally with UCLA ROMS's BGC tracer subcycling (see "BGC
+tracer subcycling"). It writes the same output files as the CPU model. A
+namelist that switches on a CPU feature the GPU model does not have yet
+stops the run at start-up and lists the switches.
 
 ## Getting started
 
@@ -245,9 +246,8 @@ v0.1.2-beta, bit for bit.
   `&bgc_settings` `bgc_physics_subcycle` and `bgc_physics_timestep` (and the
   testing keys `bgc_subcycle_pos`, `bgc_subcycle_diag`) and
   `&marbl_biogeochemistry_settings` `marbl_balance` are read. Before, any
-  of them stopped the run at the namelist read. BGC tracer subcycling is
-  not on the GPU yet: `bgc_physics_subcycle = .true.` stops the run;
-  `marbl_balance = .true.` is ignored with a note (see `NAMELIST_COMPAT`).
+  of them stopped the run at the namelist read. `marbl_balance = .true.`
+  is ignored with a note (see `NAMELIST_COMPAT`).
 - Periodic grids (a grid file of LLm x MMm points): history, average and
   restart files are written, and a restart from them is exact. Before,
   the first record stopped the run with "NetCDF: Start+count exceeds
@@ -290,6 +290,17 @@ v0.1.2-beta, bit for bit.
   steps in its first 24 steps too; on the closed basin with rivers and
   CDR that changes results at round-off (1e-13 in `DU_avg1`), on sargasso
   and the N2 nest not at all.
+- BGC tracer subcycling (`&bgc_settings bgc_physics_subcycle`,
+  `bgc_physics_timestep`; the port of UCLA ROMS #428 and #430): the BGC
+  tracers are transported, mixed and forced once per window from the
+  transports summed over the window, as UCLA ROMS does it, with its checks,
+  restart rule, messages and `BGCSUB` window diagnostics. Rivers, CDR
+  releases, CDR_LITE, CFLX_CORR and passive tracers are supported; the IMEX
+  internal-wave step, `bgc_subcycle_pos` and `bgc_subcycle_diag >= 2` stop
+  the run at start-up. Measured: Pac (8 A100) 1.37x faster at k = 4 (window
+  of 4 steps with MARBL every 4) and 1.20x at k = 2, MiniPac 1.28x and
+  1.18x. Off by default; runs without it are unchanged, bit for bit. See
+  "BGC tracer subcycling" below.
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
   depth-integrated internal-tide energy flux `up`/`vp` of the parent,
   written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS
@@ -421,6 +432,81 @@ use with MARBL; other CPU options are not available. In ROMS terms:
 - UPSTREAM_TS horizontal tracer advection (`UPSTREAM_TS_LAND_CURV` always on)
 - LMD94 interior mixing and KPP surface and bottom boundary layers (SMOOTH_RIG, INT_AT_RHO_POINTS, SMOOTH_HBL, Jwt=1)
 - Not available: NHMG, isoneutral mixing, splines, LMD_DDMIX, LMD_CONVEC
+
+## BGC tracer subcycling
+
+`&bgc_settings bgc_physics_subcycle = .true.` transports, mixes and forces
+the BGC tracers (every tracer after temperature and salinity: MARBL, the
+CDR tracers, passive tracers) once per window of `bgc_physics_timestep`
+instead of every time step, as UCLA ROMS does since #428 and #430. The
+physics still steps every `dt`; the window uses the corrector transports
+and the vertical diffusivity summed over the window, so it conserves each
+tracer's content and keeps a uniform tracer uniform. MARBL runs at the end
+of a window, at its own `marbl_timestep`. Physics results are unchanged,
+bit for bit.
+
+- **Settings.** `bgc_physics_timestep` is the window length in seconds, a
+  whole multiple of `dt` that divides `marbl_timestep` (0, the default:
+  `marbl_timestep`; without MARBL it must be set). The run stops at
+  start-up, naming the nearest valid lengths, if it is not. With MARBL every
+  4 steps, a window of 4 steps (k = 4) is the fastest setting, and a window
+  of 2 steps (k = 2) is in between; UCLA ROMS's documentation of the feature
+  discusses the accuracy of each. Restarts must fall on window boundaries
+  (`output_period_rst` a multiple of the window; the run starts on a window
+  boundary).
+- **Speed** (Derecho A100, 130 steps, no output, forcing reader on,
+  against today's setting: MARBL every 4 steps, BGC tracers transported
+  every step):
+
+  | case (ms per step, steady mean) | today | k = 2 | k = 4 | speed-up k = 2 / k = 4 |
+  |---|---:|---:|---:|---:|
+  | MiniPac, 4 A100 (1 node) | 67.89 | 57.36 | 53.04 | 1.18x / 1.28x |
+  | MiniPac, implicit free surface | 61.61 | 51.08 | 46.82 | 1.21x / 1.32x |
+  | Pac, 8 A100 (2 nodes) | 182.31 | 152.18 | 133.42 | 1.20x / 1.37x |
+  | Pac, implicit free surface | 178.12 | | 129.29 | - / 1.38x |
+  | Pac with rivers (51 729) | 184.31 | | 135.39 | - / 1.36x |
+
+  The gain is smaller than UCLA ROMS's (1.6-1.9x at k = 4) because the
+  BGC transport is a smaller part of a GPU step (about 40 %, against 60 %
+  on the CPU). Without the forcing reader the gains are the same (MiniPac
+  k = 4: 1.28x).
+- **Supported:** rivers, CDR releases in all four modes, the CDR_LITE and
+  CFLX_CORR surface fluxes, any number of passive tracers with or without
+  MARBL, split and implicit free surface, any tiling.
+- **Not on the GPU yet** (the run stops at start-up): the IMEX
+  internal-wave step together with subcycling (planned as a follow-up),
+  the positivity limiter `bgc_subcycle_pos` and its test
+  `bgc_subcycle_diag >= 2`. UPSCALING output and `ub_tune` are refused, as
+  in UCLA ROMS.
+- **Diagnostics:** `bgc_subcycle_diag = 1` prints UCLA ROMS's `BGCSUB` and
+  `BGCSUBNEG` lines for every window (Courant numbers, sub-passes,
+  continuity, the shadow uniform tracer, the worst per-tracer budget
+  residual, new negatives). The run timers report the window's parts.
+- **Differences from UCLA ROMS:** the window is ported routine by routine
+  with the CPU's operand order, so the results differ from the CPU's only by
+  rounding, as the stock tracer step does: the per-window sub-pass counts
+  and Courant numbers equal the CPU's to the printed digits, and GPU minus
+  CPU is of the size of the CPU's own strict-minus-regular rounding spread
+  (next item). Two GPU-only details: the budget residual is summed in a
+  fixed order over columns, so it prints about 10 times smaller than the
+  CPU's (both are rounding); and river faces in a tile's outer halo row are
+  summed by the rank that needs them, where the CPU exchanges the sums (the
+  same values). `marbl_balance` has no effect on the GPU.
+- **Validation:** against UCLA ROMS dev 5c8034bf on its `bgc_real_marbl`
+  test domain, a closed basin with a river and CDR releases, MiniPac and
+  Pac: the per-window sub-pass counts and Courant numbers equal the CPU's to
+  the printed digits (on MiniPac over the first 20 hours, after which the
+  two models' physics drift apart chaotically; the sub-pass counts stay
+  equal over 3 days), GPU minus CPU of the BGC tracers stays within 5 times
+  the CPU's strict-minus-regular spread at the maximum and 4 times in rms
+  over the first 16 steps (MiniPac: outside the rounding-sensitive spot
+  described in AGENTS.md), and the subcycling effect after 1 and 3 days of
+  MiniPac (k = 4 minus stock) matches the CPU's: ratio 0.985-1.000,
+  correlation 0.977-0.9999 at day 1, relative rms within 0.2 % of the CPU's
+  at day 3. Restarts on window boundaries are exact, and results do not
+  depend on the tiling (split free surface).
+- **Testing:** `tools/bgcsub_gates.py` runs the fast gate set on a small
+  MARBL case (AGENTS.md, "Testing").
 
 ## Validation
 

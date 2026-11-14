@@ -131,7 +131,7 @@ module halo_mod
   public :: halo_fill_3d
   public :: halo_fill_3d_s
   public :: halo_fill_3d_t
-  public :: halo_fill_3d_tp
+  public :: halo_fill_3d_tp, halo_fill_3d_tp_k, halo_fill_3d_k
   public :: halo_tp_start, halo_tp_mid, halo_tp_finish, tp_overlap_on
   public :: halo_fill_3d_w
   public :: halo_fill_3d_w_s
@@ -979,6 +979,19 @@ contains
     call exchange_ns_3d(a, i1, i2, j1, j2, 1, decomp%nz)
   end subroutine halo_fill_3d
 
+  subroutine halo_fill_3d_k(a, stagger, k0, k1)
+    ! halo_fill_3d for the levels k0..k1 only
+    real(rp), WORK_ATTR intent(inout) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
+    integer(ip), intent(in) :: stagger, k0, k1
+    integer(ip) :: i1, i2, j1, j2
+    if (no_neighbors()) return
+    if (k1 < k0) return
+    call ensure_bufs()
+    call interior_bounds(stagger, i1, i2, j1, j2)
+    call exchange_ew_3d(a, i1, i2, j1, j2, k0, k1)
+    call exchange_ns_3d(a, i1, i2, j1, j2, k0, k1)
+  end subroutine halo_fill_3d_k
+
   subroutine halo_fill_3d_w(a, stagger)
     real(rp), WORK_ATTR intent(inout) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, 0:decomp%nz)
     integer(ip), intent(in) :: stagger
@@ -1144,30 +1157,30 @@ contains
     endif
   end subroutine tp_ensure_bufs
 
-  subroutine tp_pack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
-    integer(ip), intent(in) :: ntr, n, nk, h, i1, i2, j1, j2
-    integer(ip) :: q, j, m, k, itr, nz
-    nz = nk / ntr
+  subroutine tp_pack_ew(a, ntr, nsl, n, kb, nz, h, i1, i2, j1, j2)
+    ! slot n of a(ntr, 0:ntpcol, nz, nsl), levels kb..kb+nz-1 <-> buffer planes 1..nz
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, nsl)
+    integer(ip), intent(in) :: ntr, nsl, n, kb, nz, h, i1, i2, j1, j2
+    integer(ip) :: q, j, m, k, itr
     CUF_DO3
     do k = 1, nz
       do j = j1, j2
         do q = 1, h * ntr
           m = (q - 1) / ntr + 1
           itr = q - (m - 1) * ntr
-          tew_slo(q, j, k) = real(a(itr, tpcol(i1 + m - 1, j), k, n), rp)
-          tew_shi(q, j, k) = real(a(itr, tpcol(i2 - h + m, j), k, n), rp)
+          tew_slo(q, j, k) = real(a(itr, tpcol(i1 + m - 1, j), kb + k - 1, n), rp)
+          tew_shi(q, j, k) = real(a(itr, tpcol(i2 - h + m, j), kb + k - 1, n), rp)
         enddo
       enddo
     enddo
   end subroutine tp_pack_ew
 
-  subroutine tp_unpack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
-    integer(ip), intent(in) :: ntr, n, nk, h, i1, i2, j1, j2
-    integer(ip) :: q, j, m, k, itr, nz
+  subroutine tp_unpack_ew(a, ntr, nsl, n, kb, nz, h, i1, i2, j1, j2)
+    ! slot n of a(ntr, 0:ntpcol, nz, nsl), levels kb..kb+nz-1 <-> buffer planes 1..nz
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, nsl)
+    integer(ip), intent(in) :: ntr, nsl, n, kb, nz, h, i1, i2, j1, j2
+    integer(ip) :: q, j, m, k, itr
     logical :: w, e
-    nz = nk / ntr
     w = (decomp%nbr_w /= NBR_NONE); e = (decomp%nbr_e /= NBR_NONE)
     if (.not. (w .or. e)) return
     ! west and east halo columns in one launch (disjoint cells)
@@ -1178,40 +1191,40 @@ contains
           m = (q - 1) / ntr + 1
           itr = q - (m - 1) * ntr
           if (w) then
-            if (tpcol(i1 - h + m - 1, j) > 0) a(itr, tpcol(i1 - h + m - 1, j), k, n) = real(tew_rlo(q, j, k), pp)
+            if (tpcol(i1 - h + m - 1, j) > 0) a(itr, tpcol(i1 - h + m - 1, j), kb + k - 1, n) = real(tew_rlo(q, j, k), pp)
           endif
           if (e) then
-            if (tpcol(i2 + m, j) > 0) a(itr, tpcol(i2 + m, j), k, n) = real(tew_rhi(q, j, k), pp)
+            if (tpcol(i2 + m, j) > 0) a(itr, tpcol(i2 + m, j), kb + k - 1, n) = real(tew_rhi(q, j, k), pp)
           endif
         enddo
       enddo
     enddo
   end subroutine tp_unpack_ew
 
-  subroutine tp_pack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
-    integer(ip), intent(in) :: ntr, n, nk, h, ilo, ihi, j1, j2
-    integer(ip) :: q, i, m, k, itr, nz
-    nz = nk / ntr
+  subroutine tp_pack_ns(a, ntr, nsl, n, kb, nz, h, ilo, ihi, j1, j2)
+    ! slot n of a(ntr, 0:ntpcol, nz, nsl), levels kb..kb+nz-1 <-> buffer planes 1..nz
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, nsl)
+    integer(ip), intent(in) :: ntr, nsl, n, kb, nz, h, ilo, ihi, j1, j2
+    integer(ip) :: q, i, m, k, itr
     CUF_DO3
     do k = 1, nz
       do i = ilo, ihi
         do q = 1, h * ntr
           m = (q - 1) / ntr + 1
           itr = q - (m - 1) * ntr
-          tns_slo(q, i, k) = real(a(itr, tpcol(i, j1 + m - 1), k, n), rp)
-          tns_shi(q, i, k) = real(a(itr, tpcol(i, j2 - h + m), k, n), rp)
+          tns_slo(q, i, k) = real(a(itr, tpcol(i, j1 + m - 1), kb + k - 1, n), rp)
+          tns_shi(q, i, k) = real(a(itr, tpcol(i, j2 - h + m), kb + k - 1, n), rp)
         enddo
       enddo
     enddo
   end subroutine tp_pack_ns
 
-  subroutine tp_unpack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
-    integer(ip), intent(in) :: ntr, n, nk, h, ilo, ihi, j1, j2
-    integer(ip) :: q, i, m, k, itr, nz
+  subroutine tp_unpack_ns(a, ntr, nsl, n, kb, nz, h, ilo, ihi, j1, j2)
+    ! slot n of a(ntr, 0:ntpcol, nz, nsl), levels kb..kb+nz-1 <-> buffer planes 1..nz
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, nsl)
+    integer(ip), intent(in) :: ntr, nsl, n, kb, nz, h, ilo, ihi, j1, j2
+    integer(ip) :: q, i, m, k, itr
     logical :: so, no
-    nz = nk / ntr
     so = (decomp%nbr_s /= NBR_NONE); no = (decomp%nbr_n /= NBR_NONE)
     if (.not. (so .or. no)) return
     ! south and north halo rows in one launch (disjoint cells)
@@ -1222,10 +1235,10 @@ contains
           m = (q - 1) / ntr + 1
           itr = q - (m - 1) * ntr
           if (so) then
-            if (tpcol(i, j1 - h + m - 1) > 0) a(itr, tpcol(i, j1 - h + m - 1), k, n) = real(tns_rlo(q, i, k), pp)
+            if (tpcol(i, j1 - h + m - 1) > 0) a(itr, tpcol(i, j1 - h + m - 1), kb + k - 1, n) = real(tns_rlo(q, i, k), pp)
           endif
           if (no) then
-            if (tpcol(i, j2 + m) > 0) a(itr, tpcol(i, j2 + m), k, n) = real(tns_rhi(q, i, k), pp)
+            if (tpcol(i, j2 + m) > 0) a(itr, tpcol(i, j2 + m), kb + k - 1, n) = real(tns_rhi(q, i, k), pp)
           endif
         enddo
       enddo
@@ -1256,17 +1269,45 @@ contains
     call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
     call tp_ensure_bufs(nk, ntr)
     if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
-      call tp_pack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
+      call tp_pack_ew(a, ntr, 3_ip, n, 1_ip, decomp%nz, h, i1, i2, j1, j2)
       call deliver3(decomp%nbr_w, decomp%nbr_e, tew_slo, tew_shi, tew_rlo, tew_rhi)
-      call tp_unpack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
+      call tp_unpack_ew(a, ntr, 3_ip, n, 1_ip, decomp%nz, h, i1, i2, j1, j2)
     endif
     if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
       ilo = i1 - h; ihi = i2 + h
-      call tp_pack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
+      call tp_pack_ns(a, ntr, 3_ip, n, 1_ip, decomp%nz, h, ilo, ihi, j1, j2)
       call deliver3(decomp%nbr_s, decomp%nbr_n, tns_slo, tns_shi, tns_rlo, tns_rhi)
-      call tp_unpack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
+      call tp_unpack_ns(a, ntr, 3_ip, n, 1_ip, decomp%nz, h, ilo, ihi, j1, j2)
     endif
   end subroutine halo_fill_3d_tp
+
+  subroutine halo_fill_3d_tp_k(a, ntr, nsl, slot, k0, k1)
+    ! halo_fill_3d_tp for the levels k0..k1 only of slot `slot` of
+    ! a(ntr, 0:ntpcol, nz, nsl): only those planes are packed and sent (the
+    ! BGC subcycling window's sub-passes; nsl = 1 for its shadow tracer)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, nsl)
+    integer(ip), intent(in) :: ntr, nsl, slot, k0, k1
+    integer(ip) :: h, nk, i1, i2, j1, j2, ilo, ihi
+    if (no_neighbors()) return
+    if (ntr <= 0 .or. k1 < k0) return
+    if (tp_pending /= 0) error stop 'halo_fill_3d_tp_k: a non-blocking all-tracer exchange is pending'
+    h = decomp%halo; nk = k1 - k0 + 1
+    call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
+    call tp_ensure_bufs(decomp%nz * ntr, ntr)
+    if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
+      call tp_pack_ew(a, ntr, nsl, slot, k0, nk, h, i1, i2, j1, j2)
+      call deliver3(decomp%nbr_w, decomp%nbr_e, tew_slo(:, :, 1:nk), tew_shi(:, :, 1:nk), &
+                    tew_rlo(:, :, 1:nk), tew_rhi(:, :, 1:nk))
+      call tp_unpack_ew(a, ntr, nsl, slot, k0, nk, h, i1, i2, j1, j2)
+    endif
+    if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
+      ilo = i1 - h; ihi = i2 + h
+      call tp_pack_ns(a, ntr, nsl, slot, k0, nk, h, ilo, ihi, j1, j2)
+      call deliver3(decomp%nbr_s, decomp%nbr_n, tns_slo(:, :, 1:nk), tns_shi(:, :, 1:nk), &
+                    tns_rlo(:, :, 1:nk), tns_rhi(:, :, 1:nk))
+      call tp_unpack_ns(a, ntr, nsl, slot, k0, nk, h, ilo, ihi, j1, j2)
+    endif
+  end subroutine halo_fill_3d_tp_k
 
   ! ---- the same exchange in three non-blocking pieces, so that the MPI
   ! transfers run under unrelated kernels: start packs and posts the
@@ -1293,7 +1334,7 @@ contains
     tp_slot_p = int(slot); tp_ntr_p = int(ntr)
     tp_ew_posted = .false.; tp_ns_posted = .false.
     if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
-      call tp_pack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
+      call tp_pack_ew(a, ntr, 3_ip, n, 1_ip, decomp%nz, h, i1, i2, j1, j2)
       call sync_work_stream()
       call comm_post_dev(decomp%nbr_w, decomp%nbr_e, int(size(tew_slo)), tew_slo, tew_shi, tew_rlo, tew_rhi, &
                          321, 322, tp_req_ew)
@@ -1313,11 +1354,11 @@ contains
     if (tp_ew_posted) then
       call comm_wait_dev(tp_req_ew)
       if (tp_devsync) call sync_arch()
-      call tp_unpack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
+      call tp_unpack_ew(a, ntr, 3_ip, n, 1_ip, decomp%nz, h, i1, i2, j1, j2)
     endif
     if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
       ilo = i1 - h; ihi = i2 + h
-      call tp_pack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
+      call tp_pack_ns(a, ntr, 3_ip, n, 1_ip, decomp%nz, h, ilo, ihi, j1, j2)
       call sync_work_stream()
       call comm_post_dev(decomp%nbr_s, decomp%nbr_n, int(size(tns_slo)), tns_slo, tns_shi, tns_rlo, tns_rhi, &
                          323, 324, tp_req_ns)
@@ -1342,7 +1383,7 @@ contains
     ilo = i1 - h; ihi = i2 + h
     call comm_wait_dev(tp_req_ns)
     if (tp_devsync) call sync_arch()
-    call tp_unpack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
+    call tp_unpack_ns(a, ntr, 3_ip, n, 1_ip, decomp%nz, h, ilo, ihi, j1, j2)
     tp_pending = 0
     if (tp_check_wanted()) call tp_check(a, ntr, n)
   end subroutine halo_tp_finish
