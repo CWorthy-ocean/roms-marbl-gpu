@@ -171,13 +171,15 @@ module imex_igw
   ! levers on the default fused path (imex_gpu_stage, imex_gpu_sweep, imex_gpu_redu 1); 0 = the path
   ! of roms-marbl-gpu dev 551565f. Bits: 1 the IMEX kernels skip deep land (the stock dry-column rule)
   ! and the mixing split's velocity is formed only where a stress kernel reads it (imex_pgu, imex_pgv
-  ! are zero at deep land). Default 0, set in imex_read_namelist (no initial value: see imex_gpu_timers)
+  ! are zero at deep land); 2 the FP32 z exchange of each PCG iteration in one round, one cell wide,
+  ! through the x exchange's real(8) ring (pf_zring4; with xring_on). Default 0, set in
+  ! imex_read_namelist (no initial value: see imex_gpu_timers)
   integer     :: imex_gpu_opt
-  integer, parameter :: OPT_BITS = 1                 ! the bits implemented
+  integer, parameter :: OPT_BITS = 3                 ! the bits implemented
   ! imex_gpu_opt in effect: bit 1 (opt_skip; visc3d reads imex_opt_skip); pg_dz: the deep-land faces of
   ! pgu, pgv were zeroed when the skip first applied
   logical, public, protected :: imex_opt_skip
-  logical :: pg_dz
+  logical :: pg_dz, opt_zring
   ! CPU 73a63afb (FS_SPEC 3.8, 9b-H): imex_rst_state 1 (default) the IMEX state in the EXACT_RESTART
   ! files (one time-less copy, with the second record of each pair), 0 none (small files, the old
   ! inexact restart); imex_redu (CPU: rank-count-independent integer-digit sums) read, only 0 on
@@ -378,7 +380,7 @@ contains
     talk = (comm_world_rank() == 0)
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
     imex_gpu_timers = 0                  ! the default (see the declaration)
-    imex_gpu_opt = 0; imex_opt_skip = .false.; pg_dz = .false.
+    imex_gpu_opt = 0; imex_opt_skip = .false.; pg_dz = .false.; opt_zring = .false.
     rewind(unit)
     msg = ''
     read(unit, nml=imex_igw_settings, iostat=ios, iomsg=msg)
@@ -548,6 +550,7 @@ contains
     if (imex_gpu_opt /= 0 .and. .not. (stage_on .and. sweep_on .and. redu_on)) call bad('imex_gpu_opt /= 0 needs' &
          // ' the default fused path (imex_gpu_stage, imex_gpu_sweep, imex_gpu_redu 1 in effect)')
     imex_opt_skip = iand(imex_gpu_opt, 1) /= 0
+    opt_zring = iand(imex_gpu_opt, 2) /= 0
     if (nerr > 0) error stop 'imex_igw: unsupported &imex_igw_settings (see above)'
   contains
     subroutine bad(what)
@@ -3040,6 +3043,74 @@ contains
   !======================================================================
   ! Whole-array helpers (halos included)
   !======================================================================
+  subroutine pf_zring4(a)
+    ! imex_gpu_opt 2 (xring_on): the halo of the real(4) z one cell wide, without corners, in one round:
+    ! the tile's four edge rows converted to real(8) (exact) into the x exchange's ring buffers, one
+    ! comm_ring_dev8 call, converted back (exact). The values the operator reads (one cell, no corners)
+    ! are those of pf_zexch4's exchange through wk_z; physical-edge ghosts and corners are left as they
+    ! are, as pf_ring1_8 leaves them for x.
+    real(4), WORK_ATTR intent(inout) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
+    integer(ip) :: k, m, nx, ny, nz, mx, nb(4), w, e, s, n
+    integer :: ierr
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    nb = [decomp%nbr_w, decomp%nbr_e, decomp%nbr_s, decomp%nbr_n]
+    if (all(nb == NBR_NONE)) return
+    if (.not. allocated(rg8_sw)) then
+      allocate(rg8_sw(ny * nz), rg8_se(ny * nz), rg8_rw(ny * nz), rg8_re(ny * nz))
+      allocate(rg8_ss(nx * nz), rg8_sn(nx * nz), rg8_rs(nx * nz), rg8_rn(nx * nz))
+      rg8_sw = 0; rg8_se = 0; rg8_rw = 0; rg8_re = 0; rg8_ss = 0; rg8_sn = 0; rg8_rs = 0; rg8_rn = 0
+    endif
+    mx = max(nx, ny)
+    CUF_DO2
+    do k = 1, nz
+      do m = 1, mx
+        if (m <= ny) then
+          rg8_sw(m + (k - 1) * ny) = real(a(1, m, k), 8); rg8_se(m + (k - 1) * ny) = real(a(nx, m, k), 8)
+        endif
+        if (m <= nx) then
+          rg8_ss(m + (k - 1) * nx) = real(a(m, 1, k), 8); rg8_sn(m + (k - 1) * nx) = real(a(m, ny, k), 8)
+        endif
+      enddo
+    enddo
+    if (any(nb >= 0)) then
+#ifdef USE_CUDA
+      ierr = cudaStreamSynchronize(work_stream)
+      if (ierr /= 0) error stop 'pf_zring4: stream sync'
+#endif
+      call comm_ring_dev8(nb, int(ny * nz), int(nx * nz), rg8_sw, rg8_se, rg8_ss, rg8_sn, rg8_rw, rg8_re, rg8_rs, rg8_rn)
+    endif
+    w = nb(1); e = nb(2); s = nb(3); n = nb(4)
+    CUF_DO2
+    do k = 1, nz
+      do m = 1, mx
+        if (m <= ny) then
+          if (w == NBR_SELF) then
+            a(0, m, k) = real(rg8_se(m + (k - 1) * ny), 4)
+          else if (w /= NBR_NONE) then
+            a(0, m, k) = real(rg8_rw(m + (k - 1) * ny), 4)
+          endif
+          if (e == NBR_SELF) then
+            a(nx + 1, m, k) = real(rg8_sw(m + (k - 1) * ny), 4)
+          else if (e /= NBR_NONE) then
+            a(nx + 1, m, k) = real(rg8_re(m + (k - 1) * ny), 4)
+          endif
+        endif
+        if (m <= nx) then
+          if (s == NBR_SELF) then
+            a(m, 0, k) = real(rg8_sn(m + (k - 1) * nx), 4)
+          else if (s /= NBR_NONE) then
+            a(m, 0, k) = real(rg8_rs(m + (k - 1) * nx), 4)
+          endif
+          if (n == NBR_SELF) then
+            a(m, ny + 1, k) = real(rg8_ss(m + (k - 1) * nx), 4)
+          else if (n /= NBR_NONE) then
+            a(m, ny + 1, k) = real(rg8_rn(m + (k - 1) * nx), 4)
+          endif
+        endif
+      enddo
+    enddo
+  end subroutine pf_zring4
+
   subroutine copy3(a, b)
     real(rp), WORK_ATTR intent(in) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
     real(rp), WORK_ATTR intent(inout) :: b(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)

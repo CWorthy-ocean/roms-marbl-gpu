@@ -871,6 +871,10 @@
     integer(ip) :: i, j, k, nx, ny, nz
 #endif
 #if PFK == 4
+    if (opt_zring .and. xring_on) then             ! imex_gpu_opt 2: one round, one cell
+      call pf_zring4(z)
+      return
+    endif
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     CUF_DO2
     do k = 1, nz
