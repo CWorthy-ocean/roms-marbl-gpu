@@ -295,6 +295,25 @@ v0.1.2-beta, bit for bit.
   periodic seamount with flux forcing, 1e8 times the CPU's strict spread
   at the first step; now 1.8 times). Periodic runs with surface forcing
   change; all other runs are unchanged, bit for bit.
+- 2x-coarse surface forcing (`interp_flux_frc`, `interp_bulk_frc`,
+  `interp_bgc_frc`) on a grid with an odd LLm or MMm: the last fine rho
+  column (row) at the east (north) edge and the u (v) end face take the
+  last coarse value, as UCLA ROMS does since ucla-roms #439. Before, the
+  GPU model reproduced UCLA ROMS's earlier result there, which mixed in a
+  zero from beyond the file: 0.75 times the forcing on that boundary
+  ring, 0.5625 times at the corner and half the stress on the u (v) end
+  face. Grids with even LLm and MMm, periodic directions and forcing on
+  the model grid are unchanged, bit for bit.
+- 2x-coarse surface forcing on a periodic grid, and the CDR_LITE
+  carbonate sensitivities (`ddic_dco2`, `ddic_dalk`) where one of their
+  two records is missing: the forcing halo in a periodic direction is the
+  periodic copy of the interior, and the 2x-coarse field is periodic too,
+  as UCLA ROMS's exchanges make them. Before, the file's coarse boundary
+  points were used in the halo and next to it (on a doubly periodic
+  seamount whose coarse file does not hold periodic copies there, 4e13
+  times the CPU's strict spread at the first step; now 1.7 times). A file
+  whose coarse boundary points are periodic copies gives the same results
+  as before, and closed grids are unchanged, bit for bit.
 - `rho0` (`&rho0_settings`) is read at run time, as UCLA ROMS reads it:
   one binary runs any reference density. Before, it was a build constant
   (`-DROMS_RHO0`, default 1000), and a namelist with another value
