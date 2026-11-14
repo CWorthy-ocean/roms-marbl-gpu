@@ -17,11 +17,14 @@
 #   &bgc_settings  bgc_physics_subcycle, bgc_physics_timestep (BGC tracer
 #     subcycling, #428), and its testing keys bgc_subcycle_pos and
 #     bgc_subcycle_diag, with UCLA ROMS's checks, restart rule and messages.
-#     The GPU port is partial: river sources, CDR releases, CDR_LITE tracers,
-#     bgc_subcycle_pos = .true., bgc_subcycle_diag >= 2, the IMEX
-#     internal-wave step (&imex_igw_settings; no UCLA ROMS reference for
-#     the combination) and builds without -DPASSIVE_FP64 are refused at
-#     start-up. bgc_subcycle_diag = 1 prints the BGCSUB window lines.
+#     Rivers, CDR releases (all four modes), CDR_LITE and CFLX_CORR
+#     fluxes, and passive tracers with or without MARBL are subcycled as on
+#     the CPU. Refused at start-up: bgc_subcycle_pos = .true.,
+#     bgc_subcycle_diag >= 2, the IMEX internal-wave step
+#     (&imex_igw_settings; no UCLA ROMS reference for the combination),
+#     UPSCALING output, ub_tune, the mirror_salt test tracer and builds
+#     without -DPASSIVE_FP64. bgc_subcycle_diag = 1 prints the BGCSUB
+#     window lines.
 #   &marbl_biogeochemistry_settings  marbl_balance (#430), which ships MARBL
 #     columns between CPU ranks and changes no result. Each GPU computes
 #     the wet columns of its tile (&tile_settings balances them), so

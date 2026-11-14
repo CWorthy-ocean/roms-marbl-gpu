@@ -19,16 +19,18 @@ module bgc_subcycle_mod
   ! inner operators, the #415 upwind rule on inflow faces of open sides,
   ! TS_DIF2 diffusion of the window-start state over the window), a 1-D
   ! swept flux vertically in the pseudo-volumes left by the horizontal
-  ! pass, the surface fluxes (CFLX_CORR restoring of DIC/ALK), implicit
-  ! vertical mixing with the window-integrated Akt, the window boundary
-  ! conditions, MARBL at MARBL steps, the exchange and the copy to the
-  ! other time slots. Kernels in bgc_window_mod.
+  ! pass, the sources (surface fluxes: CFLX_CORR restoring of DIC/ALK and
+  ! the CDR_LITE fluxes; CDR releases in every mode), implicit vertical
+  ! mixing with the window-integrated Akt, the window boundary conditions,
+  ! MARBL at MARBL steps, the exchange and the copy to the other time
+  ! slots. River faces carry the window's river tracer transport in the
+  ! horizontal pass, on every sub-pass. Kernels in bgc_window_mod.
   !
-  ! GPU port, stage 3 (GPU_BGC_SUBCYCLE_SCOPE.md): a level whose Courant
-  ! numbers need it is split into mk(k) sub-passes, as on the CPU; river
-  ! sources, CDR releases and CDR_LITE tracers are refused at start-up
-  ! until they are ported; bgc_subcycle_pos and bgc_subcycle_diag >= 2
-  ! likewise.
+  ! GPU port, stage 4 (GPU_BGC_SUBCYCLE_SCOPE.md): a level whose Courant
+  ! numbers need it is split into mk(k) sub-passes, as on the CPU; rivers,
+  ! CDR releases (parameterized, volume, depth profiles, 3D), CDR_LITE and
+  ! passive tracers with or without MARBL are in; bgc_subcycle_pos and
+  ! bgc_subcycle_diag >= 2 are refused at start-up.
   !
   ! Between window ends the BGC state is held in time slots 1 and 2 of tp
   ! and at the surface of slot 3 (the only part of slot 3 read between
@@ -37,7 +39,7 @@ module bgc_subcycle_mod
   ! with a signalling NaN, as on the CPU.
   use kinds
   use decomp_mod, only: decomp
-  use gpu_state, only: Hz, FlxU, FlxV, We, Wi, Akt, pm, pn, rmask, swflx, nwet, ntpcol, build_tp_cross
+  use gpu_state, only: Hz, FlxU, FlxV, We, Wi, Akt, pm, pn, rmask, swflx, nwet, ntpcol, build_tp_cross, nxc
   use time_state, only: iic, nnew, nstp, dt, ntstart, ntimes
   use passive_mod, only: ntp, tp, passive_hold, passive_init, tp_subcycled, tnu2_tp, passive_name, &
        passive_bry, tb_west, tb_east, tb_south, tb_north
@@ -46,12 +48,12 @@ module bgc_subcycle_mod
   use his_io, only: wrt_file_rst, output_period_rst
   use upscale_out, only: do_upscale
   use pflx_mod, only: ub_tune
-  use rivers_mod, only: river_on
-  use cdr_src_mod, only: cdr_on
+  use rivers_mod, only: river_on, rivers_win_faces, rivers_win_acc
+  use cdr_src_mod, only: cdr_on, cdr_win_nq, cdr_win_cols, cdr_win_acc, cdr_win_tr3d
   use cdr_lite_mod, only: cdrl_on, cdrl_psf, psf_cflx
   use imex_igw, only: imex_on
   use bgc_window_mod, only: WLEV, bgcw_stats, bgcw_hcoef, bgcw_inner, bgcw_outer, bgcw_factor, &
-       bgcw_vertical, bgcw_t3dbc, bgcw_reduce, bgcw_vs, bgcw_edge_r, bgcw_subq, bgcw_edge_tp
+       bgcw_vertical, bgcw_t3dbc, bgcw_reduce, bgcw_vs, bgcw_edge_r, bgcw_subq, bgcw_edge_tp, bgcw_rcol, bgcw_rbits
   use comm_mod, only: comm_rank, comm_allreduce_max, comm_allreduce_min, comm_allreduce_sum, comm_abort
   use arch_mod, only: sync_arch
   use run_timers, only: rt_ev_begin, rt_ev_end, RT_BGCACC, RT_BGCWIN, RT_BGCH0, RT_BGCH, RT_BGCV, RT_BGCBC, &
@@ -112,6 +114,29 @@ module bgc_subcycle_mod
   real(rp), WORK_ATTR allocatable :: rred(:,:)
   ! boundary-data placeholders when the passives have none (passive_bry)
   real(rp), WORK_ATTR allocatable :: tbx0(:,:,:), tby0(:,:,:)
+  ! river faces of the window (rivers_mod RIV_WIN; the CPU's hu/hv lists):
+  ! location and type (wfi, wfj, wft), window face index per u / v point
+  ! (wfu, wfv; 0: none), face bits per cross-region column (rbx) and per
+  ! interior wet column (rbo); the tracer transport summed over the window
+  ! [conc m^3] (RUA, the CPU's RUA/RVA), the column sum of the summed face
+  ! transport (RCL: rcolu/rcolv), the budget's river term per face (DRV)
+  integer(ip) :: nwf = 0
+  integer(ip), WORK_ATTR allocatable :: wfi(:), wfj(:), wft(:), wfu(:,:), wfv(:,:), rbx(:), rbo(:)
+  ! the columns that take the kernels' source variants (bgc_window_mod
+  ! *_src): cross-region columns with river faces (rlx), interior wet
+  ! columns with river faces (rlo), interior wet columns with point
+  ! sources (rlv; hsm = 1)
+  integer(ip) :: nrx = 0, nro = 0, nrv = 0
+  integer(ip), WORK_ATTR allocatable :: rlx(:), rlo(:), rlv(:), hsm(:)
+  real(rp), WORK_ATTR allocatable :: RUA(:,:), RCL(:), DRV(:,:)
+  ! CDR releases: profiles of this tile (nqw; cdr_src), their ranges per
+  ! interior wet column (wq0..wq1), release contents summed over the
+  ! window per tracer, profile and level (CPA [conc m^3/(pm pn)]), the
+  ! shadow's volume (CPV, volume releases), the 3D forcing of ALK and DIC
+  ! (passive c3a, c3d) summed (C3)
+  integer(ip) :: nqw = 0, c3a = 0, c3d = 0
+  integer(ip), WORK_ATTR allocatable :: wq0(:), wq1(:)
+  real(rp), WORK_ATTR allocatable :: CPA(:,:,:), CPV(:,:,:), C3(:,:,:,:)
 
 contains
 
@@ -174,12 +199,6 @@ contains
          'bgc_subcycle_diag >= 2 (the positivity test) is not on the GPU yet')
     if (pp /= rp) call raise('bgcsub_init', &
          'bgc_physics_subcycle needs double-precision passive tracers (a build with -DPASSIVE_FP64)')
-    if (river_on) call raise('bgcsub_init', &
-         'bgc_physics_subcycle with river sources (river_source) is not on the GPU yet')
-    if (cdr_on) call raise('bgcsub_init', &
-         'bgc_physics_subcycle with CDR releases (cdr_source) is not on the GPU yet')
-    if (cdrl_on) call raise('bgcsub_init', &
-         'bgc_physics_subcycle with CDR_LITE tracers (nt_cdr_oae, nt_cdr_dor) is not on the GPU yet')
     ! The IMEX internal-wave step (&imex_igw_settings) came to UCLA ROMS
     ! after the subcycling reference (dev 5c8034bf), so the combination has
     ! no CPU reference to port from or check against.
@@ -218,7 +237,7 @@ contains
     endif
     dbef = 0.0_rp; daft = 0.0_rp; dsrf = 0.0_rp; dnmn = 0.0_rp; dncn = 0.0_rp; dshd = 0.0_rp
     dew = 0.0_rp; dee = 0.0_rp; des = 0.0_rp; den = 0.0_rp
-    allocate(rred(max(ntp, 1_ip), 10))
+    allocate(rred(max(ntp, 1_ip), 12))
     rred = 0.0_rp
     if (.not. passive_bry) then
       allocate(tbx0(js:je, nz, 1), tby0(is:ie, nz, 1))
@@ -226,6 +245,7 @@ contains
     endif
     tnumax = maxval(tnu2_tp(1:ntp))
     call build_tp_cross()
+    call init_sources(nd)
     call reset_sums()
     nwin = 0
 
@@ -260,6 +280,90 @@ contains
            modulo(ntstart + ntimes - 1, bgcsub_k), ' steps is not applied'
     endif
   end subroutine bgcsub_init
+
+  subroutine init_sources(nd)
+    ! River faces and CDR releases of the window (nd = 1: diagnostics)
+    integer(ip), intent(in) :: nd
+    integer(ip) :: is, ie, js, je, nx, ny, nz, w
+    integer(ip), allocatable :: hi(:), hj(:), ht(:), mu(:,:), mv(:,:)
+    call sync_arch()
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    nwf = 0
+    if (river_on) then
+      call rivers_win_faces(nwf, hi, hj, ht)
+    else
+      allocate(hi(1), hj(1), ht(1))
+      hi = 0; hj = 0; ht = 1
+    endif
+    allocate(mu(is:ie, js:je), mv(is:ie, js:je))
+    mu = 0; mv = 0
+    do w = 1, nwf
+      if (ht(w) == 1) then
+        mu(hi(w), hj(w)) = w
+      else
+        mv(hi(w), hj(w)) = w
+      endif
+    enddo
+    allocate(wfi(max(nwf, 1_ip)), wfj(max(nwf, 1_ip)), wft(max(nwf, 1_ip)))
+    allocate(wfu(is:ie, js:je), wfv(is:ie, js:je), rbx(max(nxc, 1_ip)), rbo(max(nwet, 1_ip)))
+    wfi = hi(1:max(nwf, 1_ip)); wfj = hj(1:max(nwf, 1_ip)); wft = ht(1:max(nwf, 1_ip))
+    wfu = mu; wfv = mv
+    rbx = 0; rbo = 0
+    deallocate(hi, hj, ht, mu, mv)
+    if (nwf > 0) call bgcw_rbits(wfu, wfv, rbx, rbo)
+    allocate(RUA(max(ntp, 1_ip), max(nwf, 1_ip)), RCL(max(nwf, 1_ip)))
+    RUA = 0.0_rp; RCL = 0.0_rp
+    if (nd == 1 .and. nwf > 0) then
+      allocate(DRV(max(ntp, 1_ip), nwf))
+    else
+      allocate(DRV(1, 1))
+    endif
+    DRV = 0.0_rp
+    nqw = cdr_win_nq()
+    call cdr_win_tr3d(c3a, c3d)
+    allocate(wq0(max(nwet, 1_ip)), wq1(max(nwet, 1_ip)))
+    call cdr_win_cols(wq0, wq1)
+    allocate(CPA(max(ntp, 1_ip), max(nqw, 1_ip), nz), CPV(1, max(nqw, 1_ip), nz))
+    if (c3a > 0) then
+      allocate(C3(nx, ny, nz, 2))
+    else
+      allocate(C3(1, 1, 1, 2))
+    endif
+    CPA = 0.0_rp; CPV = 0.0_rp; C3 = 0.0_rp
+    call sync_arch()
+    ! the column lists of the source variants
+    allocate(hsm(max(nwet, 1_ip)))
+    hsm = 0
+    do w = 1, nwet
+      if (wq1(w) >= wq0(w) .or. c3a > 0) hsm(w) = 1
+    enddo
+    nrx = count(rbx(1:max(nxc, 1_ip)) /= 0); nro = count(rbo(1:max(nwet, 1_ip)) /= 0); nrv = count(hsm /= 0)
+    if (nxc == 0) nrx = 0
+    if (nwet == 0) then
+      nro = 0; nrv = 0
+    endif
+    allocate(rlx(max(nrx, 1_ip)), rlo(max(nro, 1_ip)), rlv(max(nrv, 1_ip)))
+    rlx = 1; rlo = 1; rlv = 1
+    nrx = 0
+    do w = 1, nxc
+      if (rbx(w) /= 0) then
+        nrx = nrx + 1; rlx(nrx) = w
+      endif
+    enddo
+    nro = 0; nrv = 0
+    do w = 1, nwet
+      if (rbo(w) /= 0) then
+        nro = nro + 1; rlo(nro) = w
+      endif
+      if (hsm(w) /= 0) then
+        nrv = nrv + 1; rlv(nrv) = w
+      endif
+    enddo
+    if (nwf > 0 .or. nrv > 0) write(*,'(a,i0,a,i0,a,i0,a,i0,a,i0,a,i0)') 'BGC subcycling: rank ', comm_rank(), &
+         '  river faces ', nwf, ' (columns: inner ', nrx, ', outer ', nro, ')  point-source columns ', nrv, &
+         '  CDR profiles ', nqw
+  end subroutine init_sources
 
   subroutine build_edge_list()
     ! the cells of the physical-edge rows over the whole array (the CPU's
@@ -377,8 +481,9 @@ contains
     ! step3d_t uses) and the corrector's set_forces (n+1/2): sum dt*FlxU,
     ! dt*FlxV, dt*(We+Wi) and dt*Akt(salt) over the tile with its halo
     ! (FlxU/FlxV exchanged by step3d_uv2, We/Wi set by omega there), the
-    ! surface fluxes of the passives (cdrl_psf: CFLX_CORR) and, for the
-    ! shadow tracer, the rain volume dt*swflx.
+    ! surface fluxes of the passives (cdrl_psf: CFLX_CORR and CDR_LITE),
+    ! the river-face tracer transports (RUA), the CDR release contents
+    ! (CPA, C3; CPV) and, for the shadow tracer, the rain volume dt*swflx.
     integer(ip) :: i, j, k, is, ie, js, je, nz, c, m, n, nw
     real(rp) :: dtl
     if (.not. bgc_physics_subcycle) return
@@ -399,7 +504,9 @@ contains
         enddo
       enddo
     enddo
-    if (psf_cflx) then
+    if (river_on) call rivers_win_acc(RUA, ntp, dtl)
+    if (cdr_on) call cdr_win_acc(ntp, CPA, merge(1_ip, 0_ip, bgc_subcycle_diag > 0), CPV, C3, dtl)
+    if (psf_cflx .or. cdrl_on) then
       n = ntp; nw = nwet
       CUF_DO2
       do c = 1, nw
@@ -509,6 +616,8 @@ contains
     ! HZS and the window-start state (the CPU's edge_copy). Diffusion on
     ! sub-pass 1 only.
     call rt_ev_begin(RT_BGCH)
+    ! river faces: the column sums of the summed face transports (rcolu/v)
+    if (nwf > 0) call bgcw_rcol(nwf, wfi, wfj, wft, VX, VY, RCL)
     do isub = 1, msub
       if (isub == 1) then
         klo = 1; khi = nz
@@ -544,23 +653,27 @@ contains
         if (isub == 1) then
           call bgcw_hcoef(k0, k1, isub, mk, VX, VY, HZS, fmk, wvol, wcx, wcy, wdx, wdy)
           if (diag) then
-            call bgcw_inner(1_ip, k0, k1, isub, mk, QONE, wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk)
+            call bgcw_inner(1_ip, k0, k1, isub, mk, QONE, wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk, &
+                            1_ip, rbx, nrx, rlx, wfu, wfv, RUA, RCL)
             call bgcw_outer(1_ip, k0, k1, isub, mk, QONE, wsx, wsy, CSH, VX, VY, HZS, wcx, wcy, fmk, tnu2_tp, &
-                            0_ip, dtw, 0_ip, dew, dee, des, den)
+                            0_ip, dtw, 0_ip, dew, dee, des, den, 1_ip, rbo, nro, rlo, wfu, wfv, RUA, RCL, DRV)
           endif
-          call bgcw_inner(n, k0, k1, isub, mk, tp(1, 0, 1, ns), wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk)
+          call bgcw_inner(n, k0, k1, isub, mk, tp(1, 0, 1, ns), wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk, &
+                          0_ip, rbx, nrx, rlx, wfu, wfv, RUA, RCL)
           call bgcw_outer(n, k0, k1, isub, mk, tp(1, 0, 1, ns), wsx, wsy, tp(1, 0, 1, nn), VX, VY, HZS, wcx, wcy, &
-                          fmk, tnu2_tp, 1_ip, dtw, idg, dew, dee, des, den)
+                          fmk, tnu2_tp, 1_ip, dtw, idg, dew, dee, des, den, 0_ip, rbo, nro, rlo, wfu, wfv, RUA, RCL, DRV)
         else
           call bgcw_hcoef(k0, k1, isub, mk, VX, VY, VS, fmk, wvol, wcx, wcy, wdx, wdy)
           if (diag) then
-            call bgcw_inner(1_ip, k0, k1, isub, mk, QSH, wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk)
+            call bgcw_inner(1_ip, k0, k1, isub, mk, QSH, wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk, &
+                            1_ip, rbx, nrx, rlx, wfu, wfv, RUA, RCL)
             call bgcw_outer(1_ip, k0, k1, isub, mk, QSH, wsx, wsy, CSH, VX, VY, HZS, wcx, wcy, fmk, tnu2_tp, &
-                            0_ip, dtw, 0_ip, dew, dee, des, den)
+                            0_ip, dtw, 0_ip, dew, dee, des, den, 1_ip, rbo, nro, rlo, wfu, wfv, RUA, RCL, DRV)
           endif
-          call bgcw_inner(n, k0, k1, isub, mk, tp(1, 0, 1, 3), wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk)
+          call bgcw_inner(n, k0, k1, isub, mk, tp(1, 0, 1, 3), wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk, &
+                          0_ip, rbx, nrx, rlx, wfu, wfv, RUA, RCL)
           call bgcw_outer(n, k0, k1, isub, mk, tp(1, 0, 1, 3), wsx, wsy, tp(1, 0, 1, nn), VX, VY, HZS, wcx, wcy, &
-                          fmk, tnu2_tp, 0_ip, dtw, idg, dew, dee, des, den)
+                          fmk, tnu2_tp, 0_ip, dtw, idg, dew, dee, des, den, 0_ip, rbo, nro, rlo, wfu, wfv, RUA, RCL, DRV)
         endif
       enddo
     enddo
@@ -572,9 +685,9 @@ contains
     call bgcw_factor(VX, VY, HZS, KA, wv1, wfc, wpv, wcf)
     ! (slot 3 holds the concentrations here: free during the window)
     call bgcw_vertical(n, tp(1, 0, 1, ns), tp(1, 0, 1, nn), tp(1, 0, 1, 3), WA, HZS, wv1, wfc, wpv, wcf, 0_ip, &
-                       SFA, RAINA, idg, dbef, daft, dsrf, dnmn, dncn)
+                       SFA, RAINA, idg, dbef, daft, dsrf, dnmn, dncn, max(nqw, 1_ip), nrv, rlv, hsm, wq0, wq1, c3a, c3d, CPA, C3)
     if (diag) call bgcw_vertical(1_ip, QONE, CSH, QSH, WA, HZS, wv1, wfc, wpv, wcf, 1_ip, SFA, RAINA, &
-                                 1_ip, dshd, dshd, dshd, dshd, dshd)
+                                 1_ip, dshd, dshd, dshd, dshd, dshd, max(nqw, 1_ip), nrv, rlv, hsm, wq0, wq1, 0_ip, 0_ip, CPV, C3)
     call rt_ev_end(RT_BGCV)
 
     ! ---- diagnostics ----
@@ -641,8 +754,7 @@ contains
   subroutine window_diag(nwin_w, msub, gmax, v1min, cres)
     ! bgc_subcycle_diag > 0: the CPU's BGCSUB and BGCSUBNEG lines. Budget
     ! per tracer: content after - before - (boundary + surface + rivers +
-    ! point sources), relative to the larger content (rivers and point
-    ! sources: 0 here, refused at start-up); shadow: max |c - 1| of the
+    ! point sources), relative to the larger content; shadow: max |c - 1| of the
     ! uniform tracer; new negatives: cells >= 0 at the window start and < 0
     ! after it. Per-tracer reductions in a fixed order, then over the ranks.
     integer(ip), intent(in) :: nwin_w, msub
@@ -664,15 +776,16 @@ contains
     if (decomp%edge_s) call bgcw_reduce(0_ip, n, nx * nz, des, rred(1, 8))
     if (decomp%edge_n) call bgcw_reduce(0_ip, n, nx * nz, den, rred(1, 9))
     call bgcw_reduce(1_ip, 1_ip, nwet, dshd, rred(1, 10))
+    call source_sums(rred(1, 11), rred(1, 12))
     call sync_arch()
     allocate(bud(6, n), gbud(6, n), x(n), y(n))
     do ib = 1, n
       bud(1, ib) = real(rred(ib, 1), 8)
       bud(2, ib) = real(rred(ib, 2), 8)
       bud(3, ib) = real(rred(ib, 3), 8)
-      bud(4, ib) = 0.0d0
+      bud(4, ib) = real(rred(ib, 11), 8)
       bud(5, ib) = real(rred(ib, 6) - rred(ib, 7) + rred(ib, 8) - rred(ib, 9), 8)
-      bud(6, ib) = 0.0d0
+      bud(6, ib) = real(rred(ib, 12), 8)
     enddo
     call comm_allreduce_sum(int(6 * n), bud, gbud)
     do ib = 1, n
@@ -711,6 +824,56 @@ contains
   end subroutine window_diag
 
   ! ----------------------------------------------------------------------
+  subroutine source_sums(b4, b6)
+    ! diagnostics, per tracer on this tile: the CDR release contents of the
+    ! window (b4: sum over the profiles of sum over k of CPA; 3D forcing:
+    ! sum of C3 over the interior) and the river inputs into wet interior
+    ! cells (b6: sum over the faces of DRV)
+    real(rp), WORK_ATTR intent(inout) :: b4(*), b6(*)
+    integer(ip) :: itr, q, k, w, n, nq, nz, nd, i, j, nx, ny, ia, id
+    real(rp) :: a, b, s3a, s3d
+    n = ntp; nq = nqw; nz = decomp%nz
+    nd = 0
+    if (nwf > 0 .and. size(DRV, 2) == nwf) nd = nwf
+    nx = decomp%nx; ny = decomp%ny; ia = c3a; id = c3d
+    s3a = 0.0_rp; s3d = 0.0_rp
+    if (ia > 0) then
+#ifdef USE_CUDA
+      !$cuf kernel do(3) <<<*,*>>>
+#endif
+      do k = 1, nz
+        do j = 1, ny
+          do i = 1, nx
+            s3a = s3a + C3(i, j, k, 1)
+            s3d = s3d + C3(i, j, k, 2)
+          enddo
+        enddo
+      enddo
+    endif
+#ifdef USE_CUDA
+    !$cuf kernel do(1) <<<*,*>>>
+#endif
+    do itr = 1, n
+      a = 0.0_rp
+      do q = 1, nq
+        b = 0.0_rp
+        do k = 1, nz
+          b = b + CPA(itr, q, k)
+        enddo
+        a = a + b
+      enddo
+      if (itr == ia) a = a + s3a
+      if (itr == id) a = a + s3d
+      b4(itr) = a
+      b = 0.0_rp
+      do w = 1, nd
+        b = b + DRV(itr, w)
+      enddo
+      b6(itr) = b
+    enddo
+  end subroutine source_sums
+
+  ! ----------------------------------------------------------------------
   real(rp) function window_cont() result(cres)
     ! max over interior wet cells, k = 1..nz-1, of |Hz - (v1 - d_z W)|/Hz,
     ! v1 = HZS - pm pn (dVX/dx + dVY/dy), W = WA pm pn with W = 0 at the
@@ -739,7 +902,7 @@ contains
   ! ----------------------------------------------------------------------
   subroutine reset_sums()
     ! sums to 0, window-start thickness = Hz
-    integer(ip) :: i, j, k, is, ie, js, je, nz, c, m, n, nw
+    integer(ip) :: i, j, k, is, ie, js, je, nz, c, m, n, nw, nwx
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je; nz = decomp%nz
     CUF_DO3
     do k = 0, nz
@@ -761,6 +924,46 @@ contains
         SFA(m, c) = 0.0_rp
       enddo
     enddo
+    if (nwf > 0) then
+      nw = nwf
+      CUF_DO2
+      do c = 1, nw
+        do m = 1, n
+          RUA(m, c) = 0.0_rp
+        enddo
+      enddo
+      if (size(DRV, 2) == nwf) then
+        CUF_DO2
+        do c = 1, nw
+          do m = 1, n
+            DRV(m, c) = 0.0_rp
+          enddo
+        enddo
+      endif
+    endif
+    if (nqw > 0) then
+      nw = nqw
+      CUF_DO3
+      do k = 1, nz
+        do c = 1, nw
+          do m = 1, n
+            CPA(m, c, k) = 0.0_rp
+            if (m == 1) CPV(1, c, k) = 0.0_rp
+          enddo
+        enddo
+      enddo
+    endif
+    if (c3a > 0) then
+      nw = decomp%nx; nwx = decomp%ny
+      CUF_DO3
+      do k = 1, nz
+        do j = 1, nwx
+          do i = 1, nw
+            C3(i, j, k, 1) = 0.0_rp; C3(i, j, k, 2) = 0.0_rp
+          enddo
+        enddo
+      enddo
+    endif
   end subroutine reset_sums
 
 end module bgc_subcycle_mod

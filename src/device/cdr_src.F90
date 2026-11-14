@@ -35,6 +35,7 @@ module cdr_src_mod
   public :: cdr_cmap, cd_vol, cq_w, cc_p0, cq_rel
   public :: cdr_set_3d, cdr_3d_buf, cdr_src_out3d
   public :: cdr_set_dp, cdr_dp_gather_hz, cdr_set_dp_weights, cdr_dp_hzc
+  public :: cdr_win_nq, cdr_win_cols, cdr_win_acc, cdr_win_tr3d
 
   integer, parameter :: CDR_NKB = 4                    ! chunks of levels per (cell, tracer)
   logical :: cdr_on = .false.
@@ -555,6 +556,129 @@ contains
       enddo
     enddo
   end subroutine cdr_src_out
+
+  ! ---------------------------------------------- BGC subcycling window
+  ! UCLA ROMS bgcsub_accumulate / vpass: the release contents are summed
+  ! over the window per profile (cidx) and level, CPA(itr, q, k) [conc m^3
+  ! per (pm pn)], and the window adds pm pn CPA to the content per area of
+  ! the cell after the vertical swept flux. 3D forcing: C3(i, j, k, m),
+  ! m = 1 ALK, 2 DIC.
+
+  integer(ip) function cdr_win_nq()
+    ! profiles of this tile (0 with 3D forcing)
+    cdr_win_nq = 0
+    if (cdr_on .and. cdr_mode /= CDR_MODE_3D) cdr_win_nq = ncq
+  end function cdr_win_nq
+
+  subroutine cdr_win_tr3d(ia, id)
+    ! 3D forcing: the passive indices of ALK and DIC (0, 0 otherwise)
+    integer(ip), intent(out) :: ia, id
+    ia = 0; id = 0
+    if (cdr_on .and. cdr_mode == CDR_MODE_3D) then
+      ia = c3_alk; id = c3_dic
+    endif
+  end subroutine cdr_win_tr3d
+
+  subroutine cdr_win_cols(q0, q1)
+    ! per interior wet column (= its passive column): the first and last
+    ! profile of its release cell (q1 < q0: none)
+    integer(ip), WORK_ATTR intent(inout) :: q0(max(nwet, 1_ip)), q1(max(nwet, 1_ip))
+    integer(ip) :: c, n, col
+    n = max(nwet, 1_ip)
+#ifdef USE_CUDA
+    !$cuf kernel do(1) <<<*, *, 0, work_stream>>>
+#endif
+    do c = 1, n
+      q0(c) = 1; q1(c) = 0
+    enddo
+    if (cdr_win_nq() == 0 .or. ncc == 0) return
+    n = ncc
+#ifdef USE_CUDA
+    !$cuf kernel do(1) <<<*, *, 0, work_stream>>>
+#endif
+    do c = 1, n
+      col = cc_col(c)
+      if (col >= 1 .and. col <= nwet) then
+        q0(col) = cc_p0(c); q1(col) = cc_p0(c + 1) - 1
+      endif
+    enddo
+  end subroutine cdr_win_cols
+
+  subroutine cdr_win_acc(ntr, cpa, nsh, cpv, c3, dtp)
+    ! Every step: CPA(itr, q, k) = CPA + (dt*prf(k))*flx(release, itr), the
+    ! CPU's CPA = CPA + dt*cdr_prf*cdr_flx with the corrector's flux
+    ! (parameterized c1 f1 + c2 f2, volume releases vol*conc, depth
+    ! profiles the remapped weights of the mapped tracers and flux 1);
+    ! nsh = 1 (shadow tracer, volume releases): CPV(1, q, k) = CPV +
+    ! (dt*vol)*prf(k), the CPU's CPVA; 3D forcing: C3 = C3 + dt*flx.
+    integer(ip), intent(in) :: ntr, nsh
+    real(rp), WORK_ATTR intent(inout) :: cpa(ntr, max(ncq, 1_ip), decomp%nz), cpv(1, max(ncq, 1_ip), decomp%nz)
+    real(rp), WORK_ATTR intent(inout) :: c3(decomp%nx, decomp%ny, decomp%nz, 2)
+    real(rp), intent(in) :: dtp
+    integer(ip) :: q, k, itr, nq, nz, nt, r, a, na, i, j, m, nx, ny, vo
+    real(rp) :: c1, c2, dtl, f
+    if (.not. cdr_on) return
+    vo = merge(1_ip, 0_ip, cdr_vol_on)
+    nz = decomp%nz; dtl = dtp; c1 = w_cor(1); c2 = w_cor(2)
+    if (cdr_mode == CDR_MODE_3D) then
+      nx = decomp%nx; ny = decomp%ny
+#ifdef USE_CUDA
+      !$cuf kernel do(3) <<<*, *, 0, work_stream>>>
+#endif
+      do k = 1, nz
+        do j = 1, ny
+          do i = 1, nx
+            do m = 1, 2
+              c3(i, j, k, m) = c3(i, j, k, m) + dtl * (c1 * cdr_3d_buf(i, j, k, m, 1) + c2 * cdr_3d_buf(i, j, k, m, 2))
+            enddo
+          enddo
+        enddo
+      enddo
+      return
+    endif
+    if (ncq == 0) return
+    nq = ncq; nt = min(ntr, ntrf)
+    if (cdr_mode == CDR_MODE_DP) then
+      na = ndp
+      if (na == 0) return
+#ifdef USE_CUDA
+      !$cuf kernel do(3) <<<*, *, 0, work_stream>>>
+#endif
+      do k = 1, nz
+        do q = 1, nq
+          do a = 1, na
+            itr = cdp_itr(a)
+            cpa(itr, q, k) = cpa(itr, q, k) + dtl * cq_wt(k, a, q) * 1.0_rp
+          enddo
+        enddo
+      enddo
+      return
+    endif
+#ifdef USE_CUDA
+    !$cuf kernel do(3) <<<*, *, 0, work_stream>>>
+#endif
+    do k = 1, nz
+      do q = 1, nq
+        do itr = 1, nt
+          r = cq_rel(q)
+          f = c1 * cd_flx(itr, r, 1) + c2 * cd_flx(itr, r, 2)
+          if (vo == 1) f = cd_vol(r) * f
+          cpa(itr, q, k) = cpa(itr, q, k) + dtl * cq_w(k, q) * f
+        enddo
+      enddo
+    enddo
+    if (nsh == 1 .and. vo == 1) then
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*, *, 0, work_stream>>>
+#endif
+      do k = 1, nz
+        do q = 1, nq
+          r = cq_rel(q)
+          cpv(1, q, k) = cpv(1, q, k) + dtl * cd_vol(r) * cq_w(k, q)
+        enddo
+      enddo
+    endif
+  end subroutine cdr_win_acc
 
   subroutine cdr_fs_src(qs)
     ! Implicit free surface (implicit_fs.F90; CPU implicit_fs_mod, CDR_FORCING

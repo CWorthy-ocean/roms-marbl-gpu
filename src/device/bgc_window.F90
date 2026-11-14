@@ -36,7 +36,7 @@ module bgc_window_mod
   implicit none
   private
   public :: WLEV, bgcw_stats, bgcw_hcoef, bgcw_inner, bgcw_outer, bgcw_factor, bgcw_vertical
-  public :: bgcw_t3dbc, bgcw_reduce, bgcw_vs, bgcw_edge_r, bgcw_subq, bgcw_edge_tp
+  public :: bgcw_t3dbc, bgcw_reduce, bgcw_vs, bgcw_edge_r, bgcw_subq, bgcw_edge_tp, bgcw_rcol, bgcw_rbits
   ! Levels per horizontal launch (the scratch of the inner operators and
   ! the coefficients hold WLEV levels).
   integer(ip), parameter :: WLEV = 20
@@ -77,6 +77,44 @@ contains
       ff = 0.0_rp
     endif
   end function swf
+
+  DEVICE_ATTR
+  function rivf(fm, ra, vel, rc, shd) result(ff)
+    ! river_faces: the window's river tracer transport through a river face
+    ! of level k, distributed over the column like the summed face
+    ! transport, fm*RUA*V/rcol (shadow, shd = 1: the transported volume
+    ! fm*V; no transport through the column: 0)
+    real(rp), intent(in) :: fm, ra, vel, rc
+    integer(ip), intent(in) :: shd
+    real(rp) :: ff
+    if (shd == 1 .or. rc == 0.0_rp) then
+      if (shd == 1) then
+        ff = fm * vel
+      else
+        ff = 0.0_rp
+      endif
+    else
+      ff = fm * ra * vel / rc
+    endif
+  end function rivf
+
+  DEVICE_ATTR
+  function vsrc(cc0, k, itr, i, j, pmn, q0, q1, ia, id, ntr, nqd, nz, nx, ny, cpa, c3) result(cc)
+    ! vpass's point sources of level k after the vertical swept flux (and
+    ! the surface flux): 3D CDR forcing of ALK (ia) / DIC (id), then the
+    ! releases of the cell's profiles q0..q1 in order, cc + (pm pn)*src
+    real(rp), intent(in) :: cc0, pmn
+    integer(ip), intent(in) :: k, itr, i, j, q0, q1, ia, id, ntr, nqd, nz, nx, ny
+    real(rp), intent(in) :: cpa(ntr, nqd, nz), c3(nx, ny, nz, 2)
+    real(rp) :: cc
+    integer(ip) :: q
+    cc = cc0
+    if (itr == ia) cc = cc + pmn * c3(i, j, k, 1)
+    if (itr == id) cc = cc + pmn * c3(i, j, k, 2)
+    do q = q0, q1
+      cc = cc + pmn * cpa(itr, q, k)
+    enddo
+  end function vsrc
 
   DEVICE_ATTR
   function qwin(l, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk) result(qv)
@@ -208,395 +246,34 @@ contains
   end subroutine stats_level_kernel
 
   ! ------------------------------------------------- H2: inner operators
-  attributes(global) launch_bounds(128, 4) subroutine inner_kernel(nxc, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, &
-      ilo, ihi, jlo, jhi, west, east, south, north, ncl, xcol, xi, xj, xnb, q, sxs, sys, VX, VY, &
-      vol, cxf, cyf, dnx, dny, fmk, mk, umask_, vmask_, rmask_)
-    ! hlevel's inner part for one (tracer, cross-region column): the inner
-    ! y fluxes of q through the faces j, j+1 and sx = (q + Yq)/2 (rows
-    ! 1..ny, columns ilo..ihi); the inner x fluxes through i, i+1 and
-    ! sy = (q + Xq)/2 (columns 1..nx, rows jlo..jhi). Levels k0..k1, stored
-    ! at k - k0 + 1 in the scratch and the coefficients. Sub-pass isub:
-    ! levels with isub > mk(k) are skipped (the CPU's cycle).
-    integer(ip), value :: nxc, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi
-    integer(ip), value :: west, east, south, north, ncl
-    integer(ip), device, intent(in) :: xcol(*), xi(*), xj(*), xnb(8, *)
-    real(pp), device, intent(in) :: q(ntr, 0:ncl, nz)
-    real(rp), device, intent(inout) :: sxs(ntr, 0:ncl, WLEV), sys(ntr, 0:ncl, WLEV)
-    real(rp), device, intent(in) :: VX(is:ie, js:je, nz), VY(is:ie, js:je, nz)
-    real(rp), device, intent(in) :: vol(is:ie, js:je, WLEV), cxf(is:ie, js:je, WLEV), cyf(is:ie, js:je, WLEV)
-    real(rp), device, intent(in) :: dnx(is:ie, js:je, WLEV), dny(is:ie, js:je, WLEV), fmk(nz)
-    integer(ip), device, intent(in) :: mk(nz)
-    real(rp), device, intent(in) :: umask_(is:ie, js:je), vmask_(is:ie, js:je), rmask_(is:ie, js:je)
-    integer(ip) :: n, itr, c, i, j, k, kk, nb(8)
-    logical :: dox, doy, wet, hl1, hr1, hl2, hr2, gl1, gr1, gl2, gr2
-    real(rp) :: fm, s0, vv, f1, f2
-    real(rp) :: vmm, vm0, vm1, vm2, umm, um0, um1, um2
-    real(rp) :: ym2, ym1, yp1, yp2, xm2, xm1, xp1, xp2, vy0, vy1, cy0, cy1, dy, vx0, vx1, cx0, cx1, dx, vl
-    n = (blockIdx%x - 1) * blockDim%y + threadIdx%y
-    if (n > nxc) return
-    itr = threadIdx%x
-    c = xcol(n); i = xi(n); j = xj(n)
-    nb(1) = xnb(1, n); nb(2) = xnb(2, n); nb(3) = xnb(3, n); nb(4) = xnb(4, n)
-    nb(5) = xnb(5, n); nb(6) = xnb(6, n); nb(7) = xnb(7, n); nb(8) = xnb(8, n)
-    dox = (j >= 1 .and. j <= ny)
-    doy = (i >= 1 .and. i <= nx)
-    wet = rmask_(i, j) > 0.5_rp
-    ! the column's masks and range tests, once for all levels
-    if (dox) then
-      vmm = vmask_(i, j - 1); vm0 = vmask_(i, j); vm1 = vmask_(i, j + 1); vm2 = vmask_(i, j + 2)
-    endif
-    if (doy) then
-      umm = umask_(i - 1, j); um0 = umask_(i, j); um1 = umask_(i + 1, j); um2 = umask_(i + 2, j)
-    endif
-    hl1 = (j - 1 > jlo); hr1 = (j + 1 <= jhi); hl2 = (j > jlo); hr2 = (j + 2 <= jhi)
-    gl1 = (i - 1 > ilo); gr1 = (i + 1 <= ihi); gl2 = (i > ilo); gr2 = (i + 2 <= ihi)
-    do k = k0, k1
-      if (isub > 1) then
-        if (isub > mk(k)) cycle
-      endif
-      kk = k - k0 + 1
-      ! every operand of the level is loaded before any arithmetic, so the
-      ! loads are in flight together (one memory latency per level)
-      fm = fmk(k)
-      s0 = real(q(itr, c, k), rp)
-      if (wet) then
-        vl = vol(i, j, kk)
-        if (dox) then
-          ym2 = real(q(itr, nb(5), k), rp); ym1 = real(q(itr, nb(6), k), rp)
-          yp1 = real(q(itr, nb(7), k), rp); yp2 = real(q(itr, nb(8), k), rp)
-          vy0 = VY(i, j, k); vy1 = VY(i, j + 1, k)
-          cy0 = cyf(i, j, kk); cy1 = cyf(i, j + 1, kk); dy = dny(i, j, kk)
-        endif
-        if (doy) then
-          xm2 = real(q(itr, nb(1), k), rp); xm1 = real(q(itr, nb(2), k), rp)
-          xp1 = real(q(itr, nb(3), k), rp); xp2 = real(q(itr, nb(4), k), rp)
-          vx0 = VX(i, j, k); vx1 = VX(i + 1, j, k)
-          cx0 = cxf(i, j, kk); cx1 = cxf(i + 1, j, kk); dx = dnx(i, j, kk)
-        endif
-        if (dox) then
-          ! face j (between j-1 and j)
-          vv = fm * vy0
-          f1 = swf(vv, cy0, ym2, ym1, s0, yp1, vmm, vm0, vm1, hl1, hr1)
-          if (south == 2 .and. j == 1 .and. vv > 0.0_rp) f1 = vv * ym1
-          ! face j+1
-          vv = fm * vy1
-          f2 = swf(vv, cy1, ym1, s0, yp1, yp2, vm0, vm1, vm2, hl2, hr2)
-          if (north == 2 .and. j + 1 == ny + 1 .and. vv < 0.0_rp) f2 = vv * yp1
-          sxs(itr, c, kk) = 0.5_rp * (s0 + (vl * s0 - (f2 - f1)) / dy)
-        endif
-        if (doy) then
-          vv = fm * vx0
-          f1 = swf(vv, cx0, xm2, xm1, s0, xp1, umm, um0, um1, gl1, gr1)
-          if (west == 2 .and. i == 1 .and. vv > 0.0_rp) f1 = vv * xm1
-          vv = fm * vx1
-          f2 = swf(vv, cx1, xm1, s0, xp1, xp2, um0, um1, um2, gl2, gr2)
-          if (east == 2 .and. i + 1 == nx + 1 .and. vv < 0.0_rp) f2 = vv * xp1
-          sys(itr, c, kk) = 0.5_rp * (s0 + (vl * s0 - (f2 - f1)) / dx)
-        endif
-      else
-        if (dox) sxs(itr, c, kk) = s0
-        if (doy) sys(itr, c, kk) = s0
-      endif
-    enddo
-  end subroutine inner_kernel
+#define BGCW_KNAME inner_kernel
+#include "bgcw_inner.inc"
+#undef BGCW_KNAME
+#define BGCW_KNAME inner_kernel_src
+#define BGCW_SRC
+#include "bgcw_inner.inc"
+#undef BGCW_SRC
+#undef BGCW_KNAME
 
   ! ------------------------------------------------ H3: outer and update
-  attributes(global) launch_bounds(128, 4) subroutine outer_kernel(nwet, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, &
-      ilo, ihi, jlo, jhi, west, east, south, north, ncl, wi, wj, nbt, q, sxs, sys, cout, VX, VY, HZS, &
-      cxf, cyf, fmk, mk, pm_, pn_, umask_, vmask_, rmask_, pmon_u_, pnom_v_, sp_, tnu, dodiff, dtw, dbud, ew, ee, es, en)
-    ! hlevel's outer part and hupdate for one (tracer, interior wet column):
-    ! outer swept fluxes of sx through the x faces i, i+1 and of sy through
-    ! the y faces j, j+1; on sub-pass 1 of a tracer (dodiff = 1) the TS_DIF2
-    ! fluxes of the window-start state q over the window (dtw) with the
-    ! diffusivity tnu(itr) + sp(i, j); content per area into cout:
-    ! HZS q - pm pn div F (sub-pass 1), then cout - pm pn div F (sub-passes
-    ! isub > 1, on the levels with isub <= mk(k); q is then the previous
-    ! sub-pass's concentration). dbud = 1: the boundary-face fluxes into
-    ! ew/ee/es/en (the budget's boundary term), summed over the sub-passes.
-    integer(ip), value :: nwet, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi
-    integer(ip), value :: west, east, south, north, ncl, dodiff, dbud
-    real(rp), value :: dtw
-    integer(ip), device, intent(in) :: wi(*), wj(*), nbt(8, *)
-    real(pp), device, intent(in) :: q(ntr, 0:ncl, nz)
-    real(rp), device, intent(in) :: sxs(ntr, 0:ncl, WLEV), sys(ntr, 0:ncl, WLEV)
-    real(pp), device, intent(inout) :: cout(ntr, 0:ncl, nz)
-    real(rp), device, intent(in) :: VX(is:ie, js:je, nz), VY(is:ie, js:je, nz), HZS(is:ie, js:je, nz)
-    real(rp), device, intent(in) :: cxf(is:ie, js:je, WLEV), cyf(is:ie, js:je, WLEV), fmk(nz)
-    integer(ip), device, intent(in) :: mk(nz)
-    real(rp), device, intent(in) :: pm_(is:ie, js:je), pn_(is:ie, js:je), umask_(is:ie, js:je), vmask_(is:ie, js:je)
-    real(rp), device, intent(in) :: rmask_(is:ie, js:je), pmon_u_(is:ie, js:je), pnom_v_(is:ie, js:je), sp_(is:ie, js:je)
-    real(rp), device, intent(in) :: tnu(*)
-    real(rp), device, intent(inout) :: ew(ntr, ny, nz), ee(ntr, ny, nz), es(ntr, nx, nz), en(ntr, nx, nz)
-    integer(ip) :: cc, itr, i, j, k, kk, nb(8)
-    real(rp) :: fm, pmn, bg, x0, xm2, xm1, xp1, xp2, vv, fw, fe, fs, fn, q0, qxm, qxp, qym, qyp
-    real(rp) :: umm, um0, um1, um2, vmm, vm0, vm1, vm2, dfw, dfe, dfs, dfn
-    real(rp) :: y0, ym2, ym1, yp1, yp2, vx0, vx1, vy0, vy1, cx0, cx1, cy0, cy1, h0, hw, he, hs, hn, co
-    logical :: gl1, gr1, gl2, gr2, hl1, hr1, hl2, hr2
-    cc = (blockIdx%x - 1) * blockDim%y + threadIdx%y
-    if (cc > nwet) return
-    itr = threadIdx%x
-    i = wi(cc); j = wj(cc)
-    nb(1) = nbt(1, cc); nb(2) = nbt(2, cc); nb(3) = nbt(3, cc); nb(4) = nbt(4, cc)
-    nb(5) = nbt(5, cc); nb(6) = nbt(6, cc); nb(7) = nbt(7, cc); nb(8) = nbt(8, cc)
-    pmn = pm_(i, j) * pn_(i, j)
-    bg = 0.0_rp
-    if (dodiff == 1) bg = tnu(itr)
-    ! the column's masks, range tests and the level-independent leading
-    ! factors of the diffusion fluxes ((dtw*0.25)*(d2 + d2))*pmon_u, as
-    ! the CPU's expression evaluates them, once for all levels
-    umm = umask_(i - 1, j); um0 = umask_(i, j); um1 = umask_(i + 1, j); um2 = umask_(i + 2, j)
-    vmm = vmask_(i, j - 1); vm0 = vmask_(i, j); vm1 = vmask_(i, j + 1); vm2 = vmask_(i, j + 2)
-    gl1 = (i - 1 > ilo); gr1 = (i + 1 <= ihi); gl2 = (i > ilo); gr2 = (i + 2 <= ihi)
-    hl1 = (j - 1 > jlo); hr1 = (j + 1 <= jhi); hl2 = (j > jlo); hr2 = (j + 2 <= jhi)
-    dfw = 0.0_rp; dfe = 0.0_rp; dfs = 0.0_rp; dfn = 0.0_rp
-    if (dodiff == 1) then
-      dfw = dtw * 0.25_rp * ((bg + sp_(i, j)) + (bg + sp_(i - 1, j))) * pmon_u_(i, j)
-      dfe = dtw * 0.25_rp * ((bg + sp_(i + 1, j)) + (bg + sp_(i, j))) * pmon_u_(i + 1, j)
-      dfs = dtw * 0.25_rp * ((bg + sp_(i, j)) + (bg + sp_(i, j - 1))) * pnom_v_(i, j)
-      dfn = dtw * 0.25_rp * ((bg + sp_(i, j + 1)) + (bg + sp_(i, j))) * pnom_v_(i, j + 1)
-    endif
-    do k = k0, k1
-      if (isub > 1) then
-        if (isub > mk(k)) cycle
-      endif
-      kk = k - k0 + 1
-      ! every operand of the level is loaded before any arithmetic, so the
-      ! loads are in flight together (one memory latency per level)
-      fm = fmk(k)
-      x0 = sxs(itr, cc, kk)
-      xm2 = sxs(itr, nb(1), kk); xm1 = sxs(itr, nb(2), kk); xp1 = sxs(itr, nb(3), kk); xp2 = sxs(itr, nb(4), kk)
-      y0 = sys(itr, cc, kk)
-      ym2 = sys(itr, nb(5), kk); ym1 = sys(itr, nb(6), kk); yp1 = sys(itr, nb(7), kk); yp2 = sys(itr, nb(8), kk)
-      vx0 = VX(i, j, k); vx1 = VX(i + 1, j, k); vy0 = VY(i, j, k); vy1 = VY(i, j + 1, k)
-      cx0 = cxf(i, j, kk); cx1 = cxf(i + 1, j, kk); cy0 = cyf(i, j, kk); cy1 = cyf(i, j + 1, kk)
-      q0 = real(q(itr, cc, k), rp)
-      h0 = HZS(i, j, k)
-      if (dodiff == 1) then
-        qxm = real(q(itr, nb(2), k), rp); qxp = real(q(itr, nb(3), k), rp)
-        qym = real(q(itr, nb(6), k), rp); qyp = real(q(itr, nb(7), k), rp)
-        hw = HZS(i - 1, j, k); he = HZS(i + 1, j, k); hs = HZS(i, j - 1, k); hn = HZS(i, j + 1, k)
-      endif
-      if (isub /= 1) co = real(cout(itr, cc, k), rp)
-      ! x faces of sx (sweep_x over rows jstr..jend)
-      vv = fm * vx0
-      fw = swf(vv, cx0, xm2, xm1, x0, xp1, umm, um0, um1, gl1, gr1)
-      if (west == 2 .and. i == 1 .and. vv > 0.0_rp) fw = vv * xm1
-      vv = fm * vx1
-      fe = swf(vv, cx1, xm1, x0, xp1, xp2, um0, um1, um2, gl2, gr2)
-      if (east == 2 .and. i + 1 == nx + 1 .and. vv < 0.0_rp) fe = vv * xp1
-      ! y faces of sy (sweep_y over columns istr..iend)
-      vv = fm * vy0
-      fs = swf(vv, cy0, ym2, ym1, y0, yp1, vmm, vm0, vm1, hl1, hr1)
-      if (south == 2 .and. j == 1 .and. vv > 0.0_rp) fs = vv * ym1
-      vv = fm * vy1
-      fn = swf(vv, cy1, ym1, y0, yp1, yp2, vm0, vm1, vm2, hl2, hr2)
-      if (north == 2 .and. j + 1 == ny + 1 .and. vv < 0.0_rp) fn = vv * yp1
-      if (dodiff == 1) then
-        fw = fw - dfw * (h0 + hw) * (q0 - qxm) * um0
-        fe = fe - dfe * (he + h0) * (qxp - q0) * um1
-        fs = fs - dfs * (h0 + hs) * (q0 - qym) * vm0
-        fn = fn - dfn * (hn + h0) * (qyp - q0) * vm1
-      endif
-      if (isub == 1) then
-        cout(itr, cc, k) = real(h0 * q0 - pmn * (fe - fw + fn - fs), pp)
-      else
-        cout(itr, cc, k) = real(co - pmn * (fe - fw + fn - fs), pp)
-      endif
-      if (dbud == 1) then
-        if (isub == 1) then
-          if (west >= 1 .and. i == 1) ew(itr, j, k) = fw * rmask_(i, j)
-          if (east >= 1 .and. i == nx) ee(itr, j, k) = fe * rmask_(i, j)
-          if (south >= 1 .and. j == 1) es(itr, i, k) = fs * rmask_(i, j)
-          if (north >= 1 .and. j == ny) en(itr, i, k) = fn * rmask_(i, j)
-        else
-          if (west >= 1 .and. i == 1) ew(itr, j, k) = ew(itr, j, k) + fw * rmask_(i, j)
-          if (east >= 1 .and. i == nx) ee(itr, j, k) = ee(itr, j, k) + fe * rmask_(i, j)
-          if (south >= 1 .and. j == 1) es(itr, i, k) = es(itr, i, k) + fs * rmask_(i, j)
-          if (north >= 1 .and. j == ny) en(itr, i, k) = en(itr, i, k) + fn * rmask_(i, j)
-        endif
-      endif
-    enddo
-  end subroutine outer_kernel
+#define BGCW_KNAME outer_kernel
+#include "bgcw_outer.inc"
+#undef BGCW_KNAME
+#define BGCW_KNAME outer_kernel_src
+#define BGCW_SRC
+#include "bgcw_outer.inc"
+#undef BGCW_SRC
+#undef BGCW_KNAME
 
   ! ------------------------------------------- vertical, sources, solve
-  attributes(global) launch_bounds(128, 4) subroutine vertical_kernel(nwet, ntr, nz, is, ie, js, je, ncl, wi, wj, &
-      q, cio, qs, WA, HZS, Hz_, pm_, pn_, rmask_, wv1, wfc, wpv, wcf, shadow, sfa, rain, diag, &
-      dbef, daft, dsrf, dnmn, dncn)
-    ! vpass for one (tracer, interior wet column): content per area cio
-    ! (from the horizontal pass) -> concentration, in place. The column's
-    ! pseudo-thickness v1 = HZS - pm pn div V comes from factor (wv1, shared
-    ! by the tracers); the concentrations q = c/v1 of levels m-1..m+2 ride
-    ! along the face loop in registers (qwin), and a walk that reaches
-    ! further recomputes q(l) = c(l)/v1(l) from cio, which stays intact until
-    ! the back substitution (the same division, so the same value); the
-    ! 1-D swept fluxes of the window's vertical transport (vsweep, with dw
-    ! formed where it is used); the surface source on the top cell (tracers:
-    ! sfa(itr, c); shadow = 1: the rain volume rain(i, j)); the implicit
-    ! solve with factor's factors (window-end Hz, window-integrated Akt),
-    ! its forward elimination fused into the flux loop (each level's value
-    ! is final once its upper face is done; the CPU's operations and order
-    ! per value) and stored in qs (slot 3 of tp, free at this point of the
-    ! window; the shadow's own array). diag = 1: per column the content before (q = the
-    ! window-start state) and after, the surface source, and the new
-    ! negatives (tracers) or max |c - 1| (shadow, into dbef).
-    integer(ip), value :: nwet, ntr, nz, is, ie, js, je, ncl, shadow, diag
-    integer(ip), device, intent(in) :: wi(*), wj(*)
-    real(pp), device, intent(in) :: q(ntr, 0:ncl, nz)
-    real(pp), device, intent(inout) :: cio(ntr, 0:ncl, nz), qs(ntr, 0:ncl, nz)
-    real(rp), device, intent(in) :: WA(is:ie, js:je, 0:nz), HZS(is:ie, js:je, nz), Hz_(is:ie, js:je, nz)
-    real(rp), device, intent(in) :: pm_(is:ie, js:je), pn_(is:ie, js:je), rmask_(is:ie, js:je)
-    real(rp), device, intent(in) :: wv1(is:ie, js:je, nz)
-    real(rp), device, intent(in) :: wfc(is:ie, js:je, nz), wpv(is:ie, js:je, nz), wcf(is:ie, js:je, nz)
-    real(rp), device, intent(in) :: sfa(ntr, *), rain(is:ie, js:je)
-    real(rp), device, intent(inout) :: dbef(ntr, *), daft(ntr, *), dsrf(ntr, *), dnmn(ntr, *), dncn(ntr, *)
-    integer(ip) :: c, itr, i, j, k, m, jj, n, m1
-    real(rp) :: pmn, rm, w, rem, s, cl, fl, fprev, bef, aft, nmn, ncn, dev, q0, cc, fw, vj, qj, dwa, dwb, ck
-    real(rp) :: pmv, pnv, qa, qb, qc, qd, cb, c2, c3, c4, c5, vb, vc, vd, v4, v5, wcur, wnx, pvc, pvx, fcc, fcx
-    integer(8) :: it0, tk, g0, gk
-    c = (blockIdx%x - 1) * blockDim%y + threadIdx%y
-    if (c > nwet) return
-    itr = threadIdx%x
-    i = wi(c); j = wj(c)
-    n = nz
-    rm = rmask_(i, j)
-    pmv = pm_(i, j); pnv = pn_(i, j)
-    ! flat offsets of (itr, c, 1) in cio and of (i, j, 1) in wv1, and their level strides (qwin)
-    tk = int(ntr, 8) * int(ncl + 1, 8)
-    it0 = int(itr, 8) + int(ntr, 8) * int(c, 8)
-    gk = int(ie - is + 1, 8) * int(je - js + 1, 8)
-    g0 = int(i - is + 1, 8) + int(ie - is + 1, 8) * int(j - js, 8)
-    ! the register window at face m = 1: q(0) (never used), q(1), q(2), q(3); the contents c and pseudo-
-    ! thicknesses v of levels 1..4 and the transport and factors of face 1 (each loaded one face ahead
-    ! of its use, so the loop's loads are in flight while the previous face is computed)
-    qa = 0.0_rp
-    vb = wv1(i, j, 1); cb = real(cio(itr, c, 1), rp)
-    c2 = 0.0_rp; c3 = 0.0_rp; c4 = 0.0_rp; c5 = 0.0_rp; vc = 1.0_rp; vd = 1.0_rp; v4 = 1.0_rp; v5 = 1.0_rp
-    if (n >= 2) then
-      vc = wv1(i, j, 2); c2 = real(cio(itr, c, 2), rp)
-    endif
-    if (n >= 3) then
-      vd = wv1(i, j, 3); c3 = real(cio(itr, c, 3), rp)
-    endif
-    if (n >= 4) then
-      v4 = wv1(i, j, 4); c4 = real(cio(itr, c, 4), rp)
-    endif
-    wcur = 0.0_rp; wnx = 0.0_rp; fcc = 0.0_rp; fcx = 0.0_rp
-    if (n >= 2) wcur = WA(i, j, 1)
-    pvc = wpv(i, j, 1); pvx = pvc
-    qb = real(real(cb / vb, pp), rp)
-    qc = 0.0_rp; qd = 0.0_rp
-    if (n >= 2) qc = real(real(c2 / vc, pp), rp)
-    if (n >= 3) qd = real(real(c3 / vd, pp), rp)
-    ! vsweep: fl(m) through the w-faces m = 1..n-1 (fl(0) = fl(n) = 0),
-    ! applied as c(m) = c(m) - (fl(m) - fl(m-1)) once fl(m) is known; dw(m)
-    ! = q(m+1) - q(m), dw(0) = dw(1), dw(n) = dw(n-1)
-    fprev = 0.0_rp
-    fw = 0.0_rp
-    do m = 1, n - 1
-      ! the next face's operands
-      if (m + 1 <= n - 1) wnx = WA(i, j, m + 1)
-      pvx = wpv(i, j, m + 1); fcx = wfc(i, j, m)
-      if (m + 4 <= n) then
-        v5 = wv1(i, j, m + 4); c5 = real(cio(itr, c, m + 4), rp)
-      endif
-      w = wcur * pmv * pnv
-      if (w > 0.0_rp) then
-        rem = w; jj = m; s = 0.0_rp
-        do while (jj >= 1)
-          vj = vwin(jj, m, vb, vc, wv1, g0, gk); qj = qwin(jj, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
-          if (rem >= vj) then
-            s = s + vj * qj; rem = rem - vj; jj = jj - 1
-            if (rem <= 0.0_rp) exit
-          else
-            cl = rem / vj
-            m1 = min(max(jj, 1_ip), n - 1)
-            dwa = qwin(m1 + 1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk) - qwin(m1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
-            m1 = min(max(jj - 1, 1_ip), n - 1)
-            dwb = qwin(m1 + 1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk) - qwin(m1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
-            s = s + rem * (qj + (1.0_rp - cl) * ((2.0_rp - cl) * dwa + (1.0_rp + cl) * dwb) * r6)
-            rem = 0.0_rp
-            exit
-          endif
-        enddo
-        if (rem > 0.0_rp) s = s + rem * qwin(1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
-        fl = s
-      else if (w < 0.0_rp) then
-        rem = -w; jj = m + 1; s = 0.0_rp
-        do while (jj <= n)
-          vj = vwin(jj, m, vb, vc, wv1, g0, gk); qj = qwin(jj, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
-          if (rem >= vj) then
-            s = s + vj * qj; rem = rem - vj; jj = jj + 1
-            if (rem <= 0.0_rp) exit
-          else
-            cl = rem / vj
-            m1 = min(max(jj - 1, 1_ip), n - 1)
-            dwa = qwin(m1 + 1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk) - qwin(m1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
-            m1 = min(max(jj, 1_ip), n - 1)
-            dwb = qwin(m1 + 1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk) - qwin(m1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
-            s = s + rem * (qj - (1.0_rp - cl) * ((2.0_rp - cl) * dwa + (1.0_rp + cl) * dwb) * r6)
-            rem = 0.0_rp
-            exit
-          endif
-        enddo
-        if (rem > 0.0_rp) s = s + rem * qwin(n, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
-        fl = -s
-      else
-        fl = 0.0_rp
-      endif
-      cc = cb - (fl - fprev)
-      fprev = fl
-      ! forward elimination of level m (implicit vertical mixing)
-      if (m == 1) then
-        fw = pvc * cc
-      else
-        fw = pvc * (cc + fcc * fw)
-      endif
-      qs(itr, c, m) = real(fw, pp)
-      ! slide the register window to face m + 1
-      qa = qb; qb = qc; qc = qd
-      if (m + 3 <= n) qd = real(real(c4 / v4, pp), rp)
-      cb = c2; c2 = c3; c3 = c4; c4 = c5
-      vb = vc; vc = vd; vd = v4; v4 = v5
-      wcur = wnx; pvc = pvx; fcc = fcx
-    enddo
-    cc = cb - (0.0_rp - fprev)
-    ! sources
-    if (shadow == 0) then
-      cc = cc + sfa(itr, c)
-    else
-      cc = cc + rain(i, j)
-    endif
-    ! top level and back substitution (window-integrated Akt, window-end Hz)
-    ck = (cc + wfc(i, j, nz - 1) * fw) / wpv(i, j, nz) * rm
-    cio(itr, c, nz) = real(ck, pp)
-    do k = nz - 1, 1, -1
-      ck = (real(qs(itr, c, k), rp) + wcf(i, j, k) * ck) * rm
-      cio(itr, c, k) = real(ck, pp)
-    enddo
-    if (diag == 1) then
-      pmn = pm_(i, j) * pn_(i, j)
-      if (shadow == 0) then
-        bef = 0.0_rp; aft = 0.0_rp; nmn = 0.0_rp; ncn = 0.0_rp
-        do k = 1, nz
-          q0 = real(q(itr, c, k), rp)
-          ck = real(cio(itr, c, k), rp)
-          bef = bef + HZS(i, j, k) * q0 / pmn * rm
-          aft = aft + Hz_(i, j, k) * ck / pmn * rm
-          if (q0 >= 0.0_rp .and. ck < 0.0_rp) then        ! negatives made by this window
-            nmn = min(nmn, ck); ncn = ncn + 1.0_rp
-          endif
-        enddo
-        dbef(itr, c) = bef; daft(itr, c) = aft; dnmn(itr, c) = nmn; dncn(itr, c) = ncn
-        dsrf(itr, c) = sfa(itr, c) / pmn * rm
-      else
-        dev = 0.0_rp
-        do k = 1, nz
-          dev = max(dev, abs(real(cio(itr, c, k), rp) - 1.0_rp))
-        enddo
-        dbef(itr, c) = dev
-      endif
-    endif
-  end subroutine vertical_kernel
+#define BGCW_KNAME vertical_kernel
+#include "bgcw_vertical.inc"
+#undef BGCW_KNAME
+#define BGCW_KNAME vertical_kernel_src
+#define BGCW_SRC
+#include "bgcw_vertical.inc"
+#undef BGCW_SRC
+#undef BGCW_KNAME
 
   ! ----------------------------------------------------------- reductions
   attributes(global) launch_bounds(256, 2) subroutine red_kernel(op, ntr, m, a, out)
@@ -804,10 +481,15 @@ contains
     enddo
   end subroutine bgcw_edge_tp
 
-  subroutine bgcw_inner(ntr, k0, k1, isub, mk, q, sxs, sys, VX, VY, vol, cxf, cyf, dnx, dny, fmk)
+  subroutine bgcw_inner(ntr, k0, k1, isub, mk, q, sxs, sys, VX, VY, vol, cxf, cyf, dnx, dny, fmk, &
+                        shd, rbx, nrl, rl, wfu, wfv, rua, rcl)
     ! H2 for ntr tracers of q (tp layout, one slot), levels k0..k1 of
-    ! sub-pass isub (levels with isub > mk(k) skipped)
-    integer(ip), intent(in) :: ntr, k0, k1, isub
+    ! sub-pass isub (levels with isub > mk(k) skipped); the columns with
+    ! river faces (rl(1:nrl), bits rbx) by inner_kernel_src, with the
+    ! window's river transport rua (shd = 1: shadow)
+    integer(ip), intent(in) :: ntr, k0, k1, isub, shd, nrl
+    integer(ip), WORK_ATTR intent(in) :: rbx(*), rl(*), wfu(*), wfv(*)
+    real(rp), WORK_ATTR intent(in) :: rua(*), rcl(*)
     integer(ip), WORK_ATTR intent(in) :: mk(decomp%nz)
     real(pp), WORK_ATTR intent(in) :: q(*)
     real(rp), WORK_ATTR intent(inout) :: sxs(*), sys(*)
@@ -831,17 +513,28 @@ contains
     grid = dim3((nxc + ncb - 1) / ncb, 1, 1)
     call inner_kernel<<<grid, block>>>(nxc, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi, &
          west, east, south, north, ntpcol, xc_col, xc_i, xc_j, xc_nb, q, sxs, sys, VX, VY, &
-         vol, cxf, cyf, dnx, dny, fmk, mk, umask, vmask, rmask)
+         vol, cxf, cyf, dnx, dny, fmk, mk, umask, vmask, rmask, nrl, rl, shd, rbx, wfu, wfv, rua, rcl)
+    if (nrl > 0) then
+      grid = dim3((nrl + ncb - 1) / ncb, 1, 1)
+      call inner_kernel_src<<<grid, block>>>(nxc, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi, &
+           west, east, south, north, ntpcol, xc_col, xc_i, xc_j, xc_nb, q, sxs, sys, VX, VY, &
+           vol, cxf, cyf, dnx, dny, fmk, mk, umask, vmask, rmask, nrl, rl, shd, rbx, wfu, wfv, rua, rcl)
+    endif
 #else
     error stop 'bgcw_inner: CUDA build only'
 #endif
   end subroutine bgcw_inner
 
   subroutine bgcw_outer(ntr, k0, k1, isub, mk, q, sxs, sys, cout, VX, VY, HZS, cxf, cyf, fmk, tnu, dodiff, dtw, &
-                        dbud, ew, ee, es, en)
+                        dbud, ew, ee, es, en, shd, rbo, nrl, rl, wfu, wfv, rua, rcl, drv)
     ! H3 for ntr tracers: content per area of q into cout (tp layout),
-    ! levels k0..k1 of sub-pass isub (levels with isub > mk(k) skipped)
-    integer(ip), intent(in) :: ntr, k0, k1, isub, dodiff, dbud
+    ! levels k0..k1 of sub-pass isub (levels with isub > mk(k) skipped);
+    ! the columns with river faces (rl(1:nrl), bits rbo) by
+    ! outer_kernel_src, their river fluxes into drv when dbud = 1
+    integer(ip), intent(in) :: ntr, k0, k1, isub, dodiff, dbud, shd, nrl
+    integer(ip), WORK_ATTR intent(in) :: rbo(*), rl(*), wfu(*), wfv(*)
+    real(rp), WORK_ATTR intent(in) :: rua(*), rcl(*)
+    real(rp), WORK_ATTR intent(inout) :: drv(*)
     integer(ip), WORK_ATTR intent(in) :: mk(decomp%nz)
     real(pp), WORK_ATTR intent(in) :: q(*)
     real(pp), WORK_ATTR intent(inout) :: cout(*)
@@ -866,7 +559,15 @@ contains
     grid = dim3((nwet + ncb - 1) / ncb, 1, 1)
     call outer_kernel<<<grid, block>>>(nwet, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi, &
          west, east, south, north, ntpcol, wet_i, wet_j, tpnb, q, sxs, sys, cout, VX, VY, HZS, &
-         cxf, cyf, fmk, mk, pm, pn, umask, vmask, rmask, pmon_u, pnom_v, diff2_sp, tnu, dodiff, dtw, dbud, ew, ee, es, en)
+         cxf, cyf, fmk, mk, pm, pn, umask, vmask, rmask, pmon_u, pnom_v, diff2_sp, tnu, dodiff, dtw, dbud, ew, ee, es, en, &
+         nrl, rl, shd, rbo, wfu, wfv, rua, rcl, drv)
+    if (nrl > 0) then
+      grid = dim3((nrl + ncb - 1) / ncb, 1, 1)
+      call outer_kernel_src<<<grid, block>>>(nwet, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi, &
+           west, east, south, north, ntpcol, wet_i, wet_j, tpnb, q, sxs, sys, cout, VX, VY, HZS, &
+           cxf, cyf, fmk, mk, pm, pn, umask, vmask, rmask, pmon_u, pnom_v, diff2_sp, tnu, dodiff, dtw, dbud, ew, ee, es, en, &
+           nrl, rl, shd, rbo, wfu, wfv, rua, rcl, drv)
+    endif
 #else
     error stop 'bgcw_outer: CUDA build only'
 #endif
@@ -910,10 +611,15 @@ contains
   end subroutine bgcw_factor
 
   subroutine bgcw_vertical(ntr, q, cio, qs, WA, HZS, wv1, wfc, wpv, wcf, shadow, sfa, rain, diag, &
-                           dbef, daft, dsrf, dnmn, dncn)
+                           dbef, daft, dsrf, dnmn, dncn, nqd, nrl, rl, hsm, wq0, wq1, ia, id, cpa, c3)
     ! vertical pass for ntr tracers (tp layout): q = window-start state,
-    ! cio = content per area in, concentration out; qs = scratch (slot 3)
-    integer(ip), intent(in) :: ntr, shadow, diag
+    ! cio = content per area in, concentration out; qs = scratch (slot 3);
+    ! the columns with point sources (rl(1:nrl), hsm = 1) by
+    ! vertical_kernel_src: cpa(ntr, nqd, nz) of the profiles wq0..wq1 of
+    ! each column, 3D CDR forcing c3 of tracers ia (ALK) / id (DIC)
+    integer(ip), intent(in) :: ntr, shadow, diag, nqd, ia, id, nrl
+    integer(ip), WORK_ATTR intent(in) :: wq0(*), wq1(*), rl(*), hsm(*)
+    real(rp), WORK_ATTR intent(in) :: cpa(*), c3(*)
     real(pp), WORK_ATTR intent(in) :: q(*)
     real(pp), WORK_ATTR intent(inout) :: cio(*), qs(*)
     real(rp), WORK_ATTR intent(in) :: WA(decomp%is:decomp%ie, decomp%js:decomp%je, 0:decomp%nz)
@@ -938,11 +644,92 @@ contains
     grid = dim3((nwet + ncb - 1) / ncb, 1, 1)
     call vertical_kernel<<<grid, block>>>(nwet, ntr, nz, is, ie, js, je, ntpcol, wet_i, wet_j, &
          q, cio, qs, WA, HZS, Hz, pm, pn, rmask, wv1, wfc, wpv, wcf, shadow, sfa, rain, diag, &
-         dbef, daft, dsrf, dnmn, dncn)
+         dbef, daft, dsrf, dnmn, dncn, decomp%nx, decomp%ny, nqd, nrl, rl, hsm, wq0, wq1, ia, id, cpa, c3)
+    if (nrl > 0) then
+      grid = dim3((nrl + ncb - 1) / ncb, 1, 1)
+      call vertical_kernel_src<<<grid, block>>>(nwet, ntr, nz, is, ie, js, je, ntpcol, wet_i, wet_j, &
+           q, cio, qs, WA, HZS, Hz, pm, pn, rmask, wv1, wfc, wpv, wcf, shadow, sfa, rain, diag, &
+           dbef, daft, dsrf, dnmn, dncn, decomp%nx, decomp%ny, nqd, nrl, rl, hsm, wq0, wq1, ia, id, cpa, c3)
+    endif
 #else
     error stop 'bgcw_vertical: CUDA build only'
 #endif
   end subroutine bgcw_vertical
+
+  ! ------------------------------------------------------- river faces
+  subroutine bgcw_rcol(nw, wi, wj, wt, VX, VY, rcl)
+    ! rcolu/rcolv: the window's summed transport through each river face
+    ! over the column (the CPU's sum(VX(i,j,:)), in level order)
+    integer(ip), intent(in) :: nw
+    integer(ip), WORK_ATTR intent(in) :: wi(*), wj(*), wt(*)
+    real(rp), WORK_ATTR intent(in) :: VX(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz), VY(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz)
+    real(rp), WORK_ATTR intent(inout) :: rcl(*)
+    integer(ip) :: w, k, nz, i, j
+    real(rp) :: a
+    if (nw <= 0) return
+    nz = decomp%nz
+#ifdef USE_CUDA
+    !$cuf kernel do(1) <<<*,*>>>
+#endif
+    do w = 1, nw
+      i = wi(w); j = wj(w)
+      a = 0.0_rp
+      if (wt(w) == 1) then
+        do k = 1, nz
+          a = a + VX(i, j, k)
+        enddo
+      else
+        do k = 1, nz
+          a = a + VY(i, j, k)
+        enddo
+      endif
+      rcl(w) = a
+    enddo
+  end subroutine bgcw_rcol
+
+  subroutine bgcw_rbits(wfu, wfv, rbx, rbo)
+    ! the river-face bits of every cross-region column (rbx, for inner)
+    ! and every interior wet column (rbo, for outer): 1, 2 = u faces i,
+    ! i+1 (rows 1..ny for the outer, jlo..jhi with i in 1..nx for the
+    ! inner's x faces), 4, 8 = v faces j, j+1 (columns 1..nx; ilo..ihi with
+    ! j in 1..ny for the inner's y faces)
+    integer(ip), WORK_ATTR intent(in) :: wfu(decomp%is:decomp%ie, decomp%js:decomp%je), wfv(decomp%is:decomp%ie, decomp%js:decomp%je)
+    integer(ip), WORK_ATTR intent(inout) :: rbx(*), rbo(*)
+    integer(ip) :: n, i, j, b, nx, ny
+    nx = decomp%nx; ny = decomp%ny
+    if (nxc > 0) then
+#ifdef USE_CUDA
+      !$cuf kernel do(1) <<<*,*>>>
+#endif
+      do n = 1, nxc
+        i = xc_i(n); j = xc_j(n)
+        b = 0
+        if (i >= 1 .and. i <= nx) then
+          if (wfu(i, j) > 0) b = b + 1
+          if (wfu(i + 1, j) > 0) b = b + 2
+        endif
+        if (j >= 1 .and. j <= ny) then
+          if (wfv(i, j) > 0) b = b + 4
+          if (wfv(i, j + 1) > 0) b = b + 8
+        endif
+        rbx(n) = b
+      enddo
+    endif
+    if (nwet > 0) then
+#ifdef USE_CUDA
+      !$cuf kernel do(1) <<<*,*>>>
+#endif
+      do n = 1, nwet
+        i = wet_i(n); j = wet_j(n)
+        b = 0
+        if (wfu(i, j) > 0) b = b + 1
+        if (wfu(i + 1, j) > 0) b = b + 2
+        if (wfv(i, j) > 0) b = b + 4
+        if (wfv(i, j + 1) > 0) b = b + 8
+        rbo(n) = b
+      enddo
+    endif
+  end subroutine bgcw_rbits
 
   subroutine bgcw_reduce(op, ntr, m, a, out)
     integer(ip), intent(in) :: op, ntr, m

@@ -297,11 +297,13 @@ v0.1.2-beta, bit for bit.
   swept-volume pass horizontally (with TS_DIF2 diffusion and the upwind
   inflow rule on open sides; a level whose window Courant numbers need it
   is split into sub-passes), a 1-D swept flux vertically, the CFLX_CORR
-  surface restoring, implicit vertical mixing with the window-integrated
+  and CDR_LITE surface fluxes, the CDR releases (parameterized, volume,
+  depth profiles, 3D), implicit vertical mixing with the window-integrated
   diffusivity, the window boundary conditions, then MARBL at MARBL steps.
-  Not yet on the GPU, so the run stops: at start-up with river sources,
-  CDR releases, CDR_LITE tracers, the IMEX internal-wave step
-  (`&imex_igw_settings`), `bgc_subcycle_pos = .true.` or
+  River faces carry the window's river tracer transport on every
+  sub-pass. Any set of passive tracers works, with or without MARBL. Not
+  yet on the GPU, so the run stops at start-up: the IMEX internal-wave
+  step (`&imex_igw_settings`), `bgc_subcycle_pos = .true.` or
   `bgc_subcycle_diag >= 2`. `bgc_subcycle_diag = 1` prints UCLA ROMS's
   `BGCSUB` window diagnostics.
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
