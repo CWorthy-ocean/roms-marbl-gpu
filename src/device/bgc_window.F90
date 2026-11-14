@@ -103,6 +103,24 @@ contains
     endif
   end function qwin
 
+  DEVICE_ATTR
+  function vwin(l, m, vb, vc, wv1, g0, gk) result(vv)
+    ! the vertical pass's v1(l) at face m: levels m, m+1 from the register
+    ! window vb, vc, others from wv1 (flat offset g0 + gk (l-1))
+    integer(ip), intent(in) :: l, m
+    real(rp), intent(in) :: vb, vc
+    real(rp), intent(in) :: wv1(*)
+    integer(8), intent(in) :: g0, gk
+    real(rp) :: vv
+    if (l == m) then
+      vv = vb
+    else if (l == m + 1) then
+      vv = vc
+    else
+      vv = wv1(g0 + gk * int(l - 1, 8))
+    endif
+  end function vwin
+
 #ifdef USE_CUDA
   ! ---------------------------------------------------------------- stats
   attributes(global) launch_bounds(128, 8) subroutine stats_kernel(nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi, &
@@ -415,7 +433,7 @@ contains
     real(rp), device, intent(inout) :: dbef(ntr, *), daft(ntr, *), dsrf(ntr, *), dnmn(ntr, *), dncn(ntr, *)
     integer(ip) :: c, itr, i, j, k, m, jj, n, m1
     real(rp) :: pmn, rm, w, rem, s, cl, fl, fprev, bef, aft, nmn, ncn, dev, q0, cc, fw, vj, qj, dwa, dwb, ck
-    real(rp) :: pmv, pnv, qa, qb, qc, qd, cb, c2, c3
+    real(rp) :: pmv, pnv, qa, qb, qc, qd, cb, c2, c3, c4, c5, vb, vc, vd, v4, v5, wcur, wnx, pvc, pvx, fcc, fcx
     integer(8) :: it0, tk, g0, gk
     c = (blockIdx%x - 1) * blockDim%y + threadIdx%y
     if (c > nwet) return
@@ -429,27 +447,45 @@ contains
     it0 = int(itr, 8) + int(ntr, 8) * int(c, 8)
     gk = int(ie - is + 1, 8) * int(je - js + 1, 8)
     g0 = int(i - is + 1, 8) + int(ie - is + 1, 8) * int(j - js, 8)
-    ! the register window at face m = 1: q(0) (never used), q(1), q(2), q(3); cb = c(1), c2 = c(2), c3 = c(3)
+    ! the register window at face m = 1: q(0) (never used), q(1), q(2), q(3); the contents c and pseudo-
+    ! thicknesses v of levels 1..4 and the transport and factors of face 1 (each loaded one face ahead
+    ! of its use, so the loop's loads are in flight while the previous face is computed)
     qa = 0.0_rp
-    cb = real(cio(itr, c, 1), rp); qb = real(real(cb / wv1(i, j, 1), pp), rp)
-    c2 = 0.0_rp; qc = 0.0_rp; c3 = 0.0_rp; qd = 0.0_rp
+    vb = wv1(i, j, 1); cb = real(cio(itr, c, 1), rp)
+    c2 = 0.0_rp; c3 = 0.0_rp; c4 = 0.0_rp; c5 = 0.0_rp; vc = 1.0_rp; vd = 1.0_rp; v4 = 1.0_rp; v5 = 1.0_rp
     if (n >= 2) then
-      c2 = real(cio(itr, c, 2), rp); qc = real(real(c2 / wv1(i, j, 2), pp), rp)
+      vc = wv1(i, j, 2); c2 = real(cio(itr, c, 2), rp)
     endif
     if (n >= 3) then
-      c3 = real(cio(itr, c, 3), rp); qd = real(real(c3 / wv1(i, j, 3), pp), rp)
+      vd = wv1(i, j, 3); c3 = real(cio(itr, c, 3), rp)
     endif
+    if (n >= 4) then
+      v4 = wv1(i, j, 4); c4 = real(cio(itr, c, 4), rp)
+    endif
+    wcur = 0.0_rp; wnx = 0.0_rp; fcc = 0.0_rp; fcx = 0.0_rp
+    if (n >= 2) wcur = WA(i, j, 1)
+    pvc = wpv(i, j, 1); pvx = pvc
+    qb = real(real(cb / vb, pp), rp)
+    qc = 0.0_rp; qd = 0.0_rp
+    if (n >= 2) qc = real(real(c2 / vc, pp), rp)
+    if (n >= 3) qd = real(real(c3 / vd, pp), rp)
     ! vsweep: fl(m) through the w-faces m = 1..n-1 (fl(0) = fl(n) = 0),
     ! applied as c(m) = c(m) - (fl(m) - fl(m-1)) once fl(m) is known; dw(m)
     ! = q(m+1) - q(m), dw(0) = dw(1), dw(n) = dw(n-1)
     fprev = 0.0_rp
     fw = 0.0_rp
     do m = 1, n - 1
-      w = WA(i, j, m) * pmv * pnv
+      ! the next face's operands
+      if (m + 1 <= n - 1) wnx = WA(i, j, m + 1)
+      pvx = wpv(i, j, m + 1); fcx = wfc(i, j, m)
+      if (m + 4 <= n) then
+        v5 = wv1(i, j, m + 4); c5 = real(cio(itr, c, m + 4), rp)
+      endif
+      w = wcur * pmv * pnv
       if (w > 0.0_rp) then
         rem = w; jj = m; s = 0.0_rp
         do while (jj >= 1)
-          vj = wv1(i, j, jj); qj = qwin(jj, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
+          vj = vwin(jj, m, vb, vc, wv1, g0, gk); qj = qwin(jj, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
           if (rem >= vj) then
             s = s + vj * qj; rem = rem - vj; jj = jj - 1
             if (rem <= 0.0_rp) exit
@@ -469,7 +505,7 @@ contains
       else if (w < 0.0_rp) then
         rem = -w; jj = m + 1; s = 0.0_rp
         do while (jj <= n)
-          vj = wv1(i, j, jj); qj = qwin(jj, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
+          vj = vwin(jj, m, vb, vc, wv1, g0, gk); qj = qwin(jj, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
           if (rem >= vj) then
             s = s + vj * qj; rem = rem - vj; jj = jj + 1
             if (rem <= 0.0_rp) exit
@@ -493,16 +529,17 @@ contains
       fprev = fl
       ! forward elimination of level m (implicit vertical mixing)
       if (m == 1) then
-        fw = wpv(i, j, 1) * cc
+        fw = pvc * cc
       else
-        fw = wpv(i, j, m) * (cc + wfc(i, j, m - 1) * fw)
+        fw = pvc * (cc + fcc * fw)
       endif
       qs(itr, c, m) = real(fw, pp)
       ! slide the register window to face m + 1
-      qa = qb; qb = qc; qc = qd; cb = c2; c2 = c3
-      if (m + 3 <= n) then
-        c3 = real(cio(itr, c, m + 3), rp); qd = real(real(c3 / wv1(i, j, m + 3), pp), rp)
-      endif
+      qa = qb; qb = qc; qc = qd
+      if (m + 3 <= n) qd = real(real(c4 / v4, pp), rp)
+      cb = c2; c2 = c3; c3 = c4; c4 = c5
+      vb = vc; vc = vd; vd = v4; v4 = v5
+      wcur = wnx; pvc = pvx; fcc = fcx
     enddo
     cc = cb - (0.0_rp - fprev)
     ! sources
