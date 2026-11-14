@@ -2,10 +2,12 @@
 # Submit a roms_gpu case with the rank layout derived from its namelist:
 # compute ranks = np_xi x np_eta, writer ranks from the history record size
 # (tools/gpu_layout.py), PBS select line and mpiexec count set accordingly.
-#   tools/submit_gpu.sh <submit_script> [NWRITERS=n] [PERNODE=1] [extra qsub -v settings, e.g. EXE=...]
+#   tools/submit_gpu.sh <submit_script> [NWRITERS=n] [PERNODE=1] [READER=1] [extra qsub -v settings, e.g. EXE=...]
 # PERNODE=1: the same ranks on every node with writers on each node
 # (gpu_layout.py --per-node; the model's ROMS_GPU_NWRITERS mode). NWRITERS
 # is then the total, rounded up to a multiple of the node count.
+# READER=1: one more rank on every node, the forcing reader (gpu_layout.py
+# --reader; the model's ROMS_GPU_FRC_READER=1 mode).
 # The submit script must name its namelist on an NML= line (it may use
 # ${CASE} from a CASE= line) and launch with "mpiexec -n ${NRANKS:-...}".
 # PBS (qsub) version; for Slurm, use the printed counts with sbatch/srun.
@@ -24,17 +26,20 @@ NML=${NML//'${CASE}'/$CASE}
 EXTRA=""
 NWOPT=""
 PNOPT=""
+RDOPT=""
 for a in "$@"; do
   case $a in
     NWRITERS=*) NWOPT="--max-writers ${a#NWRITERS=} --target-seconds 0.001" ;;
     PERNODE=1) PNOPT="--per-node" ;;
+    READER=1) RDOPT="--reader"; EXTRA="${EXTRA},ROMS_GPU_FRC_READER=1" ;;
+    READER=0) ;;
     *) EXTRA="${EXTRA},${a}" ;;
   esac
 done
-LAYOUT=$($PYTHON "$ROOT/tools/gpu_layout.py" "$NML" --gpus-per-node $GPUS_PER_NODE $NWOPT $PNOPT)
+LAYOUT=$($PYTHON "$ROOT/tools/gpu_layout.py" "$NML" --gpus-per-node $GPUS_PER_NODE $NWOPT $PNOPT $RDOPT)
 read NTILE NW NRANKS SELECT WPN <<< "$LAYOUT"
 [ -n "$SELECT" ] || { echo "submit_gpu.sh: gpu_layout.py gave no layout for $NML" >&2; exit 1; }
-echo "layout: $NTILE compute ranks + $NW writer(s) = $NRANKS ranks; select=$SELECT"
+echo "layout: $NTILE compute ranks + $NW writer(s)${RDOPT:+ + forcing readers} = $NRANKS ranks; select=$SELECT"
 if [ -n "$WPN" ]; then
   EXTRA=",ROMS_GPU_NWRITERS=${WPN}${EXTRA}"
 else
