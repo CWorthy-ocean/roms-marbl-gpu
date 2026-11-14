@@ -360,6 +360,14 @@ v0.1.2-beta, bit for bit.
   of 4 steps with MARBL every 4) and 1.20x at k = 2, MiniPac 1.28x and
   1.18x. Off by default; runs without it are unchanged, bit for bit. See
   "BGC tracer subcycling" below.
+- BGC tracer subcycling together with the IMEX internal-wave step
+  (`&imex_igw_settings`): the start-up refusal is gone, as UCLA ROMS dev
+  809aa24a runs the combination. The window sums IMEX's corrector
+  transports, its 'modal' open faces included. The IMEX tracer predictor
+  no longer updates the subcycled tracers, as the stock predictor already
+  did not; it would have overwritten one of the time levels that hold the
+  BGC state between windows. Runs without subcycling are unchanged, bit
+  for bit.
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
   depth-integrated internal-tide energy flux `up`/`vp` of the parent,
   written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS
@@ -563,6 +571,18 @@ bit for bit.
   correlation 0.977-0.9999 at day 1, relative rms within 0.2 % of the CPU's
   at day 3. Restarts on window boundaries are exact, and results do not
   depend on the tiling (split free surface).
+- **With the IMEX internal-wave step:** against UCLA ROMS dev 809aa24a
+  (mbg, k = 2, 4, k = 2 with MARBL every 4, implicit free surface,
+  'fixed' boundary, forced sub-passes; MiniPac k = 4, 'modal' boundary):
+  physics bit-identical with subcycling on and off, the sub-pass counts
+  and Courant numbers equal to the CPU's in every window, the effect of
+  subcycling equal to the CPU's (ratio 1.0000, correlation 1.000000), and
+  an exact restart inside an IMEX operator-rebuild period. The GPU's IMEX
+  step at its default settings differs from the CPU's by more than the
+  CPU's strict-minus-regular spread, with or without subcycling;
+  subcycling does not widen that difference. Like the IMEX step itself,
+  the combination is not bitwise tiling-independent (rounding-level
+  differences).
 - **Testing:** `tools/bgcsub_gates.py` runs the fast gate set on a small
   MARBL case (AGENTS.md, "Testing").
 
