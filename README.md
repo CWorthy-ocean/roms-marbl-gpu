@@ -271,6 +271,15 @@ v0.1.2-beta, bit for bit.
   inferred. Output keeps roms_gpu's layout. Also fixed: `tile_balance =
   'wet'` (the default) stopped the run on a roms_gpu-layout periodic grid
   file with `mask_rho`.
+- Surface forcing on a periodic grid: after each record the forcing
+  fields' halo in a periodic direction is the periodic copy of the
+  interior, as UCLA ROMS's exchange after each forcing read makes it.
+  Before, the halo kept the file's boundary points (UCLA ROMS layout) or
+  was never set (roms_gpu layout); either way the stress, heat and
+  freshwater fluxes next to the periodic seam were wrong (on a doubly
+  periodic seamount with flux forcing, 1e8 times the CPU's strict spread
+  at the first step; now 1.8 times). Periodic runs with surface forcing
+  change; all other runs are unchanged, bit for bit.
 - `rho0` (`&rho0_settings`) is read at run time, as UCLA ROMS reads it:
   one binary runs any reference density. Before, it was a build constant
   (`-DROMS_RHO0`, default 1000), and a namelist with another value

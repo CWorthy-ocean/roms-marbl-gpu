@@ -16,6 +16,7 @@ module frc_io
   use comm_mod, only: comm_rank, comm_size, comm_compute
   use run_timers, only: wall_time
   use frc_reader, only: frc_reader_on, frc_reader_ahead
+  use halo_mod, only: halo_fill_2d
   use netcdf, only: nf90_inquire, nf90_inq_varid, nf90_inquire_variable, nf90_inquire_dimension, nf90_get_var, &
                     nf90_double, nf90_float, nf90_max_var_dims, nf90_open, nf90_nowrite
 #ifdef USE_CUDA
@@ -1364,6 +1365,12 @@ contains
       else
         call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0)
       endif
+      ! On a periodic grid the halo is the periodic copy of the interior, as
+      ! UCLA ROMS's exchange_xxx after each record read (roms_read_write
+      ! fill_frc_slice_surf): the window read holds the file's own boundary
+      ! points (UCLA ROMS layout) or no halo at all (roms_gpu layout).
+      ! Pointwise time interpolation commutes with the copy.
+      if (decomp%periodic_x .or. decomp%periodic_y) call halo_fill_2d(dest, STAGGER_RHO)
     else
       call interp_coarse(s%buf, s%n1, s%n2, c1, c2, dest, gtype, kn)
     endif
