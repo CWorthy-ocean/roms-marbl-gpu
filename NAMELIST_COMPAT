@@ -17,9 +17,7 @@
 #   &bgc_settings  bgc_physics_subcycle, bgc_physics_timestep (BGC tracer
 #     subcycling, #428), and its testing keys bgc_subcycle_pos and
 #     bgc_subcycle_diag, with UCLA ROMS's checks, restart rule and messages.
-#     The GPU port is partial: every level of a window is transported in
-#     one sub-pass, and a window that needs more stops the run (shorten
-#     bgc_physics_timestep); river sources, CDR releases, CDR_LITE tracers,
+#     The GPU port is partial: river sources, CDR releases, CDR_LITE tracers,
 #     bgc_subcycle_pos = .true., bgc_subcycle_diag >= 2, the IMEX
 #     internal-wave step (&imex_igw_settings; no UCLA ROMS reference for
 #     the combination) and builds without -DPASSIVE_FP64 are refused at

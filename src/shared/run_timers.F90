@@ -25,15 +25,15 @@ module run_timers
   private
   integer, parameter, public :: RT_LOOP = 1, RT_OUTPUT = 2, RT_HIS = 3, RT_RST = 4, &
                                 RT_MARBL = 5, RT_FINAL = 6, RT_INIT = 7, RT_BGCACC = 8, RT_BGCWIN = 9, &
-                                RT_BGCH0 = 10, RT_BGCH = 11, RT_BGCV = 12, RT_BGCBC = 13
-  integer, parameter :: NRT = 13
+                                RT_BGCH0 = 10, RT_BGCH = 11, RT_BGCV = 12, RT_BGCBC = 13, RT_BGCHS = 14
+  integer, parameter :: NRT = 14
   character(len=34), parameter :: rt_name(NRT) = [character(len=34) :: &
        'stepping loop', 'output (maybe_wrt_output)', '  history staging (nested)', &
        '  restart staging (nested)', 'MARBL (device events)', 'end of run (io_finalize)', &
        'init (start-up to first step)', 'BGC subcycle sums (device events)', &
        'BGC window, incl. MARBL (dev. ev.)', '  window Courant numbers (nested)', &
        '  window horizontal pass (nested)', '  window vertical pass (nested)', &
-       '  window bc+MARBL+exchange (nested)']
+       '  window bc+MARBL+exchange (nested)', '    window sub-passes 2+ (nested)']
   real(8) :: rt_t(NRT) = 0.0d0
   real(8) :: rt_c0(NRT) = 0.0d0
   integer :: rt_n(NRT) = 0
@@ -50,8 +50,8 @@ module run_timers
   logical :: ev_made = .false., ev_pending = .false.
   ! BGC subcycling (bgc_subcycle_mod): the window sums and the window end,
   ! timed like MARBL with their own event pairs (rt_ev_begin/rt_ev_end)
-  type(cudaEvent) :: evb_a(RT_BGCACC:RT_BGCBC), evb_b(RT_BGCACC:RT_BGCBC)
-  logical :: evb_made = .false., evb_pending(RT_BGCACC:RT_BGCBC) = .false.
+  type(cudaEvent) :: evb_a(RT_BGCACC:RT_BGCHS), evb_b(RT_BGCACC:RT_BGCHS)
+  logical :: evb_made = .false., evb_pending(RT_BGCACC:RT_BGCHS) = .false.
 #endif
   public :: rt_tic, rt_toc, rt_dev_begin, rt_dev_end, rt_dev_collect, rt_report
   public :: rt_ev_begin, rt_ev_end
@@ -143,7 +143,7 @@ contains
 #ifdef USE_CUDA
     integer :: ierr, k
     if (.not. evb_made) then
-      do k = RT_BGCACC, RT_BGCBC
+      do k = RT_BGCACC, RT_BGCHS
         ierr = cudaEventCreate(evb_a(k))
         ierr = cudaEventCreate(evb_b(k))
       enddo
@@ -172,7 +172,7 @@ contains
 #ifdef USE_CUDA
     integer :: ierr, k
     real :: ms
-    do k = RT_BGCACC, RT_BGCBC
+    do k = RT_BGCACC, RT_BGCHS
       if (.not. evb_pending(k)) cycle
       ierr = cudaEventSynchronize(evb_b(k))
       ierr = cudaEventElapsedTime(ms, evb_a(k), evb_b(k))
@@ -230,6 +230,8 @@ contains
            ' horizontal', tmax(RT_BGCH) / max(cmax(RT_BGCH), 1.0d0), &
            ' vertical', tmax(RT_BGCV) / max(cmax(RT_BGCV), 1.0d0), &
            ' bc_marbl_exchange', tmax(RT_BGCBC) / max(cmax(RT_BGCBC), 1.0d0)
+      if (cmax(RT_BGCHS) > 0.0d0) write(*,'(1x,a,i8,a,f12.6)') 'TIMING bgcsub_subpass_windows', &
+           nint(cmax(RT_BGCHS)), ' subpasses_2plus_per_window_s', tmax(RT_BGCHS) / max(cmax(RT_BGCHS), 1.0d0)
     endif
     if (allocated(step_t)) call print_step_stats(step_t, rt_nsteps, rst_steps, n_rst_steps)
     flush(6)

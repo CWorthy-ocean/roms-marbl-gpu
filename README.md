@@ -295,16 +295,15 @@ v0.1.2-beta, bit for bit.
   and forced once per window of `bgc_physics_timestep` from the corrector
   transports summed over the window, as UCLA ROMS does it: a Lin-Rood
   swept-volume pass horizontally (with TS_DIF2 diffusion and the upwind
-  inflow rule on open sides), a 1-D swept flux vertically, the CFLX_CORR
+  inflow rule on open sides; a level whose window Courant numbers need it
+  is split into sub-passes), a 1-D swept flux vertically, the CFLX_CORR
   surface restoring, implicit vertical mixing with the window-integrated
   diffusivity, the window boundary conditions, then MARBL at MARBL steps.
   Not yet on the GPU, so the run stops: at start-up with river sources,
   CDR releases, CDR_LITE tracers, the IMEX internal-wave step
   (`&imex_igw_settings`), `bgc_subcycle_pos = .true.` or
-  `bgc_subcycle_diag >= 2`; at the first window whose Courant numbers need
-  more than one sub-pass on some level (UCLA ROMS splits such a level;
-  shorten the window). `bgc_subcycle_diag = 1` prints UCLA ROMS's `BGCSUB`
-  window diagnostics.
+  `bgc_subcycle_diag >= 2`. `bgc_subcycle_diag = 1` prints UCLA ROMS's
+  `BGCSUB` window diagnostics.
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
   depth-integrated internal-tide energy flux `up`/`vp` of the parent,
   written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS

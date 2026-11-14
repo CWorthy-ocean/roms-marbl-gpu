@@ -36,7 +36,7 @@ module bgc_window_mod
   implicit none
   private
   public :: WLEV, bgcw_stats, bgcw_hcoef, bgcw_inner, bgcw_outer, bgcw_factor, bgcw_vertical
-  public :: bgcw_t3dbc, bgcw_reduce
+  public :: bgcw_t3dbc, bgcw_reduce, bgcw_vs, bgcw_edge_r, bgcw_subq, bgcw_edge_tp
   ! Levels per horizontal launch (the scratch of the inner operators and
   ! the coefficients hold WLEV levels).
   integer(ip), parameter :: WLEV = 20
@@ -208,15 +208,16 @@ contains
   end subroutine stats_level_kernel
 
   ! ------------------------------------------------- H2: inner operators
-  attributes(global) launch_bounds(128, 4) subroutine inner_kernel(nxc, k0, k1, ntr, nx, ny, nz, is, ie, js, je, &
+  attributes(global) launch_bounds(128, 4) subroutine inner_kernel(nxc, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, &
       ilo, ihi, jlo, jhi, west, east, south, north, ncl, xcol, xi, xj, xnb, q, sxs, sys, VX, VY, &
-      vol, cxf, cyf, dnx, dny, fmk, umask_, vmask_, rmask_)
+      vol, cxf, cyf, dnx, dny, fmk, mk, umask_, vmask_, rmask_)
     ! hlevel's inner part for one (tracer, cross-region column): the inner
     ! y fluxes of q through the faces j, j+1 and sx = (q + Yq)/2 (rows
     ! 1..ny, columns ilo..ihi); the inner x fluxes through i, i+1 and
     ! sy = (q + Xq)/2 (columns 1..nx, rows jlo..jhi). Levels k0..k1, stored
-    ! at k - k0 + 1 in the scratch and the coefficients.
-    integer(ip), value :: nxc, k0, k1, ntr, nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi
+    ! at k - k0 + 1 in the scratch and the coefficients. Sub-pass isub:
+    ! levels with isub > mk(k) are skipped (the CPU's cycle).
+    integer(ip), value :: nxc, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi
     integer(ip), value :: west, east, south, north, ncl
     integer(ip), device, intent(in) :: xcol(*), xi(*), xj(*), xnb(8, *)
     real(pp), device, intent(in) :: q(ntr, 0:ncl, nz)
@@ -224,6 +225,7 @@ contains
     real(rp), device, intent(in) :: VX(is:ie, js:je, nz), VY(is:ie, js:je, nz)
     real(rp), device, intent(in) :: vol(is:ie, js:je, WLEV), cxf(is:ie, js:je, WLEV), cyf(is:ie, js:je, WLEV)
     real(rp), device, intent(in) :: dnx(is:ie, js:je, WLEV), dny(is:ie, js:je, WLEV), fmk(nz)
+    integer(ip), device, intent(in) :: mk(nz)
     real(rp), device, intent(in) :: umask_(is:ie, js:je), vmask_(is:ie, js:je), rmask_(is:ie, js:je)
     integer(ip) :: n, itr, c, i, j, k, kk, nb(8)
     logical :: dox, doy, wet, hl1, hr1, hl2, hr2, gl1, gr1, gl2, gr2
@@ -249,6 +251,9 @@ contains
     hl1 = (j - 1 > jlo); hr1 = (j + 1 <= jhi); hl2 = (j > jlo); hr2 = (j + 2 <= jhi)
     gl1 = (i - 1 > ilo); gr1 = (i + 1 <= ihi); gl2 = (i > ilo); gr2 = (i + 2 <= ihi)
     do k = k0, k1
+      if (isub > 1) then
+        if (isub > mk(k)) cycle
+      endif
       kk = k - k0 + 1
       ! every operand of the level is loaded before any arithmetic, so the
       ! loads are in flight together (one memory latency per level)
@@ -298,14 +303,16 @@ contains
   ! ------------------------------------------------ H3: outer and update
   attributes(global) launch_bounds(128, 4) subroutine outer_kernel(nwet, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, &
       ilo, ihi, jlo, jhi, west, east, south, north, ncl, wi, wj, nbt, q, sxs, sys, cout, VX, VY, HZS, &
-      cxf, cyf, fmk, pm_, pn_, umask_, vmask_, rmask_, pmon_u_, pnom_v_, sp_, tnu, dodiff, dtw, dbud, ew, ee, es, en)
+      cxf, cyf, fmk, mk, pm_, pn_, umask_, vmask_, rmask_, pmon_u_, pnom_v_, sp_, tnu, dodiff, dtw, dbud, ew, ee, es, en)
     ! hlevel's outer part and hupdate for one (tracer, interior wet column):
     ! outer swept fluxes of sx through the x faces i, i+1 and of sy through
     ! the y faces j, j+1; on sub-pass 1 of a tracer (dodiff = 1) the TS_DIF2
     ! fluxes of the window-start state q over the window (dtw) with the
     ! diffusivity tnu(itr) + sp(i, j); content per area into cout:
-    ! HZS q - pm pn div F (sub-pass 1). dbud = 1: the boundary-face fluxes
-    ! into ew/ee/es/en (the budget's boundary term).
+    ! HZS q - pm pn div F (sub-pass 1), then cout - pm pn div F (sub-passes
+    ! isub > 1, on the levels with isub <= mk(k); q is then the previous
+    ! sub-pass's concentration). dbud = 1: the boundary-face fluxes into
+    ! ew/ee/es/en (the budget's boundary term), summed over the sub-passes.
     integer(ip), value :: nwet, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi
     integer(ip), value :: west, east, south, north, ncl, dodiff, dbud
     real(rp), value :: dtw
@@ -315,6 +322,7 @@ contains
     real(pp), device, intent(inout) :: cout(ntr, 0:ncl, nz)
     real(rp), device, intent(in) :: VX(is:ie, js:je, nz), VY(is:ie, js:je, nz), HZS(is:ie, js:je, nz)
     real(rp), device, intent(in) :: cxf(is:ie, js:je, WLEV), cyf(is:ie, js:je, WLEV), fmk(nz)
+    integer(ip), device, intent(in) :: mk(nz)
     real(rp), device, intent(in) :: pm_(is:ie, js:je), pn_(is:ie, js:je), umask_(is:ie, js:je), vmask_(is:ie, js:je)
     real(rp), device, intent(in) :: rmask_(is:ie, js:je), pmon_u_(is:ie, js:je), pnom_v_(is:ie, js:je), sp_(is:ie, js:je)
     real(rp), device, intent(in) :: tnu(*)
@@ -348,6 +356,9 @@ contains
       dfn = dtw * 0.25_rp * ((bg + sp_(i, j + 1)) + (bg + sp_(i, j))) * pnom_v_(i, j + 1)
     endif
     do k = k0, k1
+      if (isub > 1) then
+        if (isub > mk(k)) cycle
+      endif
       kk = k - k0 + 1
       ! every operand of the level is loaded before any arithmetic, so the
       ! loads are in flight together (one memory latency per level)
@@ -392,10 +403,17 @@ contains
         cout(itr, cc, k) = real(co - pmn * (fe - fw + fn - fs), pp)
       endif
       if (dbud == 1) then
-        if (west >= 1 .and. i == 1) ew(itr, j, k) = fw * rmask_(i, j)
-        if (east >= 1 .and. i == nx) ee(itr, j, k) = fe * rmask_(i, j)
-        if (south >= 1 .and. j == 1) es(itr, i, k) = fs * rmask_(i, j)
-        if (north >= 1 .and. j == ny) en(itr, i, k) = fn * rmask_(i, j)
+        if (isub == 1) then
+          if (west >= 1 .and. i == 1) ew(itr, j, k) = fw * rmask_(i, j)
+          if (east >= 1 .and. i == nx) ee(itr, j, k) = fe * rmask_(i, j)
+          if (south >= 1 .and. j == 1) es(itr, i, k) = fs * rmask_(i, j)
+          if (north >= 1 .and. j == ny) en(itr, i, k) = fn * rmask_(i, j)
+        else
+          if (west >= 1 .and. i == 1) ew(itr, j, k) = ew(itr, j, k) + fw * rmask_(i, j)
+          if (east >= 1 .and. i == nx) ee(itr, j, k) = ee(itr, j, k) + fe * rmask_(i, j)
+          if (south >= 1 .and. j == 1) es(itr, i, k) = es(itr, i, k) + fs * rmask_(i, j)
+          if (north >= 1 .and. j == ny) en(itr, i, k) = en(itr, i, k) + fn * rmask_(i, j)
+        endif
       endif
     enddo
   end subroutine outer_kernel
@@ -644,10 +662,12 @@ contains
 #endif
   end subroutine bgcw_stats
 
-  subroutine bgcw_hcoef(k0, k1, VX, VY, VS, fmk, vol, cxf, cyf, dnx, dny)
-    ! hcoef for levels k0..k1 of one sub-pass (VS: the sub-pass's
-    ! pseudo-thickness; HZS on sub-pass 1), stored at k - k0 + 1
-    integer(ip), intent(in) :: k0, k1
+  subroutine bgcw_hcoef(k0, k1, isub, mk, VX, VY, VS, fmk, vol, cxf, cyf, dnx, dny)
+    ! hcoef for levels k0..k1 of sub-pass isub (VS: the sub-pass's
+    ! pseudo-thickness; HZS on sub-pass 1), stored at k - k0 + 1; levels
+    ! with isub > mk(k) are skipped
+    integer(ip), intent(in) :: k0, k1, isub
+    integer(ip), WORK_ATTR intent(in) :: mk(decomp%nz)
     real(rp), WORK_ATTR intent(in) :: VX(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz), VY(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz), VS(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz), fmk(decomp%nz)
     real(rp), WORK_ATTR intent(inout) :: vol(decomp%is:decomp%ie, decomp%js:decomp%je, WLEV), cxf(decomp%is:decomp%ie, decomp%js:decomp%je, WLEV), cyf(decomp%is:decomp%ie, decomp%js:decomp%je, WLEV), dnx(decomp%is:decomp%ie, decomp%js:decomp%je, WLEV), dny(decomp%is:decomp%ie, decomp%js:decomp%je, WLEV)
     integer(ip) :: i, j, k, kk, nx, ny, ilo, ihi, jlo, jhi
@@ -660,6 +680,7 @@ contains
     do k = k0, k1
       do j = jlo, jhi
         do i = ilo, ihi
+         if (isub == 1 .or. isub <= mk(k)) then
           kk = k - k0 + 1
           fm = fmk(k)
           v0 = VS(i, j, k) / (pm(i, j) * pn(i, j))
@@ -686,14 +707,108 @@ contains
           endif
           if (j >= 1 .and. j <= ny) dny(i, j, kk) = v0 - fm * (VY(i, j + 1, k) - VY(i, j, k))
           if (i >= 1 .and. i <= nx) dnx(i, j, kk) = v0 - fm * (VX(i + 1, j, k) - VX(i, j, k))
+         endif
         enddo
       enddo
     enddo
   end subroutine bgcw_hcoef
 
-  subroutine bgcw_inner(ntr, k0, k1, q, sxs, sys, VX, VY, vol, cxf, cyf, dnx, dny, fmk)
-    ! H2 for ntr tracers of q (tp layout, one slot), levels k0..k1
-    integer(ip), intent(in) :: ntr, k0, k1
+  ! ------------------------------------------------ sub-passes isub > 1
+  subroutine bgcw_vs(isub, klo, khi, mk, fmk, VX, VY, HZS, VS)
+    ! the sub-pass's pseudo-thickness on the interior cells of the levels
+    ! with isub <= mk(k) (bgcsub_window_tile): VS = HZS - (isub-1) fm pm pn
+    ! div V; the halo and the edge rows follow (exchange, bgcw_edge_r)
+    integer(ip), intent(in) :: isub, klo, khi
+    integer(ip), WORK_ATTR intent(in) :: mk(decomp%nz)
+    real(rp), WORK_ATTR intent(in) :: fmk(decomp%nz)
+    real(rp), WORK_ATTR intent(in) :: VX(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz), VY(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz), HZS(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz)
+    real(rp), WORK_ATTR intent(inout) :: VS(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz)
+    integer(ip) :: i, j, k, nx, ny
+    nx = decomp%nx; ny = decomp%ny
+#ifdef USE_CUDA
+    !$cuf kernel do(3) <<<*,*>>>
+#endif
+    do k = klo, khi
+      do j = 1, ny
+        do i = 1, nx
+          if (isub <= mk(k)) VS(i, j, k) = HZS(i, j, k) - real(isub - 1, rp) * fmk(k) * pm(i, j) * pn(i, j) * &
+                                           (VX(i + 1, j, k) - VX(i, j, k) + VY(i, j + 1, k) - VY(i, j, k))
+        enddo
+      enddo
+    enddo
+  end subroutine bgcw_vs
+
+  subroutine bgcw_edge_r(klo, khi, neb, ebi, ebj, src, dst)
+    ! edge_copy of a 3-D field: the physical-edge rows (cells ebi, ebj),
+    ! levels klo..khi, from src
+    integer(ip), intent(in) :: klo, khi, neb
+    integer(ip), WORK_ATTR intent(in) :: ebi(*), ebj(*)
+    real(rp), WORK_ATTR intent(in) :: src(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz)
+    real(rp), WORK_ATTR intent(inout) :: dst(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz)
+    integer(ip) :: k, p
+    if (neb <= 0) return
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do k = klo, khi
+      do p = 1, neb
+        dst(ebi(p), ebj(p), k) = src(ebi(p), ebj(p), k)
+      enddo
+    enddo
+  end subroutine bgcw_edge_r
+
+  subroutine bgcw_subq(ntr, isub, klo, khi, mk, cin, VS, q)
+    ! sub-pass isub > 1: the concentrations q = content / VS of the
+    ! interior wet columns on the levels with isub <= mk(k) (tp layout, one
+    ! slot each; the CPU's t(:,:,:,3) = t(:,:,:,nnew)/VS)
+    integer(ip), intent(in) :: ntr, isub, klo, khi
+    integer(ip), WORK_ATTR intent(in) :: mk(decomp%nz)
+    real(pp), WORK_ATTR intent(in) :: cin(ntr, 0:ntpcol, decomp%nz)
+    real(rp), WORK_ATTR intent(in) :: VS(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz)
+    real(pp), WORK_ATTR intent(inout) :: q(ntr, 0:ntpcol, decomp%nz)
+    integer(ip) :: k, c, m, nw
+    nw = nwet
+    if (nw <= 0) return
+#ifdef USE_CUDA
+    !$cuf kernel do(3) <<<*,*>>>
+#endif
+    do k = klo, khi
+      do c = 1, nw
+        do m = 1, ntr
+          if (isub <= mk(k)) q(m, c, k) = real(real(cin(m, c, k), rp) / VS(wet_i(c), wet_j(c), k), pp)
+        enddo
+      enddo
+    enddo
+  end subroutine bgcw_subq
+
+  subroutine bgcw_edge_tp(ntr, klo, khi, neb, ebi, ebj, src, dst)
+    ! edge_copy in the tp layout: the stored columns of the physical-edge
+    ! rows (cells ebi, ebj) and the shared land column 0, levels klo..khi,
+    ! from src (one slot each)
+    integer(ip), intent(in) :: ntr, klo, khi, neb
+    integer(ip), WORK_ATTR intent(in) :: ebi(*), ebj(*)
+    real(pp), WORK_ATTR intent(in) :: src(ntr, 0:ntpcol, decomp%nz)
+    real(pp), WORK_ATTR intent(inout) :: dst(ntr, 0:ntpcol, decomp%nz)
+    integer(ip) :: k, p, m, c
+#ifdef USE_CUDA
+    !$cuf kernel do(3) <<<*,*>>>
+#endif
+    do k = klo, khi
+      do p = 0, neb
+        do m = 1, ntr
+          c = 0
+          if (p > 0) c = tpcol(ebi(max(p, 1_ip)), ebj(max(p, 1_ip)))
+          if (p == 0 .or. c > 0) dst(m, c, k) = src(m, c, k)
+        enddo
+      enddo
+    enddo
+  end subroutine bgcw_edge_tp
+
+  subroutine bgcw_inner(ntr, k0, k1, isub, mk, q, sxs, sys, VX, VY, vol, cxf, cyf, dnx, dny, fmk)
+    ! H2 for ntr tracers of q (tp layout, one slot), levels k0..k1 of
+    ! sub-pass isub (levels with isub > mk(k) skipped)
+    integer(ip), intent(in) :: ntr, k0, k1, isub
+    integer(ip), WORK_ATTR intent(in) :: mk(decomp%nz)
     real(pp), WORK_ATTR intent(in) :: q(*)
     real(rp), WORK_ATTR intent(inout) :: sxs(*), sys(*)
     real(rp), WORK_ATTR intent(in) :: VX(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz), VY(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz)
@@ -714,18 +829,20 @@ contains
     ncb = max(1_ip, 128_ip / ntr)
     block = dim3(ntr, ncb, 1)
     grid = dim3((nxc + ncb - 1) / ncb, 1, 1)
-    call inner_kernel<<<grid, block>>>(nxc, k0, k1, ntr, nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi, &
+    call inner_kernel<<<grid, block>>>(nxc, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi, &
          west, east, south, north, ntpcol, xc_col, xc_i, xc_j, xc_nb, q, sxs, sys, VX, VY, &
-         vol, cxf, cyf, dnx, dny, fmk, umask, vmask, rmask)
+         vol, cxf, cyf, dnx, dny, fmk, mk, umask, vmask, rmask)
 #else
     error stop 'bgcw_inner: CUDA build only'
 #endif
   end subroutine bgcw_inner
 
-  subroutine bgcw_outer(ntr, k0, k1, isub, q, sxs, sys, cout, VX, VY, HZS, cxf, cyf, fmk, tnu, dodiff, dtw, &
+  subroutine bgcw_outer(ntr, k0, k1, isub, mk, q, sxs, sys, cout, VX, VY, HZS, cxf, cyf, fmk, tnu, dodiff, dtw, &
                         dbud, ew, ee, es, en)
-    ! H3 for ntr tracers: content per area of q into cout (tp layout)
+    ! H3 for ntr tracers: content per area of q into cout (tp layout),
+    ! levels k0..k1 of sub-pass isub (levels with isub > mk(k) skipped)
     integer(ip), intent(in) :: ntr, k0, k1, isub, dodiff, dbud
+    integer(ip), WORK_ATTR intent(in) :: mk(decomp%nz)
     real(pp), WORK_ATTR intent(in) :: q(*)
     real(pp), WORK_ATTR intent(inout) :: cout(*)
     real(rp), WORK_ATTR intent(in) :: sxs(*), sys(*), tnu(*)
@@ -749,7 +866,7 @@ contains
     grid = dim3((nwet + ncb - 1) / ncb, 1, 1)
     call outer_kernel<<<grid, block>>>(nwet, k0, k1, isub, ntr, nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi, &
          west, east, south, north, ntpcol, wet_i, wet_j, tpnb, q, sxs, sys, cout, VX, VY, HZS, &
-         cxf, cyf, fmk, pm, pn, umask, vmask, rmask, pmon_u, pnom_v, diff2_sp, tnu, dodiff, dtw, dbud, ew, ee, es, en)
+         cxf, cyf, fmk, mk, pm, pn, umask, vmask, rmask, pmon_u, pnom_v, diff2_sp, tnu, dodiff, dtw, dbud, ew, ee, es, en)
 #else
     error stop 'bgcw_outer: CUDA build only'
 #endif

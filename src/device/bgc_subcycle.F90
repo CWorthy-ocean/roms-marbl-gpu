@@ -24,12 +24,11 @@ module bgc_subcycle_mod
   ! conditions, MARBL at MARBL steps, the exchange and the copy to the
   ! other time slots. Kernels in bgc_window_mod.
   !
-  ! GPU port, stage 2 (GPU_BGC_SUBCYCLE_SCOPE.md): every level in one
-  ! sub-pass. A window whose Courant numbers need a second sub-pass on some
-  ! level stops the run with a message (the CPU then splits that level);
-  ! river sources, CDR releases and CDR_LITE tracers are refused at
-  ! start-up until they are ported; bgc_subcycle_pos and
-  ! bgc_subcycle_diag >= 2 likewise.
+  ! GPU port, stage 3 (GPU_BGC_SUBCYCLE_SCOPE.md): a level whose Courant
+  ! numbers need it is split into mk(k) sub-passes, as on the CPU; river
+  ! sources, CDR releases and CDR_LITE tracers are refused at start-up
+  ! until they are ported; bgc_subcycle_pos and bgc_subcycle_diag >= 2
+  ! likewise.
   !
   ! Between window ends the BGC state is held in time slots 1 and 2 of tp
   ! and at the surface of slot 3 (the only part of slot 3 read between
@@ -42,7 +41,7 @@ module bgc_subcycle_mod
   use time_state, only: iic, nnew, nstp, dt, ntstart, ntimes
   use passive_mod, only: ntp, tp, passive_hold, passive_init, tp_subcycled, tnu2_tp, passive_name, &
        passive_bry, tb_west, tb_east, tb_south, tb_north
-  use halo_mod, only: halo_fill_3d_tp
+  use halo_mod, only: halo_fill_3d_tp, halo_fill_3d_tp_k, halo_fill_3d_k
   use marbl_gpu, only: marbl_on, marbl_timestep_ratio, marbl_gpu_step
   use his_io, only: wrt_file_rst, output_period_rst
   use upscale_out, only: do_upscale
@@ -52,10 +51,11 @@ module bgc_subcycle_mod
   use cdr_lite_mod, only: cdrl_on, cdrl_psf, psf_cflx
   use imex_igw, only: imex_on
   use bgc_window_mod, only: WLEV, bgcw_stats, bgcw_hcoef, bgcw_inner, bgcw_outer, bgcw_factor, &
-       bgcw_vertical, bgcw_t3dbc, bgcw_reduce
+       bgcw_vertical, bgcw_t3dbc, bgcw_reduce, bgcw_vs, bgcw_edge_r, bgcw_subq, bgcw_edge_tp
   use comm_mod, only: comm_rank, comm_allreduce_max, comm_allreduce_min, comm_allreduce_sum, comm_abort
   use arch_mod, only: sync_arch
-  use run_timers, only: rt_ev_begin, rt_ev_end, RT_BGCACC, RT_BGCWIN, RT_BGCH0, RT_BGCH, RT_BGCV, RT_BGCBC
+  use run_timers, only: rt_ev_begin, rt_ev_end, RT_BGCACC, RT_BGCWIN, RT_BGCH0, RT_BGCH, RT_BGCV, RT_BGCBC, &
+       RT_BGCHS
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
 #endif
@@ -87,6 +87,14 @@ module bgc_subcycle_mod
   ! (1, every stored column), its content / concentration and scratch (tp
   ! layout)
   real(pp), WORK_ATTR allocatable :: QONE(:,:,:), CSH(:,:,:), QSH(:,:,:)
+  ! sub-passes per level (mk: device copy of mkh) and the pseudo-thickness
+  ! VS of sub-passes 2 and up; the cells of the physical-edge rows
+  ! (edge_copy)
+  integer(ip), allocatable :: mkh(:)
+  integer(ip), WORK_ATTR allocatable :: mk(:)
+  real(rp), WORK_ATTR allocatable :: VS(:,:,:)
+  integer(ip) :: neb = 0
+  integer(ip), WORK_ATTR allocatable :: ebi(:), ebj(:)
   ! window work: 1/(sub-passes) per level; per-level coefficients and the
   ! inner operators of WLEV levels; implicit-diffusion factors; the
   ! Courant-number reductions
@@ -185,7 +193,9 @@ contains
     allocate(VX(is:ie, js:je, nz), VY(is:ie, js:je, nz), HZS(is:ie, js:je, nz))
     allocate(WA(is:ie, js:je, 0:nz), KA(is:ie, js:je, 0:nz))
     allocate(SFA(ntp, max(nwet, 1_ip)), RAINA(is:ie, js:je))
-    allocate(fmk(nz))
+    allocate(fmk(nz), mkh(nz), mk(nz), VS(is:ie, js:je, nz))
+    fmk = 1.0_rp; mkh = 1; mk = 1; VS = 0.0_rp
+    call build_edge_list()
     allocate(wvol(is:ie, js:je, WLEV), wcx(is:ie, js:je, WLEV), wcy(is:ie, js:je, WLEV))
     allocate(wdx(is:ie, js:je, WLEV), wdy(is:ie, js:je, WLEV))
     allocate(wsx(ntp * (ntpcol + 1) * WLEV), wsy(ntp * (ntpcol + 1) * WLEV))
@@ -194,7 +204,6 @@ contains
     wvol = 0.0_rp; wcx = 0.0_rp; wcy = 0.0_rp; wdx = 0.0_rp; wdy = 0.0_rp
     wsx = 0.0_rp; wsy = 0.0_rp
     wv1 = 1.0_rp; wfc = 0.0_rp; wpv = 1.0_rp; wcf = 0.0_rp
-    fmk = 1.0_rp
     nd = merge(1_ip, 0_ip, bgc_subcycle_diag > 0)
     if (nd == 1) then
       allocate(QONE(1, 0:ntpcol, nz), CSH(1, 0:ntpcol, nz), QSH(1, 0:ntpcol, nz))
@@ -249,9 +258,41 @@ contains
       if (modulo(ntstart + ntimes - 1, bgcsub_k) /= 0) write(*,'(1x,A,I0,A)') &
            '  the run ends inside a window: the BGC transport of its last ', &
            modulo(ntstart + ntimes - 1, bgcsub_k), ' steps is not applied'
-      write(*,'(1x,A)') '  GPU: one sub-pass per level; a window that needs more stops the run'
     endif
   end subroutine bgcsub_init
+
+  subroutine build_edge_list()
+    ! the cells of the physical-edge rows over the whole array (the CPU's
+    ! edge_copy: dst(istr-1,:,:) at a western edge, ...), each once
+    integer(ip) :: i, j, is, ie, js, je, nx, ny, n
+    logical, allocatable :: e(:,:)
+    integer(ip), allocatable :: hi(:), hj(:)
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    nx = decomp%nx; ny = decomp%ny
+    allocate(e(is:ie, js:je))
+    e = .false.
+    if (decomp%edge_w) e(0, :) = .true.
+    if (decomp%edge_e) e(nx + 1, :) = .true.
+    if (decomp%edge_s) e(:, 0) = .true.
+    if (decomp%edge_n) e(:, ny + 1) = .true.
+    neb = int(count(e), ip)
+    allocate(hi(max(neb, 1_ip)), hj(max(neb, 1_ip)))
+    hi = 0; hj = 0
+    n = 0
+    do j = js, je
+      do i = is, ie
+        if (e(i, j)) then
+          n = n + 1; hi(n) = i; hj(n) = j
+        endif
+      enddo
+    enddo
+    allocate(ebi(max(neb, 1_ip)), ebj(max(neb, 1_ip)))
+    if (neb == 0) then
+      hi(1) = is; hj(1) = js
+    endif
+    ebi = hi; ebj = hj
+    deallocate(e, hi, hj)
+  end subroutine build_edge_list
 
   integer(ip) function ntpcol_n()
     ! last stored column of tp (tp(:, 0:ntpcol, :, :))
@@ -385,7 +426,7 @@ contains
     ! pass, vertical pass with sources and implicit mixing, diagnostics,
     ! window boundary conditions, MARBL at MARBL steps, the Fe hold, the
     ! exchange of slot nnew, the copy to the other slots, the reset.
-    integer(ip) :: nn, ns, l, c, k, m, n, nz, ncol, nwin_w, k0, k1, msub, mk, idg, kc
+    integer(ip) :: nn, ns, l, c, k, m, n, nz, ncol, nwin_w, k0, k1, msub, idg, kc, isub, klo, khi, kb
     real(rp) :: dtw, cres, v1min, gmax(5), cff
     real(pp) :: snan
     real(8), allocatable :: lb(:), gb(:)
@@ -420,10 +461,11 @@ contains
     msub = 1; kc = 1
     gmax = 0.0_rp; v1min = 1.0_rp
     do k = 1, nz
-      mk = max(1_ip, ceiling(real(gb(5 * (k - 1) + 5), rp) / 0.95_rp, ip))
-      fmk(k) = 1.0_rp / real(mk, rp)
-      if (mk > msub) then
-        msub = mk; kc = k
+      mkh(k) = max(1_ip, ceiling(real(gb(5 * (k - 1) + 5), rp) / 0.95_rp, ip))
+      fmk(k) = 1.0_rp / real(mkh(k), rp)
+      mk(k) = mkh(k)
+      if (mkh(k) > msub) then
+        msub = mkh(k); kc = k
       endif
       gmax(1) = max(gmax(1), real(gb(5 * (k - 1) + 1), rp))
       gmax(2) = max(gmax(2), real(gb(5 * (k - 1) + 2), rp))
@@ -446,13 +488,6 @@ contains
            ' shorten the window (bgc_physics_timestep, or marbl_timestep if it is 0) or reduce v_sponge/tnu2'
       call window_stop('bgcsub_window', info)
     endif
-    if (msub > 1) then
-      write(info,'(A,I0,A,I0,A,I0,A,F8.3,A)') 'BGC window ending at step ', iic, ': level ', kc, &
-           ' needs ', msub, ' sub-passes (horizontal Courant ', cff, '); this GPU version transports'// &
-           ' each level in one sub-pass: shorten the window (bgc_physics_timestep, or marbl_timestep'// &
-           ' if it is 0) until every level needs one'
-      call window_stop('bgcsub_window', info)
-    endif
     call rt_ev_end(RT_BGCH0)
     ! window continuity (the CPU's cont): Hz_end = v1 - d_z W, k < nz
     cres = 0.0_rp
@@ -464,21 +499,72 @@ contains
       deallocate(lb, gb)
     endif
 
-    ! ---- horizontal pass, level blocks of WLEV: content per area into
-    ! slot nnew (shadow: CSH), from the window-start state (slot nstp)
+    ! ---- horizontal pass: content per area into slot nnew (shadow: CSH).
+    ! Sub-pass 1 from the window-start state (slot nstp) on every level, in
+    ! level blocks of WLEV; sub-pass isub > 1 on the levels with
+    ! isub <= mk(k) (levels klo..khi hold them all), from the previous
+    ! sub-pass's concentrations q = content / VS in slot 3 (free during the
+    ! window: every level is rewritten at its end), with VS = HZS - (isub-1)
+    ! fm pm pn div V; VS and q exchanged over klo..khi, the edge rows from
+    ! HZS and the window-start state (the CPU's edge_copy). Diffusion on
+    ! sub-pass 1 only.
     call rt_ev_begin(RT_BGCH)
-    do k0 = 1, nz, WLEV
-      k1 = min(k0 + WLEV - 1, nz)
-      call bgcw_hcoef(k0, k1, VX, VY, HZS, fmk, wvol, wcx, wcy, wdx, wdy)
-      if (diag) then
-        call bgcw_inner(1_ip, k0, k1, QONE, wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk)
-        call bgcw_outer(1_ip, k0, k1, 1_ip, QONE, wsx, wsy, CSH, VX, VY, HZS, wcx, wcy, fmk, tnu2_tp, 0_ip, &
-                        dtw, 0_ip, dew, dee, des, den)
+    do isub = 1, msub
+      if (isub == 1) then
+        klo = 1; khi = nz
+      else
+        if (isub == 2) call rt_ev_begin(RT_BGCHS)
+        klo = nz; khi = 1
+        do k = 1, nz
+          if (isub <= mkh(k)) then
+            klo = min(klo, k); khi = max(khi, k)
+          endif
+        enddo
+        call bgcw_vs(isub, klo, khi, mk, fmk, VX, VY, HZS, VS)
+        call halo_fill_3d_k(VS, STAGGER_RHO, klo, khi)
+        call bgcw_edge_r(klo, khi, neb, ebi, ebj, HZS, VS)
+        call bgcw_subq(n, isub, klo, khi, mk, tp(1, 0, 1, nn), VS, tp(1, 0, 1, 3))
+        call halo_fill_3d_tp_k(tp, ntp, 3_ip, 3_ip, klo, khi)
+        call bgcw_edge_tp(n, klo, khi, neb, ebi, ebj, tp(1, 0, 1, ns), tp(1, 0, 1, 3))
+        if (diag) then
+          call bgcw_subq(1_ip, isub, klo, khi, mk, CSH, VS, QSH)
+          call halo_fill_3d_tp_k(QSH, 1_ip, 1_ip, 1_ip, klo, khi)
+          call bgcw_edge_tp(1_ip, klo, khi, neb, ebi, ebj, QONE, QSH)
+        endif
       endif
-      call bgcw_inner(n, k0, k1, tp(1, 0, 1, ns), wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk)
-      call bgcw_outer(n, k0, k1, 1_ip, tp(1, 0, 1, ns), wsx, wsy, tp(1, 0, 1, nn), VX, VY, HZS, wcx, wcy, fmk, &
-                      tnu2_tp, 1_ip, dtw, idg, dew, dee, des, den)
+      do kb = klo, khi, WLEV
+        ! the block's first and last level with a sub-pass isub (none: skip)
+        k0 = kb + WLEV; k1 = kb - 1
+        do k = kb, min(kb + WLEV - 1, khi)
+          if (isub <= mkh(k)) then
+            k0 = min(k0, k); k1 = max(k1, k)
+          endif
+        enddo
+        if (k1 < k0) cycle
+        if (isub == 1) then
+          call bgcw_hcoef(k0, k1, isub, mk, VX, VY, HZS, fmk, wvol, wcx, wcy, wdx, wdy)
+          if (diag) then
+            call bgcw_inner(1_ip, k0, k1, isub, mk, QONE, wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk)
+            call bgcw_outer(1_ip, k0, k1, isub, mk, QONE, wsx, wsy, CSH, VX, VY, HZS, wcx, wcy, fmk, tnu2_tp, &
+                            0_ip, dtw, 0_ip, dew, dee, des, den)
+          endif
+          call bgcw_inner(n, k0, k1, isub, mk, tp(1, 0, 1, ns), wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk)
+          call bgcw_outer(n, k0, k1, isub, mk, tp(1, 0, 1, ns), wsx, wsy, tp(1, 0, 1, nn), VX, VY, HZS, wcx, wcy, &
+                          fmk, tnu2_tp, 1_ip, dtw, idg, dew, dee, des, den)
+        else
+          call bgcw_hcoef(k0, k1, isub, mk, VX, VY, VS, fmk, wvol, wcx, wcy, wdx, wdy)
+          if (diag) then
+            call bgcw_inner(1_ip, k0, k1, isub, mk, QSH, wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk)
+            call bgcw_outer(1_ip, k0, k1, isub, mk, QSH, wsx, wsy, CSH, VX, VY, HZS, wcx, wcy, fmk, tnu2_tp, &
+                            0_ip, dtw, 0_ip, dew, dee, des, den)
+          endif
+          call bgcw_inner(n, k0, k1, isub, mk, tp(1, 0, 1, 3), wsx, wsy, VX, VY, wvol, wcx, wcy, wdx, wdy, fmk)
+          call bgcw_outer(n, k0, k1, isub, mk, tp(1, 0, 1, 3), wsx, wsy, tp(1, 0, 1, nn), VX, VY, HZS, wcx, wcy, &
+                          fmk, tnu2_tp, 0_ip, dtw, idg, dew, dee, des, den)
+        endif
+      enddo
     enddo
+    if (msub > 1) call rt_ev_end(RT_BGCHS)
     call rt_ev_end(RT_BGCH)
 
     ! ---- vertical swept flux, sources, implicit mixing ----
