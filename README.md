@@ -126,10 +126,19 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
     `np_xi x np_eta` the run stops and prints the layout it expected.
   - `ROMS_GPU_NWRITERS` unset: the first `np_xi x np_eta` ranks compute and
     every extra rank is a writer, so the writers sit on the last node.
-  `python3 tools/gpu_layout.py namelist.nml [--per-node]` prints the
-  suggested numbers (compute ranks, writers, total, a PBS select line, and
-  with `--per-node` the writers per node); `tools/submit_gpu.sh <job script>
-  [PERNODE=1]` does the same and submits a PBS job with them.
+  - Forcing reader (optional, `ROMS_GPU_FRC_READER=1`): the last rank of
+    every node reads the surface forcing and boundary records ahead of the
+    model, each record whole and in file order, so that the compute ranks'
+    own reads come from the node's page cache instead of waiting on the
+    file system at every new record. Results are unchanged (the compute
+    ranks read as before). Launch one more rank on every node; the other
+    ranks follow the two rules above. Without a spare rank on every node
+    the run has no reader and says so.
+  `python3 tools/gpu_layout.py namelist.nml [--per-node] [--reader]` prints
+  the suggested numbers (compute ranks, writers, total, a PBS select line,
+  and with `--per-node` the writers per node); `tools/submit_gpu.sh <job
+  script> [PERNODE=1] [READER=1]` does the same and submits a PBS job with
+  them.
 - **GPUs:** a compute rank uses GPU (its rank on the node mod the number of
   visible GPUs), so place ranks node by node and make all of a node's GPUs
   visible to every rank. `tools/numa_bind.sh` (launch with `mpiexec
@@ -216,6 +225,20 @@ v0.1.2-beta, bit for bit.
   runs are unchanged.
 
 ## Changes after v0.1.3-beta
+
+- Forcing reader (`ROMS_GPU_FRC_READER=1`; `tools/submit_gpu.sh READER=1`
+  and `tools/gpu_layout.py --reader` add the rank): one more rank on every
+  node reads each surface forcing and boundary record ahead of the model,
+  whole and in file order, into the node's page cache. The compute ranks
+  read as before, so results are unchanged, but their reads no longer wait
+  on the file system at every new record. On Derecho (A100, forcing files
+  not yet read by the node, as in any production run) this removed the
+  whole cold-read cost: MiniPac physics-only 52.97 to 40.61 ms per step
+  (40.67 with the files already cached), MiniPac with MARBL 74.79 to 68.59
+  (68.85), Pac physics-only 109.71 to 102.48 (103.01); the first read of
+  each monthly boundary file fell from 157-415 ms to 7 ms. No cost when the
+  files are already cached. Without a spare rank on every node the run has
+  no reader and says so.
 
 - Namelists written from UCLA ROMS's current template (after 0.14.0) run:
   `&bgc_settings` `bgc_physics_subcycle` and `bgc_physics_timestep` (and the

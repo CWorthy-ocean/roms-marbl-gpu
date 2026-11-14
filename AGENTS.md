@@ -46,7 +46,11 @@ make gpu FC_GPU=nvfortran \
   Compile a new module with external MPI calls on its own, like `comm.F90`.
 - Rank layout: `python3 tools/gpu_layout.py namelist.nml`, or submit with
   `tools/submit_gpu.sh examples/minipac/run_minipac.pbs` (PBS). Set
-  `MPICH_GPU_SUPPORT_ENABLED=1` only with a CUDA-aware MPI.
+  `MPICH_GPU_SUPPORT_ENABLED=1` only with a CUDA-aware MPI. Ranks other than
+  compute ranks: writers (`src/host/io_server.F90`) and, with
+  `ROMS_GPU_FRC_READER=1`, one forcing reader per node
+  (`src/host/frc_reader.F90`, the last rank of each node); roles are set in
+  `comm.F90` `init_comm`.
 
 ## Testing
 
