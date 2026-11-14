@@ -1365,15 +1365,17 @@ contains
       else
         call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0)
       endif
-      ! On a periodic grid the halo is the periodic copy of the interior, as
-      ! UCLA ROMS's exchange_xxx after each record read (roms_read_write
-      ! fill_frc_slice_surf): the window read holds the file's own boundary
-      ! points (UCLA ROMS layout) or no halo at all (roms_gpu layout).
-      ! Pointwise time interpolation commutes with the copy.
-      if (decomp%periodic_x .or. decomp%periodic_y) call halo_fill_2d(dest, STAGGER_RHO)
     else
       call interp_coarse(s%buf, s%n1, s%n2, c1, c2, dest, gtype, kn)
     endif
+    ! On a periodic grid the halo is the periodic copy of the interior, as
+    ! UCLA ROMS's exchange_xxx after each record read (roms_read_write
+    ! fill_frc_slice_surf, after coarse2fine for a 2x-coarse field): the
+    ! window read holds the file's own boundary points (UCLA ROMS layout)
+    ! or no halo at all (roms_gpu layout), and interp_coarse fills the
+    ! halo from the coarse field. Pointwise time interpolation commutes
+    ! with the copy.
+    if (decomp%periodic_x .or. decomp%periodic_y) call halo_fill_2d(dest, STAGGER_RHO)
   end subroutine fill_any
 
   subroutine interp_coarse(b, n1, n2, c1, c2, dest, gtype, kn)
@@ -1388,10 +1390,13 @@ contains
     ! depend on the tiling. With an odd LLm (MMm) in a closed direction the
     ! last fine rho column (row) and the u (v) end face also take the coarse
     ! point beyond the file's last one, which takes the last one's value
-    ! (coarse_caps; the CPU's clamp_coarse_edges, ucla-roms #439). Other
-    ! coarse points beyond the file extent count as 0, as the CPU's
-    ! zero-initialized coarse buffer; NaN propagates as on the CPU and
-    ! becomes 0 at the end unless kn (keep NaN).
+    ! (coarse_rule; the CPU's clamp_coarse_edges, ucla-roms #439). In a
+    ! periodic direction the coarse field is periodic too (coarse_rule;
+    ! the CPU's exchange of the coarse buffer), so the file's coarse
+    ! boundary points are not used. Other coarse points beyond the file
+    ! extent count as 0, as the CPU's zero-initialized coarse buffer; NaN
+    ! propagates as on the CPU and becomes 0 at the end unless kn (keep
+    ! NaN).
     ! Filled: rho i = 0:nx+1, j = 0:ny+1; u i = 1:nx+1, j = 0:ny+1;
     ! v i = 0:nx+1, j = 1:ny+1 (the standard on-grid windows).
     integer,          intent(in) :: n1, n2
@@ -1401,10 +1406,11 @@ contains
     character(len=1), intent(in) :: gtype
     logical,          intent(in) :: kn
     integer :: i, j, ib, jb, ie, je, gi0, gj0, ox, oy, ic, jc, cx, cy, i0c, i1c, j0c, j1c
+    integer :: px, py, lx, ly
     real(rp) :: xo, yo, xg, yg, xl, yl
     real(rp) :: a00, a10, a01, a11, q00, q10, q01, q11, f1, f2, x
     logical :: in0, in1, jn0, jn1
-    call coarse_caps(n1, n2, cx, cy)
+    call coarse_rule(gtype, n1, n2, cx, cy, px, py, lx, ly)
     ib = 0; jb = 0; xo = 0.25_rp; yo = 0.25_rp; ox = 1; oy = 1
     if (gtype == 'u') then
       ib = 1; xo = 0.5_rp; ox = 0
@@ -1426,10 +1432,22 @@ contains
         yl = yg - real(jc, rp)
         ic = ic + ox
         jc = jc + oy
-        i0c = min(ic, cx)
-        i1c = min(ic + 1, cx)
-        j0c = min(jc, cy)
-        j1c = min(jc + 1, cy)
+        i0c = ic
+        i1c = ic + 1
+        j0c = jc
+        j1c = jc + 1
+        if (px > 0) then
+          i0c = lx + modulo(i0c - lx, px)
+          i1c = lx + modulo(i1c - lx, px)
+        endif
+        if (py > 0) then
+          j0c = ly + modulo(j0c - ly, py)
+          j1c = ly + modulo(j1c - ly, py)
+        endif
+        i0c = min(i0c, cx)
+        i1c = min(i1c, cx)
+        j0c = min(j0c, cy)
+        j1c = min(j1c, cy)
         in0 = (i0c >= 1 .and. i0c <= n1)
         in1 = (i1c >= 1 .and. i1c <= n1)
         jn0 = (j0c >= 1 .and. j0c <= n2)
@@ -1457,21 +1475,38 @@ contains
     enddo
   end subroutine interp_coarse
 
-  subroutine coarse_caps(n1, n2, cx, cy)
-    ! The cap on the coarse file index (xi: cx, eta: cy) of interp_coarse
-    ! and missing_coarse, as UCLA ROMS's clamp_coarse_edges
-    ! (roms_read_write, ucla-roms #439, d8dda5b2): with an odd LLm (MMm) in
-    ! a closed direction the last fine rho column (row) and the u (v) end
-    ! face need the coarse point after the file's last one (file index
-    ! n1 + 1, n2 + 1), which takes the last one's value. With an even LLm
-    ! (MMm) that point has zero weight and stays 0 (no cap), and a periodic
-    ! direction is left alone, as on the CPU.
-    integer, intent(in)  :: n1, n2
-    integer, intent(out) :: cx, cy
+  subroutine coarse_rule(gtype, n1, n2, cx, cy, px, py, lx, ly)
+    ! How interp_coarse and missing_coarse map a coarse index to the file
+    ! (xi: cx, px, lx; eta: cy, py, ly), as UCLA ROMS fills its coarse
+    ! buffer (roms_read_write fill_frc_slice_surf):
+    ! - a closed direction: the cap of clamp_coarse_edges (ucla-roms #439,
+    !   d8dda5b2): with an odd LLm (MMm) the last fine rho column (row) and
+    !   the u (v) end face need the coarse point after the file's last one
+    !   (file index n1 + 1, n2 + 1), which takes the last one's value. With
+    !   an even LLm (MMm) that point has zero weight and stays 0 (no cap).
+    ! - a periodic direction: exchange_xxx of the coarse buffer makes the
+    !   coarse field periodic with LLm/2 (MMm/2) points, coarse 1..LLm/2
+    !   (file index lx..lx+px-1; file index 1 is coarse rho 0 and coarse
+    !   u/v face 1), whatever the file holds at its boundary points. No cap.
+    character(len=1), intent(in)  :: gtype
+    integer,          intent(in)  :: n1, n2
+    integer,          intent(out) :: cx, cy, px, py, lx, ly
     cx = huge(cx); cy = huge(cy)
-    if (.not. decomp%periodic_x .and. mod(int(decomp%gnx), 2) == 1) cx = n1
-    if (.not. decomp%periodic_y .and. mod(int(decomp%gny), 2) == 1) cy = n2
-  end subroutine coarse_caps
+    px = 0; py = 0
+    lx = 2; ly = 2
+    if (gtype == 'u') lx = 1
+    if (gtype == 'v') ly = 1
+    if (decomp%periodic_x) then
+      px = int(decomp%gnx) / 2
+    elseif (mod(int(decomp%gnx), 2) == 1) then
+      cx = n1
+    endif
+    if (decomp%periodic_y) then
+      py = int(decomp%gny) / 2
+    elseif (mod(int(decomp%gny), 2) == 1) then
+      cy = n2
+    endif
+  end subroutine coarse_rule
 
   subroutine interp_on_grid(b, n1, n2, c1, c2, dest, i0, j0)
     ! Device time interpolation of two buffered records onto the grid,
@@ -1602,6 +1637,12 @@ contains
       call missing_coarse(s_ddco2%buf, s_ddalk%buf, s_ddco2%n1, s_ddco2%n2, size(s_ddalk%buf, 1), &
                           size(s_ddalk%buf, 2), c1, c2, es, ddco2, ddalk)
     endif
+    ! On a periodic grid the halo is the periodic copy, as fill_any leaves
+    ! it: the CPU applies the rule to the exchanged records, halo included.
+    if (decomp%periodic_x .or. decomp%periodic_y) then
+      call halo_fill_2d(ddco2, STAGGER_RHO)
+      call halo_fill_2d(ddalk, STAGGER_RHO)
+    endif
   end subroutine missing_sensitivity
 
   subroutine bracket_times(s, t1, t2)
@@ -1660,10 +1701,10 @@ contains
     logical,  intent(in) :: es
     real(rp), WORK_ATTR intent(inout) :: ddco2(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(inout) :: ddalk(decomp%is:decomp%ie, decomp%js:decomp%je)
-    integer :: i, j, ie, je, gi0, gj0, ic, jc, m, cx, cy, i0c, i1c, j0c, j1c
+    integer :: i, j, ie, je, gi0, gj0, ic, jc, m, cx, cy, i0c, i1c, j0c, j1c, px, py, lx, ly
     real(rp) :: xg, yg, xl, yl, w, f1, f2, a00, a10, a01, a11, q00, q10, q01, q11
     logical :: in0, in1, jn0, jn1, v1, v2
-    call coarse_caps(n1, n2, cx, cy)
+    call coarse_rule('r', n1, n2, cx, cy, px, py, lx, ly)
     ie = int(decomp%nx) + 1; je = int(decomp%ny) + 1
     gi0 = int(decomp%i0) - 1; gj0 = int(decomp%j0) - 1
 #ifdef USE_CUDA
@@ -1679,10 +1720,22 @@ contains
         yl = yg - real(jc, rp)
         ic = ic + 1
         jc = jc + 1
-        i0c = min(ic, cx)
-        i1c = min(ic + 1, cx)
-        j0c = min(jc, cy)
-        j1c = min(jc + 1, cy)
+        i0c = ic
+        i1c = ic + 1
+        j0c = jc
+        j1c = jc + 1
+        if (px > 0) then
+          i0c = lx + modulo(i0c - lx, px)
+          i1c = lx + modulo(i1c - lx, px)
+        endif
+        if (py > 0) then
+          j0c = ly + modulo(j0c - ly, py)
+          j1c = ly + modulo(j1c - ly, py)
+        endif
+        i0c = min(i0c, cx)
+        i1c = min(i1c, cx)
+        j0c = min(j0c, cy)
+        j1c = min(j1c, cy)
         in0 = (i0c >= 1 .and. i0c <= n1)
         in1 = (i1c >= 1 .and. i1c <= n1)
         jn0 = (j0c >= 1 .and. j0c <= n2)

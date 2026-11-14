@@ -304,6 +304,16 @@ v0.1.2-beta, bit for bit.
   ring, 0.5625 times at the corner and half the stress on the u (v) end
   face. Grids with even LLm and MMm, periodic directions and forcing on
   the model grid are unchanged, bit for bit.
+- 2x-coarse surface forcing on a periodic grid, and the CDR_LITE
+  carbonate sensitivities (`ddic_dco2`, `ddic_dalk`) where one of their
+  two records is missing: the forcing halo in a periodic direction is the
+  periodic copy of the interior, and the 2x-coarse field is periodic too,
+  as UCLA ROMS's exchanges make them. Before, the file's coarse boundary
+  points were used in the halo and next to it (on a doubly periodic
+  seamount whose coarse file does not hold periodic copies there, 4e13
+  times the CPU's strict spread at the first step; now 1.7 times). A file
+  whose coarse boundary points are periodic copies gives the same results
+  as before, and closed grids are unchanged, bit for bit.
 - `rho0` (`&rho0_settings`) is read at run time, as UCLA ROMS reads it:
   one binary runs any reference density. Before, it was a build constant
   (`-DROMS_RHO0`, default 1000), and a namelist with another value
