@@ -20,11 +20,10 @@ module avg_out
   ! list is empty; temperature, salinity and the CDR_LITE tracers go to the
   ! ocean file, the MARBL tracers to the BGC file. Without MARBL, none.
   !
-  ! CPU behaviours kept: the BGC average's start-up call (when wrt_bgc_his
-  ! is off) already adds the initial state and advances the output clock by
-  ! one step. Not kept: the CPU starts a new _bgc_avg file for every record
-  ! (its record counter is reset at every call); here nrpf_bgc_avg records
-  ! go in each file.
+  ! As the CPU since ucla-roms #400: the start-up state is not a sample of
+  ! the first BGC average window (with wrt_bgc_his on or off), so each
+  ! record averages the steps of the period that ends at its time, and
+  ! nrpf_bgc_avg records go in each file.
   use kinds
   use his_io, only: output_fname, refdatestr
   use decomp_mod
@@ -56,7 +55,7 @@ module avg_out
   integer  :: nrpf_avg = 20
   logical  :: wz = .true., wub = .true., wvb = .true., wu = .true., wv = .true., wr = .true., wo = .true., &
               ww = .true., wakv = .true., wakt = .true., waks = .true., whbl = .true., whbbl = .true.
-  ! &bgc_settings (the averaging part, and wrt_bgc_his for the start-up call)
+  ! &bgc_settings (the averaging part; wrt_bgc_his is read but not used)
   logical  :: wrt_bgc_avg = .false., wrt_bgc_his = .false.
   real(rp) :: output_period_bgc_avg = 100.0_rp
   integer  :: nrpf_bgc_avg = 20
@@ -262,9 +261,6 @@ contains
       if (bon) write(*,'(a,es12.4,a,i0,a,i0,a)') 'BGC averages: period ', output_period_bgc_avg, ' s, ', &
            nrpf_bgc_avg, ' records per file, ', nba, ' tracers'
     endif
-    ! the CPU's start-up wrt_bgc: without BGC history output it already
-    ! averages the initial state (slot nstp = 1) and advances the clock
-    if (bon .and. .not. wrt_bgc_his) call bgc_step(start_time)
   end subroutine init_avg_output
 
   subroutine zero_all()
