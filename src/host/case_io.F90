@@ -42,7 +42,8 @@ module case_io
                        marbl_gpu_load_state
   use fs_data, only: fs_alloc_rates, udu, udv, gru, grv, qd, xx, mg_se0, mg_scu, mg_scv, fs_nsc, fs_pot_phase
   use implicit_fs_gpu, only: fs_rst_loaded, fs_on, fs_rst_scal_in, fs_mg_loaded
-  use imex_igw, only: imex_rst_has, imex_rst_accept, imex_rst_loaded, imex_nsc, imex_stage_on, &
+  use imex_igw, only: imex_rst_has, imex_rst_accept, imex_rst_loaded, imex_nsc, imex_stage_on, imex_obm_rst_may, &
+                      im_obcm => obcm3, &
                       im_pgu => pgu, im_pgv => pgv, ipg_nm1, im_dpw => dpw, im_hs1 => hs1, im_hs2 => hs2, &
                       im_hsol => hsol, im_mq => pf_mq, im_bref => bref_sav, im_n2raw => ad_n2raw, &
                       im_hzop => hz_op, im_dza => dza, im_n2o => ad_n2o
@@ -803,7 +804,7 @@ contains
     integer :: nrecs, rec, ibuf(8)
     real(rp) :: tbuf(1), time_bak, tscale
     logical :: times_ok, steps_ok, have_coup, has_tstep, fs_rates_read
-    logical :: have_sc, take_rates, take_mg, take_imex, imex_n2r
+    logical :: have_sc, take_rates, take_mg, take_imex, imex_n2r, imex_om
     integer :: nsf
     real(8) :: fsc(fs_nsc), isc(imex_nsc)
     character(len=64) :: units
@@ -899,7 +900,7 @@ contains
     endif
     ! IMEX_IGW exact restart (CPU 22c05bc1 imex_rst_get): the IMEX state of the record when
     ! the restart is exact and the record has a complete state for this run's settings
-    take_imex = .false.; imex_n2r = .false.
+    take_imex = .false.; imex_n2r = .false.; imex_om = .false.
     if (imex_rst_has('imex_rst_scal')) then
       have_sc = nc_has_var(ncid, 'imex_rst_scal')
       isc = 0.0d0
@@ -911,6 +912,8 @@ contains
       ! imex_n2raw: read when in the file (every file with a taper since CPU 72539140; no setup lag or
       ! a file of e8fca7b-aeceaec before), else recomputed
       imex_n2r = take_imex .and. nc_has_var(ncid, 'imex_n2raw')
+      ! 'modal' reference (CPU imex_rst_get): read when the run may be 'modal' (decided at the first step)
+      imex_om = take_imex .and. imex_obm_rst_may('imex_obcm') .and. nc_has_var(ncid, 'imex_obcm')
     endif
     ! All records through the collective reader: phase 1 queues every window,
     ! pr_flush reads whole variables in parallel and redistributes, phase 2
@@ -948,7 +951,7 @@ contains
         endif
       endif
       if (calc_pflx) call load_pflx_slow(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
-      if (take_imex) call load_imex_state(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v, imex_n2r)
+      if (take_imex) call load_imex_state(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v, imex_n2r, imex_om)
       if (ld_phase == 1) then
         call wall_stamp('ini queued')
         call pr_flush(ncid)
@@ -956,7 +959,7 @@ contains
       endif
     enddo
     call pr_end()
-    if (take_imex) call imex_rst_loaded(isc, imex_n2r)
+    if (take_imex) call imex_rst_loaded(isc, imex_n2r, imex_om)
     if (fs_rates_read .and. take_mg) call fs_mg_loaded()
     if (fs_rates_read) then
       call fs_rst_loaded()
@@ -978,13 +981,13 @@ contains
     call wall_stamp('ini halos')
   end subroutine load_init_records
 
-  subroutine load_imex_state(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v, n2r)
+  subroutine load_imex_state(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v, n2r, om)
     ! the IMEX_IGW state of the file (CPU 73a63afb imex_rst_get; his_io writes it): the time-less
     ! copy, or (files of e8fca7b-aeceaec, a copy per record) record rec's (par_read takes the record
     ! only for a variable that has the record dimension); only what the settings in effect use;
-    ! n2r: imex_n2raw is read (else imex_rst_loaded recomputes it)
+    ! n2r: imex_n2raw is read (else imex_rst_loaded recomputes it); om: imex_obcm
     integer, intent(in) :: ncid, rec, i0, j0, nxi, neta, xi_u, eta_v
-    logical, intent(in) :: n2r
+    logical, intent(in) :: n2r, om
     integer :: nz, is, js
     nz = decomp%nz; is = decomp%is; js = decomp%js
     call pr_store_3d(ncid, 'imex_pgu', im_pgu(is, js, 1, ipg_nm1), i0+1, j0, xi_u, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
@@ -1012,6 +1015,7 @@ contains
     else
       call pr_store_3d(ncid, 'imex_n2o', im_n2o(is, js, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     endif
+    if (om) call pr_store_3d(ncid, 'imex_obcm', im_obcm(is, js, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
   end subroutine load_imex_state
 
   logical function has_coupling_fields(ncid) result(ok)
