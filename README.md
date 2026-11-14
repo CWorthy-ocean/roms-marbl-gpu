@@ -270,6 +270,31 @@ v0.1.2-beta, bit for bit.
   periodic direction, `io_server.F90` `add_var`), and initial and
   restart files were read with u and v points one point off
   (`case_io.F90`). Non-periodic runs are unchanged, bit for bit.
+- Periodic grids can be set in the namelist: the new optional group
+  `&periodic_settings` with `ew_periodic` and `ns_periodic`, UCLA ROMS's
+  `EW_PERIODIC` and `NS_PERIODIC` (a key left out is `.false.`; one
+  direction may be periodic alone). UCLA ROMS ignores the group, so one
+  namelist serves both models. With the group, the grid, initial and
+  restart files may each use UCLA ROMS's layout (LLm+2 x MMm+2 whatever the
+  periodicity; the interior is read) or roms_gpu's (no boundary points in a periodic direction), and
+  a file that fits neither stops the run with the sizes expected. Forcing
+  fields on a periodic grid are checked per direction and also accept
+  roms_gpu's periodic u (v) faces (LLm, MMm). Before, the GPU model only
+  inferred the periodicity from the grid file's size, so a UCLA ROMS
+  periodic grid ran as a closed basin without a message. Without the group
+  the run is unchanged, bit for bit, and a start-up line names the layout
+  inferred. Output keeps roms_gpu's layout. Also fixed: `tile_balance =
+  'wet'` (the default) stopped the run on a roms_gpu-layout periodic grid
+  file with `mask_rho`.
+- Surface forcing on a periodic grid: after each record the forcing
+  fields' halo in a periodic direction is the periodic copy of the
+  interior, as UCLA ROMS's exchange after each forcing read makes it.
+  Before, the halo kept the file's boundary points (UCLA ROMS layout) or
+  was never set (roms_gpu layout); either way the stress, heat and
+  freshwater fluxes next to the periodic seam were wrong (on a doubly
+  periodic seamount with flux forcing, 1e8 times the CPU's strict spread
+  at the first step; now 1.8 times). Periodic runs with surface forcing
+  change; all other runs are unchanged, bit for bit.
 - `rho0` (`&rho0_settings`) is read at run time, as UCLA ROMS reads it:
   one binary runs any reference density. Before, it was a build constant
   (`-DROMS_RHO0`, default 1000), and a namelist with another value

@@ -16,6 +16,7 @@ module frc_io
   use comm_mod, only: comm_rank, comm_size, comm_compute
   use run_timers, only: wall_time
   use frc_reader, only: frc_reader_on, frc_reader_ahead
+  use halo_mod, only: halo_fill_2d
   use netcdf, only: nf90_inquire, nf90_inq_varid, nf90_inquire_variable, nf90_inquire_dimension, nf90_get_var, &
                     nf90_double, nf90_float, nf90_max_var_dims, nf90_open, nf90_nowrite
 #ifdef USE_CUDA
@@ -655,17 +656,26 @@ contains
     !     v: xi_rho x eta_v   = (gnx+2) x (gny+1), or gnx x (gny+1)
     !   2x coarse (the CPU's interp_*_frc inputs; gxc = gnx/2, gyc = gny/2):
     !     r: (gxc+2) x (gyc+2), u: (gxc+1) x (gyc+2), v: (gxc+2) x (gyc+1)
+    ! On a periodic grid each direction is taken on its own, and a periodic
+    ! one also accepts the roms_gpu layout of its u (v) faces, gnx (gny).
     ! Any other shape stops the run.
     type(series2d),   intent(inout) :: s
     character(len=*), intent(in)    :: gtype, path
     integer,          intent(in)    :: nxi, neta
-    integer :: gx, gy, gxc, gyc
+    integer :: gx, gy, gxc, gyc, lx, ly
     gx = int(decomp%gnx); gy = int(decomp%gny)
     gxc = gx / 2; gyc = gy / 2
     s%fn1 = nxi; s%fn2 = neta
     s%lay = LAY_GRID
     s%fi0 = int(decomp%i0); s%fj0 = int(decomp%j0)
-    if (gtype == 'r' .and. nxi == gx + 2 .and. neta == gy + 2) then
+    lx = -1; ly = -1
+    if (decomp%periodic_x .or. decomp%periodic_y) then
+      lx = axis_li0(nxi, gx, gtype == 'u', decomp%periodic_x)
+      ly = axis_li0(neta, gy, gtype == 'v', decomp%periodic_y)
+    endif
+    if (lx >= 0 .and. ly >= 0) then
+      s%li0 = lx; s%lj0 = ly
+    elseif (gtype == 'r' .and. nxi == gx + 2 .and. neta == gy + 2) then
       s%li0 = 0; s%lj0 = 0
     elseif (gtype == 'r' .and. nxi == gx .and. neta == gy) then
       s%li0 = 1; s%lj0 = 1
@@ -690,6 +700,9 @@ contains
       write(*,'(5a,2(i0,a))') 'bind_series: ', trim(s%vname), ' (', gtype, '-point) has the shape ', nxi, ' x ', neta, &
            ' (xi x eta) in '//trim(path)
       write(*,'(a,2(i0,a))') '  the model grid is LLm x MMm = ', gx, ' x ', gy, '; accepted shapes:'
+      if (decomp%periodic_x .or. decomp%periodic_y) &
+        write(*,'(a,2(l1,a))') '  (periodic: ew ', decomp%periodic_x, ', ns ', decomp%periodic_y, &
+             '; a periodic direction also takes the u (v) faces as LLm (MMm), and each direction is taken on its own)'
       write(*,'(a,6(i0,a))') '  rho: ', gx + 2, ' x ', gy + 2, ' or ', gx, ' x ', gy, ', 2x coarse ', gxc + 2, ' x ', gyc + 2
       write(*,'(a,6(i0,a))') '  u:   ', gx + 1, ' x ', gy + 2, ' or ', gx + 1, ' x ', gy, ', 2x coarse ', gxc + 1, ' x ', gyc + 2
       write(*,'(a,6(i0,a))') '  v:   ', gx + 2, ' x ', gy + 1, ' or ', gx, ' x ', gy + 1, ', 2x coarse ', gxc + 2, ' x ', gyc + 1
@@ -698,6 +711,22 @@ contains
     s%n1 = nxi - gx + int(decomp%nx)
     s%n2 = neta - gy + int(decomp%ny)
   end subroutine classify_layout
+
+  integer function axis_li0(n, g, face, periodic) result(l0)
+    ! classify_layout on a periodic grid, one direction: the local index of
+    ! the first point read, as for a closed grid (rho: g+2 from the boundary
+    ! point, g from point 1; faces: g+1 from face 1), plus the roms_gpu
+    ! periodic faces (g from face 1); -1 = not accepted.
+    integer, intent(in) :: n, g
+    logical, intent(in) :: face, periodic
+    l0 = -1
+    if (face) then
+      if (n == g + 1 .or. (periodic .and. n == g)) l0 = 1
+    else
+      if (n == g + 2) l0 = 0
+      if (n == g) l0 = 1
+    endif
+  end function axis_li0
 
   subroutine sort_catalog(s)
     type(series2d), intent(inout) :: s
@@ -1336,6 +1365,12 @@ contains
       else
         call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0)
       endif
+      ! On a periodic grid the halo is the periodic copy of the interior, as
+      ! UCLA ROMS's exchange_xxx after each record read (roms_read_write
+      ! fill_frc_slice_surf): the window read holds the file's own boundary
+      ! points (UCLA ROMS layout) or no halo at all (roms_gpu layout).
+      ! Pointwise time interpolation commutes with the copy.
+      if (decomp%periodic_x .or. decomp%periodic_y) call halo_fill_2d(dest, STAGGER_RHO)
     else
       call interp_coarse(s%buf, s%n1, s%n2, c1, c2, dest, gtype, kn)
     endif
