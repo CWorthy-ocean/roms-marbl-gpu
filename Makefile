@@ -44,7 +44,7 @@ SRC_SHARED = src/shared/kinds.F90 src/shared/decomp.F90 src/shared/tile_balance.
              src/shared/comm.F90 src/shared/formulas.F90 src/shared/time_state.F90 \
              src/shared/run_timers.F90
 SRC_DEV    = src/device/implicit_fs_mgk.F90 src/device/gpu_state.F90 src/device/column_solve.F90 src/device/halo.F90 src/device/pflx.F90 src/device/rivers.F90 src/device/cdr_src.F90 src/device/cdr_lite.F90 src/device/carb_sens.F90 \
-             src/device/geom.F90 src/device/obc.F90 src/device/step2d.F90 src/device/prsgrd.F90 \
+             src/device/geom.F90 src/device/obc.F90 src/device/imex_red.F90 src/device/imex_igw.F90 src/device/step2d.F90 src/device/prsgrd.F90 \
              src/device/advect.F90 src/device/rho_eos.F90 src/device/uv_rhs.F90 \
              src/device/passive_column.F90 src/device/passive.F90 \
              src/device/pre_step3d.F90 src/device/step3d_uv.F90 src/device/visc3d.F90 \
@@ -178,7 +178,7 @@ SRC_SHARED_NOCOMM = $(filter-out src/shared/comm.F90,$(SRC_SHARED))
 # (nvfortran -O2 host code was miscompiled twice in this code base).
 # The free surface's CUDA IPC rings (implicit_fs_ipc.F90, fs_ipc) are compiled on their own too:
 # adding the module to the main command re-triggered nvfortran 25.9's -g fort2 crash (heap
-# corruption in the main command).
+# corruption after imex_igw.F90, IMEX_GPU_PORT.md sessions 4-5).
 # The coarsest level's Cholesky factor and solve (implicit_fs_chol.F90, fs_chol, fs_gpu_opt 16) at
 # -O2 -Mnovect: no vectorization keeps the operation order (bit-identical to -O1), 4x faster.
 SRC_DEV_GPU = $(filter-out src/device/implicit_fs_chol.F90 src/device/implicit_fs_host.F90 src/device/implicit_fs_ipc.F90,$(SRC_DEV))

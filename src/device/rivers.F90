@@ -48,7 +48,7 @@ module rivers_mod
   public :: RIV_S2D, RIV_PRE, RIV_COR, RIV_S2DF, RIV_RNG
   ! for the fast-step override fused into step2d_mid's ubar/vbar kernel
   public :: rf_flx, riv_ufc, riv_vfc
-  public :: rivers_fs_map
+  public :: rivers_fs_map, rivers_pred_flx
 
   ! Stage bits of a face: the CPU's loop ranges differ by stage. A face in
   ! the fast-loop range gets RIV_S2DF when step2d_mid's ubar/vbar kernel
@@ -519,6 +519,42 @@ contains
       enddo
     enddo
   end subroutine rivers_tp
+
+  subroutine rivers_pred_flx()
+    ! IMEX_IGW predictor transport (CPU imex_pred_riv_tile, 59a2e72c and 1648c059; FS_SPEC 9b-J item 1):
+    ! on the owned river faces (pre_step3d's range, RIV_PRE) the predictor transport Flx_pred is
+    ! the river transport at the predictor's forcing time (time n), distributed over the column as
+    ! the predictor's river tracer flux is (and as rivers_huv for set_HUV):
+    !   Flx_pred = 0.5 (Hz(i-1) + Hz(i)) * (riv_vol*frac / riv_depth),
+    ! riv_depth the mean column depth of the two cells; no dn_u, no time weights. The btfix
+    ! transport multiplies u* - mis by umask, 0 on a river face, so without this the predictor
+    ! carried only (w2 + w3) Q_r there (59a2e72c); the weighted levels w1 u* + w2 u^n + w3 u^n-1
+    ! (59a2e72c's form) mixed the earlier steps' river volumes (u^n, u^n-1: set by earlier
+    ! correctors, or 0 from an initial file) into the water the tracer predictor adds the river
+    ! tracer with at the current Q_r (1648c059). Halos by the exchange that follows.
+    integer(ip) :: f, k, i, j, r, n, nz
+    real(rp) :: c1, c2, q, dep, rflx
+    if (nrf == 0) return
+    n = nrf; nz = decomp%nz
+    c1 = w_pre(1); c2 = w_pre(2)
+    CUF_DO2
+    do k = 1, nz
+      do f = 1, n
+        if (iand(rf_s(f), int(RIV_PRE, ip)) == 0) cycle
+        i = rf_i(f); j = rf_j(f); r = rf_r(f)
+        q = (c1 * rv_vol(r, 1) + c2 * rv_vol(r, 2)) * rf_frac(f)
+        if (rf_t(f) == 1) then
+          dep = 0.5_rp * (z_w(i - 1, j, nz) - z_w(i - 1, j, 0) + z_w(i, j, nz) - z_w(i, j, 0))
+          rflx = q / dep
+          FlxU(i, j, k) = 0.5_rp * (Hz(i - 1, j, k) + Hz(i, j, k)) * rflx
+        else
+          dep = 0.5_rp * (z_w(i, j - 1, nz) - z_w(i, j - 1, 0) + z_w(i, j, nz) - z_w(i, j, 0))
+          rflx = q / dep
+          FlxV(i, j, k) = 0.5_rp * (Hz(i, j - 1, k) + Hz(i, j, k)) * rflx
+        endif
+      enddo
+    enddo
+  end subroutine rivers_pred_flx
 
   subroutine rivers_fs_map(mu, mv)
     ! Implicit free surface (implicit_fs.F90): the face index of every

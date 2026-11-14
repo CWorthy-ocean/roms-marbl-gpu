@@ -18,6 +18,7 @@ module pre_step3d_mod
   use passive_mod, only: ntp, tp, passive_predictor, passive_t3dbc
   use obc, only: u3dbc, v3dbc, t3dbc
   use rivers_mod, only: river_on, rivers_ts, rivers_uv, RIV_PRE
+  use imex_igw, only: imex_on, imex_solve_stage, imex_stage_pred, imex_predictor_transport
   implicit none
   private
   public :: pre_step3d
@@ -38,6 +39,10 @@ contains
     real(rp) :: dc0, am3, dcp, uk
     logical :: probe_u, fused_v, keep
 
+    if (imex_on) then
+      call pre_step3d_imex()
+      return
+    endif
     nx = decomp%nx
     ny = decomp%ny
     nz = decomp%nz
@@ -426,6 +431,239 @@ contains
     endif
     call dump_pre_step_t()
   end subroutine pre_step3d
+
+  subroutine pre_step3d_imex()
+    ! IMEX_IGW (imex_igw.F90): the CPU's two passes of pre_step3d_tile.
+    ! Pass 1, the momentum predictor from the level-n transport (Hz_bak,
+    ! Hz_fwd from FlxU, FlxV, We, Wi of set_HUV/omega), then the elliptic
+    ! correction of u*, v* (imex_solve_stage), rivers and the open-boundary
+    ! values, and the predictor tracer transport Flx_pred into FlxU, FlxV,
+    ! We, Wi (imex_predictor_transport); pass 2, the tracer predictor with
+    ! Hz_bak, Hz_fwd rebuilt from Flx_pred. The kernels are the stock ones
+    ! (non-probe forms) in the new order.
+    integer(ip) :: i, j, k, itrc, indx, iAkt, nx, ny, nz, lim, limm
+    integer(ip) :: n_stp, n_new, i_u0, i_u1, j_v0
+    real(rp) :: dtau, cf_stp, cf_bak, cff
+    real(rp) :: fck, wck, cfk, fcm, wcm, cfm
+    real(rp) :: dc0, am3, dcp, uk
+    logical :: fused_v
+
+    nx = decomp%nx
+    ny = decomp%ny
+    nz = decomp%nz
+    n_stp = nstp
+    n_new = nnew
+    indx = 3 - nstp
+    i_u0 = 1
+    if (decomp%edge_w) i_u0 = 2
+    i_u1 = nx
+    j_v0 = 1
+    if (decomp%edge_s) j_v0 = 2
+    call lf_am3_weights(is_first_time_step(), dt, dtau, cf_stp, cf_bak)
+    if (nz > COL_KMAX) error stop 'pre_step3d: nz exceeds COL_KMAX'
+    call set_bottom_drag()
+    lim = dry_lim(G_TRC)
+    limm = dry_lim(G_MOM)
+
+    ! ---- pass 1: momentum predictor
+    call hz_bak_fwd(dtau, lim)
+    call add_horiz_uv_rhs_all(.false.)
+    call add_vert_uv_rhs(1, ny)
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, ny
+      do i = i_u0, i_u1
+        if (limm > 0) then; if (colact(i, j) == 0) cycle; end if
+        dc0 = dtau * 0.25_rp * (pm(i, j) + pm(i - 1, j)) * (pn(i, j) + pn(i - 1, j))
+        am3 = 0.5_rp * (Hz_bak(i, j, nz) + Hz_bak(i - 1, j, nz)) * ( &
+              cf_stp * u(i, j, nz, n_stp) + cf_bak * u(i, j, nz, indx)) + dc0 * ru(i, j, nz)
+        u(i, j, nz, indx) = 0.5_rp * (Hz(i, j, nz) + Hz(i - 1, j, nz)) * u(i, j, nz, n_stp)
+        fck = 2.0_rp * dtau * (Akv(i, j, nz - 1) + Akv(i - 1, j, nz - 1)) / &
+             (Hz_fwd(i, j, nz) + Hz_fwd(i - 1, j, nz) + Hz_fwd(i, j, nz - 1) + Hz_fwd(i - 1, j, nz - 1))
+        wck = dc0 * 0.5_rp * (Wi(i, j, nz - 1) + Wi(i - 1, j, nz - 1))
+        cff = 1.0_rp / (0.5_rp * (Hz_fwd(i, j, nz) + Hz_fwd(i - 1, j, nz)) + &
+             fck - min(wck, 0.0_rp))
+        cfk = cff * (fck + max(wck, 0.0_rp))
+        col_cf(i, j, nz - 1) = cfk
+        dcp = cff * (am3 + dtau * sustr(i, j))
+        col_dc(i, j, nz) = dcp
+        do k = nz - 1, 2, -1
+          am3 = 0.5_rp * (Hz_bak(i, j, k) + Hz_bak(i - 1, j, k)) * ( &
+                cf_stp * u(i, j, k, n_stp) + cf_bak * u(i, j, k, indx)) + dc0 * ru(i, j, k)
+          u(i, j, k, indx) = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * u(i, j, k, n_stp)
+          fcm = 2.0_rp * dtau * (Akv(i, j, k - 1) + Akv(i - 1, j, k - 1)) / &
+               (Hz_fwd(i, j, k) + Hz_fwd(i - 1, j, k) + Hz_fwd(i, j, k - 1) + Hz_fwd(i - 1, j, k - 1))
+          wcm = dc0 * 0.5_rp * (Wi(i, j, k - 1) + Wi(i - 1, j, k - 1))
+          cff = 1.0_rp / (0.5_rp * (Hz_fwd(i, j, k) + Hz_fwd(i - 1, j, k)) + &
+                          fcm - min(wcm, 0.0_rp) + &
+                          fck + max(wck, 0.0_rp) - &
+                          cfk * (fck - min(wck, 0.0_rp)))
+          cfm = cff * (fcm + max(wcm, 0.0_rp))
+          col_cf(i, j, k - 1) = cfm
+          dcp = cff * (am3 + dcp * (fck - min(wck, 0.0_rp)))
+          col_dc(i, j, k) = dcp
+          fck = fcm; wck = wcm; cfk = cfm
+        enddo
+        am3 = 0.5_rp * (Hz_bak(i, j, 1) + Hz_bak(i - 1, j, 1)) * ( &
+              cf_stp * u(i, j, 1, n_stp) + cf_bak * u(i, j, 1, indx)) + dc0 * ru(i, j, 1)
+        u(i, j, 1, indx) = 0.5_rp * (Hz(i, j, 1) + Hz(i - 1, j, 1)) * u(i, j, 1, n_stp)
+        uk = (am3 + dcp * (fck - min(wck, 0.0_rp))) / &
+             (0.5_rp * (Hz_fwd(i, j, 1) + Hz_fwd(i - 1, j, 1)) + 0.5_rp * dtau * (r_D(i, j) + r_D(i - 1, j)) + &
+              fck + max(wck, 0.0_rp) - &
+              cfk * (fck - min(wck, 0.0_rp)))
+        u(i, j, 1, n_new) = uk
+        do k = 2, nz
+          uk = col_dc(i, j, k) + col_cf(i, j, k - 1) * uk
+          u(i, j, k, n_new) = uk
+        enddo
+      enddo
+    enddo
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = j_v0, ny
+      do i = 1, nx
+        if (limm > 0) then; if (colact(i, j) == 0) cycle; end if
+        dc0 = dtau * 0.25_rp * (pm(i, j) + pm(i, j - 1)) * (pn(i, j) + pn(i, j - 1))
+        am3 = 0.5_rp * (Hz_bak(i, j, nz) + Hz_bak(i, j - 1, nz)) * ( &
+              cf_stp * v(i, j, nz, n_stp) + cf_bak * v(i, j, nz, indx)) + dc0 * rv(i, j, nz)
+        v(i, j, nz, indx) = 0.5_rp * (Hz(i, j, nz) + Hz(i, j - 1, nz)) * v(i, j, nz, n_stp)
+        fck = 2.0_rp * dtau * (Akv(i, j, nz - 1) + Akv(i, j - 1, nz - 1)) / &
+             (Hz_fwd(i, j, nz) + Hz_fwd(i, j - 1, nz) + Hz_fwd(i, j, nz - 1) + Hz_fwd(i, j - 1, nz - 1))
+        wck = dc0 * 0.5_rp * (Wi(i, j, nz - 1) + Wi(i, j - 1, nz - 1))
+        cff = 1.0_rp / (0.5_rp * (Hz_fwd(i, j, nz) + Hz_fwd(i, j - 1, nz)) + &
+             fck - min(wck, 0.0_rp))
+        cfk = cff * (fck + max(wck, 0.0_rp))
+        col_cf(i, j, nz - 1) = cfk
+        dcp = cff * (am3 + dtau * svstr(i, j))
+        col_dc(i, j, nz) = dcp
+        do k = nz - 1, 2, -1
+          am3 = 0.5_rp * (Hz_bak(i, j, k) + Hz_bak(i, j - 1, k)) * ( &
+                cf_stp * v(i, j, k, n_stp) + cf_bak * v(i, j, k, indx)) + dc0 * rv(i, j, k)
+          v(i, j, k, indx) = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * v(i, j, k, n_stp)
+          fcm = 2.0_rp * dtau * (Akv(i, j, k - 1) + Akv(i, j - 1, k - 1)) / &
+               (Hz_fwd(i, j, k) + Hz_fwd(i, j - 1, k) + Hz_fwd(i, j, k - 1) + Hz_fwd(i, j - 1, k - 1))
+          wcm = dc0 * 0.5_rp * (Wi(i, j, k - 1) + Wi(i, j - 1, k - 1))
+          cff = 1.0_rp / (0.5_rp * (Hz_fwd(i, j, k) + Hz_fwd(i, j - 1, k)) + &
+                          fcm - min(wcm, 0.0_rp) + &
+                          fck + max(wck, 0.0_rp) - &
+                          cfk * (fck - min(wck, 0.0_rp)))
+          cfm = cff * (fcm + max(wcm, 0.0_rp))
+          col_cf(i, j, k - 1) = cfm
+          dcp = cff * (am3 + dcp * (fck - min(wck, 0.0_rp)))
+          col_dc(i, j, k) = dcp
+          fck = fcm; wck = wcm; cfk = cfm
+        enddo
+        am3 = 0.5_rp * (Hz_bak(i, j, 1) + Hz_bak(i, j - 1, 1)) * ( &
+              cf_stp * v(i, j, 1, n_stp) + cf_bak * v(i, j, 1, indx)) + dc0 * rv(i, j, 1)
+        v(i, j, 1, indx) = 0.5_rp * (Hz(i, j, 1) + Hz(i, j - 1, 1)) * v(i, j, 1, n_stp)
+        uk = (am3 + dcp * (fck - min(wck, 0.0_rp))) / &
+             (0.5_rp * (Hz_fwd(i, j, 1) + Hz_fwd(i, j - 1, 1)) + 0.5_rp * dtau * (r_D(i, j) + r_D(i, j - 1)) + &
+              fck + max(wck, 0.0_rp) - &
+              cfk * (fck - min(wck, 0.0_rp)))
+        v(i, j, 1, n_new) = uk
+        do k = 2, nz
+          uk = col_dc(i, j, k) + col_cf(i, j, k - 1) * uk
+          v(i, j, k, n_new) = uk
+        enddo
+      enddo
+    enddo
+    call imex_solve_stage(imex_stage_pred, dtau, cf_bak)   ! elliptic correction of u*, v*
+    if (river_on) call rivers_uv(RIV_PRE)
+    call u3dbc()
+    call v3dbc()
+    call imex_predictor_transport()                        ! Flx_pred -> FlxU, FlxV; We, Wi
+
+    ! ---- pass 2: tracer predictor with Flx_pred
+    call hz_bak_fwd(dtau, lim)
+    if (fuse_tracers(nrhs, n_new, indx)) then
+      call pre_tracers_horiz_fused(nrhs, n_stp, n_new, indx, dtau, cf_stp, cf_bak)
+    else
+    do itrc = 1, nt
+      call horiz_c4_fluxes(nrhs, itrc)
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = 1, ny
+        do i = 1, nx
+          do k = 1, nz
+            t(i, j, k, n_new, itrc) = Hz_bak(i, j, k) * ( &
+                 cf_stp * t(i, j, k, n_stp, itrc) + cf_bak * t(i, j, k, indx, itrc)) - &
+                 dtau * pm(i, j) * pn(i, j) * (wrk3a(i + 1, j, k) - wrk3a(i, j, k) + &
+                                               wrk3b(i, j + 1, k) - wrk3b(i, j, k))
+            t(i, j, k, indx, itrc) = Hz(i, j, k) * t(i, j, k, n_stp, itrc)
+          enddo
+        enddo
+      enddo
+    enddo
+    endif
+    if (river_on) call rivers_ts(RIV_PRE, n_new, dtau, 1_ip, nt)
+    fused_v = fuse_tracers(nrhs, n_new, n_new)
+    if (fused_v) call pre_tracers_vert_fused(nrhs, n_new, dtau)
+    do itrc = 1, nt
+      if (.not. fused_v) then
+      call vert_c4_fluxes(nrhs, itrc)
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = 1, ny
+        do i = 1, nx
+          do k = 1, nz
+            t(i, j, k, n_new, itrc) = t(i, j, k, n_new, itrc) - dtau * pm(i, j) * pn(i, j) * &
+                                     (col_wc(i, j, k) - col_wc(i, j, k - 1))
+          enddo
+        enddo
+      enddo
+      endif
+      iAkt = min(itrc, 2)
+      call implicit_tracer_columns(nx, ny, nz, n_new, itrc, iAkt, dtau, .true.)
+    enddo
+    if (ntp > 0) call passive_predictor(dtau, cf_stp, cf_bak, n_stp, n_new, indx)
+    call t3dbc(itemp)
+    call t3dbc(isalt)
+    if (ntp > 0) call passive_t3dbc()
+    call hg_begin()
+    call hg_add(F_U, nnew)
+    call hg_add(F_V, nnew)
+    call hg_add(F_T, nnew, itemp)
+    call hg_add(F_T, nnew, isalt)
+    call hg_end()
+    if (ntp > 0) then
+      if (tp_overlap_on(1)) then
+        call halo_tp_start(tp, ntp, nnew)
+      else
+        call halo_fill_3d_tp(tp, ntp, nnew)
+      endif
+    endif
+  end subroutine pre_step3d_imex
+
+  subroutine hz_bak_fwd(dtau, lim)
+    ! Hz_bak, Hz_fwd = Hz +- dtau/2 pm pn div(FlxU, FlxV, We + Wi) (the
+    ! stock pre_step3d kernel)
+    real(rp), intent(in) :: dtau
+    integer(ip), intent(in) :: lim
+    integer(ip) :: i, j, k, nx, ny, nz, lm
+    real(rp) :: FlxDiv, dt_l
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    lm = lim; dt_l = dtau
+#ifdef USE_CUDA
+    !$cuf kernel do(3) <<<*,(32,16,1)>>>
+#endif
+    do k = 1, nz
+      do j = 0, ny
+        do i = 0, nx
+          if (lm > 0) then; if (colact(i, j) == 0) cycle; end if
+          FlxDiv = 0.5_rp * dt_l * pm(i, j) * pn(i, j) * ( &
+                   FlxU(i + 1, j, k) - FlxU(i, j, k) + &
+                   FlxV(i, j + 1, k) - FlxV(i, j, k) + &
+                   We(i, j, k) + Wi(i, j, k) - We(i, j, k - 1) - Wi(i, j, k - 1))
+          Hz_bak(i, j, k) = Hz(i, j, k) + FlxDiv
+          Hz_fwd(i, j, k) = Hz(i, j, k) - FlxDiv
+        enddo
+      enddo
+    enddo
+  end subroutine hz_bak_fwd
 
   subroutine set_bottom_drag()
     ! CPU pre_step3d "rd" -> r_D at rho points from bottom-level u,v(nstp):

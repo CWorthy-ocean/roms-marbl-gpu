@@ -16,6 +16,7 @@ module step3d_uv_mod
   use rivers_mod, only: river_on, rivers_uv, RIV_COR
   use arch_mod, only: sync_arch
   use geom, only: dump_rufrc_build, dump_rv3d
+  use imex_igw, only: imex_on, wflx_corr, u_nm1, v_nm1
   implicit none
   private
   public :: step3d_uv1
@@ -489,6 +490,102 @@ contains
     flush(6)
   end subroutine dump_cpl2_b
 
+  subroutine step3d_uv2_couple2_imex(j_ur0, j_ur1, i_ur1, j_vr1, i_vr0, i_vr1, lim)
+    ! step3d_uv2's second coupling with the IMEX_IGW corrector transport
+    ! (CPU step3d_uv2 under IMEX_IGW): Flx_corr = mu Flx* + Hz_u dn_u
+    ! (theta_c u^n+1 + nu u^n + rho u^n-1), weights wflx_corr on (u^n+1,
+    ! Flx*, u^n, u^n-1); otherwise the stock kernels.
+    integer(ip), intent(in) :: j_ur0, j_ur1, i_ur1, j_vr1, i_vr0, i_vr1, lim
+    integer(ip) :: i, j, k, nz, n_new, n_stp, kn, lm
+    real(rp) :: Dcol, uint, mis_u, mis_f, flx_int, flx_k, hz_dn, u_k, w1, w2, w3, w4
+    nz = decomp%nz
+    n_new = nnew
+    n_stp = nstp
+    kn = knew
+    lm = lim
+    w1 = wflx_corr(1); w2 = wflx_corr(2); w3 = wflx_corr(3); w4 = wflx_corr(4)
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = j_ur0, j_ur1
+      do i = 1, i_ur1
+        if (lm > 0) then; if (colact(i, j) == 0) cycle; end if
+        if (umask(i, j) + riv_umask(i, j) > 0.5_rp) then
+          Dcol = 0.0_rp
+          uint = 0.0_rp
+          do k = 1, nz
+            hz_dn = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * dn_u(i, j)
+            Dcol = Dcol + hz_dn
+            uint = uint + hz_dn * u(i, j, k, n_new)
+          enddo
+          ubar(i, j, kn) = DU_avg1(i, j) / Dcol
+          mis_u = (uint - DU_avg1(i, j)) / Dcol
+          ! shift and flux in one pass (hz_dn recomputed, same expression)
+          flx_int = 0.0_rp
+          do k = 1, nz
+            hz_dn = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * dn_u(i, j)
+            u_k = apply_mask((u(i, j, k, n_new) - mis_u), (umask(i, j)))
+            u(i, j, k, n_new) = u_k
+            flx_k = w2 * FlxU(i, j, k) + hz_dn * &
+                    (w1 * u_k + w3 * u(i, j, k, n_stp) + w4 * u_nm1(i, j, k))
+            col_dc(i, j, k) = flx_k
+            flx_int = flx_int + flx_k
+          enddo
+          mis_f = (flx_int - DU_avg2(i, j)) / Dcol
+          do k = 1, nz
+            FlxU(i, j, k) = col_dc(i, j, k) - (0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * dn_u(i, j)) * mis_f
+          enddo
+        else
+          ubar(i, j, kn) = 0.0_rp
+          do k = 1, nz
+            u(i, j, k, n_new) = 0.0_rp
+            FlxU(i, j, k) = 0.0_rp
+          enddo
+        endif
+      enddo
+    enddo
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, j_vr1
+      do i = i_vr0, i_vr1
+        if (lm > 0) then; if (colact(i, j) == 0) cycle; end if
+        if (vmask(i, j) + riv_vmask(i, j) > 0.5_rp) then
+          Dcol = 0.0_rp
+          uint = 0.0_rp
+          do k = 1, nz
+            hz_dn = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * dm_v(i, j)
+            Dcol = Dcol + hz_dn
+            uint = uint + hz_dn * v(i, j, k, n_new)
+          enddo
+          vbar(i, j, kn) = DV_avg1(i, j) / Dcol
+          mis_u = (uint - DV_avg1(i, j)) / Dcol
+          ! shift and flux in one pass (hz_dn recomputed, same expression)
+          flx_int = 0.0_rp
+          do k = 1, nz
+            hz_dn = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * dm_v(i, j)
+            u_k = apply_mask((v(i, j, k, n_new) - mis_u), (vmask(i, j)))
+            v(i, j, k, n_new) = u_k
+            flx_k = w2 * FlxV(i, j, k) + hz_dn * &
+                    (w1 * u_k + w3 * v(i, j, k, n_stp) + w4 * v_nm1(i, j, k))
+            col_dc(i, j, k) = flx_k
+            flx_int = flx_int + flx_k
+          enddo
+          mis_f = (flx_int - DV_avg2(i, j)) / Dcol
+          do k = 1, nz
+            FlxV(i, j, k) = col_dc(i, j, k) - (0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * dm_v(i, j)) * mis_f
+          enddo
+        else
+          vbar(i, j, kn) = 0.0_rp
+          do k = 1, nz
+            v(i, j, k, n_new) = 0.0_rp
+            FlxV(i, j, k) = 0.0_rp
+          enddo
+        endif
+      enddo
+    enddo
+  end subroutine step3d_uv2_couple2_imex
+
   subroutine step3d_uv2()
     integer(ip) :: i, j, k, nx, ny, nz, n_new, n_stp, kn
     integer(ip) :: i_u0, i_u1, j_v0, i_ur1, j_vr1, j_ur0, j_ur1, i_vr0, i_vr1
@@ -713,6 +810,10 @@ contains
     ! its fluxes. River faces (umask = 0, riv_umask = 1) are coupled as
     ! the CPU does on every face: ubar = DU_avg1/D and the flux correction,
     ! with u(nnew) masked to 0 (rivers_uv sets it afterwards).
+    if (imex_on) then
+      ! IMEX_IGW: the tracer transport with the IMEX weights (wflx_corr)
+      call step3d_uv2_couple2_imex(j_ur0, j_ur1, i_ur1, j_vr1, i_vr0, i_vr1, lim)
+    else
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
@@ -803,6 +904,7 @@ contains
         endif
       enddo
     enddo
+    endif
     if (probe_c) then
       call sync_arch()
       if (cpl_prb(33) == 1.0_rp) call dump_cpl2_b('u', ip4, jp4, cpl_prb(20), cpl_prb(21), &

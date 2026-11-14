@@ -451,7 +451,8 @@ contains
     ! caller handles the self-wrap). The caller has synchronized the stream
     ! that packed the send buffers. Tags 321-324 (direction of travel),
     ! distinct from the other exchanges. (The implicit free surface's
-    ! one-cell rings without corners, fs_data ring.)
+    ! one-cell rings without corners, fs_data ring; IMEX's one-cell
+    ! exchange of the stage solution, imex_igw's pf_ring1_8.)
     integer(ip), intent(in) :: nbr(4)
     integer,     intent(in) :: nw, ns
 #ifdef USE_CUDA

@@ -10,6 +10,7 @@ module prsgrd_mod
   use halo_mod
   use arch_mod, only: sync_arch
   use time_state
+  use imex_igw, only: imex_on, imex_pg_store_combine
   implicit none
   private
   public :: prsgrd
@@ -463,6 +464,9 @@ contains
       enddo
     endif
 
+    ! IMEX_IGW: store this PG as the stage's level and replace ru, rv by the
+    ! weighted explicit combination (CPU: end of prsgrd_tile)
+    if (imex_on) call imex_pg_store_combine(i_ru_lo, i_ru_hi, j_rv_lo, j_rv_hi)
     call hg_begin()
     call hg_add(F_RU)
     call hg_add(F_RV)
