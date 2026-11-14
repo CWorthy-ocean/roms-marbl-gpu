@@ -49,7 +49,7 @@ contains
     nx = decomp%nx
     ny = decomp%ny
     nz = decomp%nz
-    HalfGRho = 0.5_rp * g / rho0
+    HalfGRho = 0.5_rp * g / rho0_case
     do_tides = pot_tides
     edge_w = decomp%edge_w
     edge_e = decomp%edge_e
@@ -544,7 +544,7 @@ contains
     ny = decomp%ny
     i = iprb_pt(1)
     if (i < 1 .or. i > decomp%nx) return
-    HalfGRho = 0.5_rp * g / rho0
+    HalfGRho = 0.5_rp * g / rho0_case
     js = (/ ny - 1, ny /)
     do jj = 1, 2
       j = js(jj)

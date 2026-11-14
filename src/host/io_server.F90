@@ -270,6 +270,10 @@ contains
     pend(cur)%j0f(iv) = int(decomp%j0)
     if (present(di)) pend(cur)%i0f(iv) = pend(cur)%i0f(iv) + di
     if (present(dj)) pend(cur)%j0f(iv) = pend(cur)%j0f(iv) + dj
+    ! A periodic direction has no boundary row in the file: interior rho point
+    ! 1 (di = 1) is file index decomp%i0, like u point 1 (di = 0).
+    if (decomp%periodic_x .and. present(di)) pend(cur)%i0f(iv) = int(decomp%i0) + max(di - 1, 0)
+    if (decomp%periodic_y .and. present(dj)) pend(cur)%j0f(iv) = int(decomp%j0) + max(dj - 1, 0)
     pend(cur)%nfloat = pend(cur)%nfloat + n
   end subroutine add_var
 

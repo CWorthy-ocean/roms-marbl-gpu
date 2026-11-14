@@ -69,8 +69,8 @@ contains
     ! the exchange's work_stream kernels; no host sync needed.)
     lim = dry_lim(G_EOS)
 
-    cffg = g / rho0
-    cff1 = 1.0_rp / rho0
+    cffg = g / rho0_case
+    cff1 = 1.0_rp / rho0_case
 #ifdef USE_CUDA
     ! Scalar call arguments are passed as parenthesized expressions: a loop
     ! scalar passed by reference makes the CUF compiler treat it as shared

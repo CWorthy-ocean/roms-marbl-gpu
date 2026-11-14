@@ -135,8 +135,10 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   kernel races with it unless `sync_arch()` comes first. A kernel is better,
   since host access also migrates pages. A run that is not reproducible but is
   under `CUDA_LAUNCH_BLOCKING=1` has such a race.
-- `rho0` is a build constant (`-DROMS_RHO0`, default 1000). A namelist with
-  another value stops at start-up.
+- `rho0` (`&rho0_settings`) is read at run time into `formulas`' managed
+  `rho0` (`case_io` `set_rho0`), which the EOS and pressure functions read
+  in kernels. It is not a `parameter`: do not use it in constant
+  expressions.
 - Diagnostic probes print in the first steps at fixed points of the
   development grid: set `ROMS_GPU_PROBES=0` (`tools/submit_gpu.sh` does). CUDA
   graphs (`ROMS_GPU_GRAPH=1`) damp zeta; keep them off for validation.
