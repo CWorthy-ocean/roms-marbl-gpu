@@ -354,9 +354,9 @@ v0.1.2-beta, bit for bit.
   tracers are transported, mixed and forced once per window from the
   transports summed over the window, as UCLA ROMS does it, with its checks,
   restart rule, messages and `BGCSUB` window diagnostics. Rivers, CDR
-  releases, CDR_LITE, CFLX_CORR and passive tracers are supported; the IMEX
-  internal-wave step, `bgc_subcycle_pos` and `bgc_subcycle_diag >= 2` stop
-  the run at start-up. Measured: Pac (8 A100) 1.37x faster at k = 4 (window
+  releases, CDR_LITE, CFLX_CORR and passive tracers are supported;
+  `bgc_subcycle_pos` and `bgc_subcycle_diag >= 2` stop the run at
+  start-up. Measured: Pac (8 A100) 1.37x faster at k = 4 (window
   of 4 steps with MARBL every 4) and 1.20x at k = 2, MiniPac 1.28x and
   1.18x. Off by default; runs without it are unchanged, bit for bit. See
   "BGC tracer subcycling" below.
@@ -531,12 +531,11 @@ bit for bit.
   k = 4: 1.28x).
 - **Supported:** rivers, CDR releases in all four modes, the CDR_LITE and
   CFLX_CORR surface fluxes, any number of passive tracers with or without
-  MARBL, split and implicit free surface, any tiling.
-- **Not on the GPU yet** (the run stops at start-up): the IMEX
-  internal-wave step together with subcycling (planned as a follow-up),
-  the positivity limiter `bgc_subcycle_pos` and its test
-  `bgc_subcycle_diag >= 2`. UPSCALING output and `ub_tune` are refused, as
-  in UCLA ROMS.
+  MARBL, split and implicit free surface, the IMEX internal-wave step
+  (`&imex_igw_settings`, 'modal' or 'fixed' open boundary), any tiling.
+- **Not on the GPU yet** (the run stops at start-up): the positivity
+  limiter `bgc_subcycle_pos` and its test `bgc_subcycle_diag >= 2`.
+  UPSCALING output and `ub_tune` are refused, as in UCLA ROMS.
 - **Diagnostics:** `bgc_subcycle_diag = 1` prints UCLA ROMS's `BGCSUB` and
   `BGCSUBNEG` lines for every window (Courant numbers, sub-passes,
   continuity, the shadow uniform tracer, the worst per-tracer budget

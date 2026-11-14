@@ -51,7 +51,6 @@ module bgc_subcycle_mod
   use rivers_mod, only: river_on, rivers_win_faces, rivers_win_acc
   use cdr_src_mod, only: cdr_on, cdr_win_nq, cdr_win_cols, cdr_win_acc, cdr_win_tr3d
   use cdr_lite_mod, only: cdrl_on, cdrl_psf, psf_cflx
-  use imex_igw, only: imex_on
   use bgc_window_mod, only: WLEV, bgcw_stats, bgcw_hcoef, bgcw_inner, bgcw_outer, bgcw_factor, &
        bgcw_vertical, bgcw_t3dbc, bgcw_reduce, bgcw_vs, bgcw_edge_r, bgcw_subq, bgcw_edge_tp, bgcw_rcol, bgcw_rbits
   use comm_mod, only: comm_rank, comm_allreduce_max, comm_allreduce_min, comm_allreduce_sum, comm_abort
@@ -199,11 +198,6 @@ contains
          'bgc_subcycle_diag >= 2 (the positivity test) is not on the GPU yet')
     if (pp /= rp) call raise('bgcsub_init', &
          'bgc_physics_subcycle needs double-precision passive tracers (a build with -DPASSIVE_FP64)')
-    ! The IMEX internal-wave step (&imex_igw_settings) came to UCLA ROMS
-    ! after the subcycling reference (dev 5c8034bf), so the combination has
-    ! no CPU reference to port from or check against.
-    if (imex_on) call raise('bgcsub_init', &
-         'bgc_physics_subcycle with the IMEX internal-wave step (&imex_igw_settings) is not on the GPU yet')
     if (decomp%nz > COL_KMAX) call raise('bgcsub_init', 'bgc_physics_subcycle: nz exceeds COL_KMAX')
     if (nerr > 0) error stop 'bgc_subcycle: bgc_physics_subcycle settings rejected (see above)'
 
@@ -484,6 +478,9 @@ contains
     ! surface fluxes of the passives (cdrl_psf: CFLX_CORR and CDR_LITE),
     ! the river-face tracer transports (RUA), the CDR release contents
     ! (CPA, C3; CPV) and, for the shadow tracer, the rain volume dt*swflx.
+    ! With IMEX_IGW these are IMEX's corrector transports (step3d_uv2's
+    ! wflx_corr fluxes, 'modal' open faces included), as on the CPU
+    ! (ucla-roms 809aa24a main.F90: bgcsub_accumulate before step3d_t).
     integer(ip) :: i, j, k, is, ie, js, je, nz, c, m, n, nw
     real(rp) :: dtl
     if (.not. bgc_physics_subcycle) return
