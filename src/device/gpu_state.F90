@@ -194,6 +194,23 @@ module gpu_state
 #endif
   public :: build_tp_columns
 
+  ! Cross-shaped region of the BGC subcycling window (bgc_window_mod, built
+  ! by build_tp_cross only when bgc_physics_subcycle is on): the interior
+  ! wet columns (xc 1..nwet, = tp columns 1..nwet) followed by the stored
+  ! columns of the halo strips, (i in ilo..0 or nx+1..ihi, j in 1..ny) and
+  ! (i in 1..nx, j in jlo..0 or ny+1..jhi), where ilo..ihi, jlo..jhi are
+  ! the 2-point halo, or the boundary row at a physical edge (the CPU's
+  ! window ranges). The window's inner operators are formed there.
+  ! xc_nb(1:8, n) = tp columns of (i-2,j), (i-1,j), (i+1,j), (i+2,j),
+  ! (i,j-2), (i,j-1), (i,j+1), (i,j+2) (0: unstored or outside the arrays).
+  integer(ip), public :: nxc = 0
+#ifdef USE_CUDA
+  integer(ip), device, allocatable, public :: xc_col(:), xc_i(:), xc_j(:), xc_nb(:,:)
+#else
+  integer(ip), allocatable, public :: xc_col(:), xc_i(:), xc_j(:), xc_nb(:,:)
+#endif
+  public :: build_tp_cross, window_ranges
+
   ! Lateral-mixing skip (2026-10-08). Harmonic viscosity / diffusion is zero
   ! where visc2_r, visc2_p and diff2 are zero (on Pac everywhere but the
   ! sponge band): the update of a cell is then +-0 exactly. mixact(i, j) = 1
@@ -348,6 +365,65 @@ contains
     tpnb = nb
     deallocate(nb)
   end subroutine build_tp_columns
+
+  subroutine window_ranges(ilo, ihi, jlo, jhi)
+    ! The BGC window's valid cell ranges (UCLA ROMS bgcsub_window_tile):
+    ! the 2-point halo, or the boundary row at a physical edge (the cells
+    ! beyond are extrapolated). decomp%edge_* is false on a periodic side.
+    integer(ip), intent(out) :: ilo, ihi, jlo, jhi
+    ilo = -1; ihi = decomp%nx + 2; jlo = -1; jhi = decomp%ny + 2
+    if (decomp%edge_w) ilo = 0
+    if (decomp%edge_e) ihi = decomp%nx + 1
+    if (decomp%edge_s) jlo = 0
+    if (decomp%edge_n) jhi = decomp%ny + 1
+  end subroutine window_ranges
+
+  subroutine build_tp_cross()
+    ! Called by bgcsub_init (after build_tp_columns). Host loop.
+    integer(ip) :: i, j, n, m, is, ie, js, je, nx, ny, ilo, ihi, jlo, jhi
+    integer(ip), allocatable :: hc(:), hi(:), hj(:), hnb(:,:)
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    nx = decomp%nx; ny = decomp%ny
+    if (.not. allocated(tpcol_h)) error stop 'build_tp_cross: build_tp_columns first'
+    call window_ranges(ilo, ihi, jlo, jhi)
+    m = nwet + 2 * (ny * 4 + nx * 4)
+    allocate(hc(max(m, 1)), hi(max(m, 1)), hj(max(m, 1)), hnb(8, max(m, 1)))
+    hnb = 0
+    n = 0
+    do j = 1, ny
+      do i = 1, nx
+        if (rmask(i, j) > 0.5_rp) then
+          n = n + 1; hc(n) = tpcol_h(i, j); hi(n) = i; hj(n) = j
+        endif
+      enddo
+    enddo
+    if (n /= nwet) error stop 'build_tp_cross: wet count differs from the wet list'
+    do j = jlo, jhi
+      do i = ilo, ihi
+        if (i >= 1 .and. i <= nx .and. j >= 1 .and. j <= ny) cycle      ! interior
+        if (.not. ((j >= 1 .and. j <= ny) .or. (i >= 1 .and. i <= nx))) cycle   ! corner
+        if (tpcol_h(i, j) == 0) cycle
+        n = n + 1; hc(n) = tpcol_h(i, j); hi(n) = i; hj(n) = j
+      enddo
+    enddo
+    do m = 1, n
+      i = hi(m); j = hj(m)
+      if (i - 2 >= is) hnb(1, m) = tpcol_h(i - 2, j)
+      if (i - 1 >= is) hnb(2, m) = tpcol_h(i - 1, j)
+      if (i + 1 <= ie) hnb(3, m) = tpcol_h(i + 1, j)
+      if (i + 2 <= ie) hnb(4, m) = tpcol_h(i + 2, j)
+      if (j - 2 >= js) hnb(5, m) = tpcol_h(i, j - 2)
+      if (j - 1 >= js) hnb(6, m) = tpcol_h(i, j - 1)
+      if (j + 1 <= je) hnb(7, m) = tpcol_h(i, j + 1)
+      if (j + 2 <= je) hnb(8, m) = tpcol_h(i, j + 2)
+    enddo
+    nxc = n
+    if (allocated(xc_col)) deallocate(xc_col, xc_i, xc_j, xc_nb)
+    allocate(xc_col(max(n, 1)), xc_i(max(n, 1)), xc_j(max(n, 1)), xc_nb(8, max(n, 1)))
+    xc_col = hc(1:max(n, 1)); xc_i = hi(1:max(n, 1)); xc_j = hj(1:max(n, 1))
+    xc_nb = hnb(:, 1:max(n, 1))
+    deallocate(hc, hi, hj, hnb)
+  end subroutine build_tp_cross
 
   subroutine open_edge_codes(west, east, south, north)
     ! Edge codes of this tile's sides for the horizontal tracer fluxes:
