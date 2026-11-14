@@ -13,8 +13,10 @@ module cdr_out
   ! (c0 = 0 on the window's first step); the fields MARBL changes only on
   ! its steps are added once, right after the MARBL step that computed
   ! them, weighted by the steps since the last addition (ucla-roms #400),
-  ! and at the write; at the write sum/navg. Not on the GPU yet:
-  ! cdr_monthly_averages (stops at start-up).
+  ! and at the write; at the write sum/navg. As the CPU's precheck,
+  ! output_period_cdr must then be a whole multiple of the MARBL timestep
+  ! (stops at start-up). Not on the GPU yet: cdr_monthly_averages (stops
+  ! at start-up).
   use kinds
   use his_io, only: output_fname, refdatestr
   use decomp_mod
@@ -99,6 +101,20 @@ contains
     if (.not. marbl_on) error stop 'init_cdr_output: the CDR output needs MARBL'
     if (cdr_monthly_averages) error stop 'init_cdr_output: cdr_monthly_averages is not on the GPU model yet'
     if (nrpf_cdr < 1) error stop 'init_cdr_output: nrpf_cdr must be >= 1'
+    ! The CPU's precheck check_avg_ends_on_marbl_step (ucla-roms #400): MARBL
+    ! updates its fluxes only on MARBL steps and applies them for the whole
+    ! MARBL timestep, so only a window that ends on a MARBL step averages
+    ! the fluxes MARBL applied in it, and only then is a restart at a
+    ! window end exact.
+    if (wrt_cdr_avg) then
+      if (mod(output_period_cdr, dt * real(marbl_timestep_ratio, rp)) /= 0.0_rp) then
+        if (comm_rank() == 0) write(*,'(a,es12.4,a,es12.4,a)') 'CDR_OUTPUT_SETTINGS: output_period_cdr = ', &
+             output_period_cdr, ' s is not a whole multiple of the MARBL timestep ROMS uses (marbl_timestep '// &
+             'rounded to a multiple of dt) = ', dt * real(marbl_timestep_ratio, rp), ' s. An averaging window '// &
+             'must end on a MARBL step to average the fluxes MARBL applied in it and to give bit-identical restarts.'
+        error stop 'init_cdr_output: output_period_cdr is not a whole multiple of the MARBL timestep'
+      endif
+    endif
     ialk = pidx('ALK'); idic = pidx('DIC'); ialka = pidx('ALK_ALT_CO2'); idica = pidx('DIC_ALT_CO2')
     ipo4 = pidx('PO4'); isio3 = pidx('SiO3')
     ispchl = pidx('spChl'); idiatchl = pidx('diatChl'); idiazchl = pidx('diazChl')
@@ -298,7 +314,8 @@ contains
     ! its flux to the tracers on that step for the whole marbl_timestep,
     ! so a window that ends on a MARBL step averages exactly the flux
     ! behind its DIC change, and no average needs held values from before
-    ! a restart (a restart file does not carry them).
+    ! a restart (a restart file does not carry them). Every window ends on
+    ! a MARBL step (init_cdr_output), so the call in finalize adds nothing.
     integer :: i, j, k, nz, i0, i1, j0, j1
     real(rp) :: c0, w
     if (nheld == 0) return
