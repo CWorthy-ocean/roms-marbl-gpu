@@ -21,6 +21,8 @@ module imex_igw
   !   [imex_solve_stage(corr)];
   ! - step3d_uv2's tracer transport with the IMEX weights (wflx_corr, u_nm1);
   ! - t3dmix from t^n;
+  ! - lateral mixing as a split step from the corrected state (imex_mix_split,
+  !   visc3d.F90);
   ! - the end-of-step shift of the stored levels [imex_shift_levels].
   ! Each stage solve: per-step coefficients [imex_step_setup, imex_adj_setup]
   ! from a reference buoyancy b_ref [imex_bref_build] with the 'coef' N2
@@ -31,7 +33,7 @@ module imex_igw
   !
   ! Supported namelist values: the defaults, plus imex_solver_enabled,
   ! imex_allow_explicit (with the weights it allows), the weights, the
-  ! tolerances, imex_maxit, imex_verbose 0/1/2,
+  ! tolerances, imex_maxit, imex_verbose 0/1/2, imex_mix_split 0/1,
   ! imex_n2_ref, imex_n2_taper, imex_bref_hours, imex_warm 0/1,
   ! imex_setup_lag 0/1, and the solver paths
   ! imex_pcg_start 0 (the CPU's imex_pcg_warm/imex_pcg) or imex_pcg_start 2/3
@@ -143,6 +145,12 @@ module imex_igw
   ! imex_redu (CPU: rank-count-independent integer-digit sums) read, only 0 on the GPU
   ! (imex_gpu_redu = 1 is the GPU's deterministic sum within a device)
   integer     :: imex_redu = 0
+  ! CPU 1b3132bd, default 1 since 903b3aca (IMEX_SPONGE_INSTABILITY.md): lateral mixing as a split step
+  ! from the corrected state, 1 visc3d's Laplacian from u^n plus the baroclinic part of this step's
+  ! corrected increment (visc3d.F90); 0 as before (visc3d from u^n added after the implicit
+  ! correction). With the additive form the explicit Laplacian of a sponge band made the IMEX step
+  ! unstable at C_igw > ~2.
+  integer, public, protected :: imex_mix_split   ! default 1: set in imex_read_namelist
 
   ! Former keys, fixed at their former defaults (removed from the namelist 2026-11-13, UCLA ROMS
   ! IMEX_KEY_TRIM): the N2 regularization of the diagonal [s-2], the b_ref smoothing passes along
@@ -166,7 +174,7 @@ module imex_igw
        imex_verbose, imex_solver_enabled, imex_allow_explicit, imex_selftest, &
        imex_n2_ref, imex_n2_taper, imex_warm, &
        imex_bref_hours, imex_setup_lag, imex_pcg_start, imex_pcg_fused, imex_solver_prec, imex_stage_fused, &
-       imex_redu, &
+       imex_redu, imex_mix_split, &
        imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep
 
   ! Weights (set_derived_weights): regular step and first step of a run
@@ -282,6 +290,7 @@ contains
     character(len=1024) :: found
     talk = (comm_world_rank() == 0)
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
+    imex_mix_split = 1                   ! the default (see the declaration)
     rewind(unit)
     msg = ''
     read(unit, nml=imex_igw_settings, iostat=ios, iomsg=msg)
@@ -392,6 +401,7 @@ contains
       call bad('imex_tol_pred, imex_tol_corr and imex_maxit must be positive')
     if (imex_n2_ref < 0.0_rp .or. imex_n2_taper < 0.0_rp) call bad('imex_n2_ref and imex_n2_taper must be >= 0')
     if (imex_verbose < 0 .or. imex_verbose > 2) call bad('imex_verbose must be 0, 1 or 2')
+    if (imex_mix_split < 0 .or. imex_mix_split > 1) call bad('imex_mix_split must be 0 or 1')
     if (imex_warm < 0 .or. imex_warm > 1) call bad('imex_warm must be 0 or 1')
     if (imex_bref_hours <= 0.0_rp) call bad('imex_bref_hours must be positive')
     if (imex_setup_lag < 0 .or. imex_setup_lag > 1) call bad('imex_setup_lag must be 0 or 1')
@@ -478,7 +488,7 @@ contains
          // ' imex_solver_prec = 8'
     write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_gpu_redu =', imex_gpu_redu, &
          '  imex_gpu_stage =', merge(1, 0, stage_on), '  imex_gpu_sweep =', merge(1, 0, sweep_on)
-    write(*,'(3x,a,i2)') 'imex_redu =', imex_redu
+    write(*,'(3x,a,i2,a,i2)') 'imex_redu =', imex_redu, '  imex_mix_split =', imex_mix_split
     if (imex_gpu_stage == 1 .and. .not. stage_on) write(*,'(3x,a)') 'imex_gpu_stage = 1 needs the fused solve,' &
          // ' imex_warm = 1 and theta_p, theta_c > 0: the session-2 stage is used'
     write(*,*)
