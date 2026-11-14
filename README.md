@@ -242,6 +242,21 @@ v0.1.2-beta, bit for bit.
   files are already cached. Without a spare rank on every node the run has
   no reader and says so.
 
+- Averaged MARBL output as UCLA ROMS writes it from 0.13.0 (ucla-roms
+  #400). `_bgc_avg` with `wrt_bgc_his = .false.`: the start-up state is
+  no longer a sample of the first window, so each record averages the
+  steps of the period that ends at its time. Before, the initial state
+  was averaged in and each record was written one step early.
+  `_cdr` averages (`wrt_cdr_avg`) with `marbl_timestep` > `dt`: the
+  fields MARBL updates only on its steps (pH, CO3, the saturation fields
+  and depths, FG_CO2, pCO2SURF and their ALT_CO2 twins) are added right
+  after the MARBL step that computed them, for the steps since the
+  previous MARBL step. Before, they were added for the steps after it,
+  and the first record after a restart differed from an uninterrupted
+  run's. `output_period_cdr` must now be a whole multiple of the MARBL
+  timestep, or the run stops at start-up, as in UCLA ROMS. Runs without
+  these outputs, `_bgc_avg` with `wrt_bgc_his = .true.`, and `_cdr` with
+  `marbl_timestep` = `dt` are unchanged, bit for bit.
 - Namelists written from UCLA ROMS's current template (after 0.14.0) run:
   `&bgc_settings` `bgc_physics_subcycle` and `bgc_physics_timestep` (and the
   testing keys `bgc_subcycle_pos`, `bgc_subcycle_diag`) and
