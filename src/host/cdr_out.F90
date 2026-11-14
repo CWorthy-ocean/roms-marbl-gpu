@@ -11,9 +11,10 @@ module cdr_out
   ! cdr_source) and the averaged thickness-weighted ALK/DIC.
   ! With wrt_cdr_avg the CPU's sums: every step after the step c0*sum + x
   ! (c0 = 0 on the window's first step); the fields MARBL changes only on
-  ! its steps are added once, weighted by the steps they were held, before
-  ! each MARBL step and at the write; at the write sum/navg. Not on the GPU
-  ! yet: cdr_monthly_averages (stops at start-up).
+  ! its steps are added once, right after the MARBL step that computed
+  ! them, weighted by the steps since the last addition (ucla-roms #400),
+  ! and at the write; at the write sum/navg. Not on the GPU yet:
+  ! cdr_monthly_averages (stops at start-up).
   use kinds
   use his_io, only: output_fname, refdatestr
   use decomp_mod
@@ -291,7 +292,13 @@ contains
 
   subroutine sum_marbl()
     ! The CPU's accumulate_marbl_fields: the MARBL-held fields, weighted by
-    ! the steps they were held (c0 = 0 on the window's first addition).
+    ! the steps since the last addition (c0 = 0 on the window's first
+    ! addition). Called right after each MARBL step, the values that step
+    ! computed stand for the steps since the previous one: MARBL applies
+    ! its flux to the tracers on that step for the whole marbl_timestep,
+    ! so a window that ends on a MARBL step averages exactly the flux
+    ! behind its DIC change, and no average needs held values from before
+    ! a restart (a restart file does not carry them).
     integer :: i, j, k, nz, i0, i1, j0, j1
     real(rp) :: c0, w
     if (nheld == 0) return
@@ -379,8 +386,8 @@ contains
       call sum_step(c0)
       if (wsrc) call sum_sources()
       nheld = nheld + 1
-      ! the MARBL-held fields before the next MARBL step changes them
-      if (modulo(iic + 1, marbl_timestep_ratio) == 0) call sum_marbl()
+      ! add the MARBL fields this step computed (see sum_marbl)
+      if (modulo(iic, marbl_timestep_ratio) == 0) call sum_marbl()
       if (writing) call finalize()
     endif
     if (writing) then
