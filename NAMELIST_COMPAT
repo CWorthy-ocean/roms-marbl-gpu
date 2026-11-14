@@ -204,6 +204,14 @@
 # removed option, or with other boundary settings (e.g. 'fixed' to
 # 'modal'), is read as an inexact restart with a note.
 #
+# Averaged MARBL output, as UCLA ROMS from 0.13.0 (#400): with
+# &cdr_output_settings do_cdr_output and wrt_cdr_avg, output_period_cdr
+# must be a whole multiple of the MARBL timestep the run uses
+# (marbl_timestep rounded down to a multiple of dt), or the run stops at
+# start-up with UCLA ROMS's message. UCLA ROMS makes the same check of
+# &bgc_settings output_period_bgc_avg_dia; roms_gpu refuses
+# wrt_bgc_dia_avg (feature_guard). Up to v0.1.3-beta any period ran.
+#
 # Half-resolution forcing: interp_bulk_frc, interp_flux_frc
 # (&surf_frc_settings) and interp_bgc_frc (&bgc_settings) are read but not
 # used; roms_gpu takes a forcing field as half resolution from its shape
