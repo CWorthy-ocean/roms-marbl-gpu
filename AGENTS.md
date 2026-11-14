@@ -46,7 +46,11 @@ make gpu FC_GPU=nvfortran \
   Compile a new module with external MPI calls on its own, like `comm.F90`.
 - Rank layout: `python3 tools/gpu_layout.py namelist.nml`, or submit with
   `tools/submit_gpu.sh examples/minipac/run_minipac.pbs` (PBS). Set
-  `MPICH_GPU_SUPPORT_ENABLED=1` only with a CUDA-aware MPI.
+  `MPICH_GPU_SUPPORT_ENABLED=1` only with a CUDA-aware MPI. Ranks other than
+  compute ranks: writers (`src/host/io_server.F90`) and, with
+  `ROMS_GPU_FRC_READER=1`, one forcing reader per node
+  (`src/host/frc_reader.F90`, the last rank of each node); roles are set in
+  `comm.F90` `init_comm`.
 
 ## Testing
 
@@ -126,6 +130,17 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   boundary, river mouth, tile edge or masked neighbour, treat it as a scheme
   error until shown otherwise. Accept it only where the CPU's own spread is
   large there, and leave the decision to the user.
+  - MiniPac has one such spot, on the shelf slope off New Guinea at j 58-66,
+    i 428-436 (0-based rho-grid indices). N^2 is near zero in the upper
+    levels and the shear is weak, so a 1e-16 difference in `bvf` moves the LMD
+    Richardson-number mixing, and the difference grows about 10x per step:
+    salt reaches 800x the strict spread by step 4 while the rest of the domain
+    stays at 0.5-3x. The CPU does the same from a rounding-level perturbation
+    (see `adiabatic_diff` in `src/shared/formulas.F90`), so it is not a GPU
+    error. Judge MiniPac outside these columns, at every level (the
+    difference spreads below the upper 20 levels), against the strict spread.
+    Inside them, compare with a CPU run whose initial temperature is perturbed
+    by 1e-15 relative (pass at 3x), or exclude the columns and say so.
 - Put each GPU-only speed lever behind its own bit (as `fs_gpu_opt` does),
   bit-identical or documented as rounding-level, so it can be bisected.
 

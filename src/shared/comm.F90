@@ -12,6 +12,13 @@ module comm_mod
   ! Compute ranks are numbered in world order (node by node), so the tile
   ! decomposition is the same either way; writer_world and compute_of_world
   ! translate between writer, compute and world ranks.
+  ! Forcing readers (ROMS_GPU_FRC_READER = 1, src/host/frc_reader.F90): the
+  ! last rank of every node reads the forcing records ahead into the node's
+  ! page cache. They are taken out first, and the rules above apply to the
+  ! other ranks, so the launch adds one rank to every node. All or none:
+  ! when a node has no rank to spare (the other ranks would not give
+  ! np_xi x np_eta compute ranks, and with the default layout at least one
+  ! writer), there are no readers and the run says so.
   ! Compute ranks exchange halos on compute_comm (comm_rank/comm_size
   ! refer to it); the server only receives staged output records over
   ! the world communicator (see io_server). One compute rank is a no-op
@@ -38,7 +45,11 @@ module comm_mod
   logical :: io_rank_flag = .false.
   integer :: node_rank = 0, node_size = 1     ! rank and rank count on this node
   integer, allocatable :: writer_world(:)     ! (0:io_nserv-1) world rank of each writer
-  integer, allocatable :: compute_of_world(:) ! (0:world_size-1) compute rank, -1 on writers
+  integer, allocatable :: compute_of_world(:) ! (0:world_size-1) compute rank, -1 on writers and readers
+  logical :: rd_flag = .false.                ! this rank is a forcing reader
+  integer :: rd_n = 0                         ! number of forcing reader ranks (0 or one per node)
+  integer :: ncompute_w = 1                   ! number of compute ranks
+  integer, allocatable :: reader_world(:)     ! (0:rd_n-1) world rank of each reader
   logical :: ready = .false.
   ! comm_fs_sum (the implicit free surface's PCG reductions, fs_gpu_opt 512): when all compute ranks
   ! (1, 2 or 4) share one node, the sums go through an MPI-3 shared-memory window instead of
@@ -74,6 +85,7 @@ module comm_mod
   public :: io_server_rank
   public :: io_server_count, io_server_index, comm_writers
   public :: comm_writer_world, comm_compute_index, comm_node_rank
+  public :: is_reader_rank, comm_reader_count, comm_reader_world, comm_ncompute
   public :: comm_world
   public :: comm_world_rank
   public :: comm_world_size
@@ -84,10 +96,11 @@ contains
 
   subroutine init_comm()
 #ifdef USE_MPI
-    integer :: ierr, color, stat, r, n, nw, nwpn, node_comm, mine
+    integer :: ierr, color, stat, r, n, nw, nwpn, node_comm, mine, nrd, nrdpn, below
     logical :: flag
     character(len=8) :: val
     integer, allocatable :: role(:)
+    logical, allocatable :: isrd(:)
     call MPI_Initialized(flag, ierr)
     if (.not. flag) then
       call MPI_Init(ierr)
@@ -115,54 +128,73 @@ contains
         error stop 'init_comm: bad ROMS_GPU_NWRITERS'
       endif
     endif
+    ! forcing readers: the last rank of every node, when every node can spare one
+    allocate(isrd(0:world_size - 1))
+    call setup_readers(nwpn, isrd)
+    rd_flag = isrd(world_rank)
+    nrd = count(isrd)
+    nrdpn = merge(1, 0, nrd > 0)
+    below = count(.not. isrd(0:world_rank - 1))   ! non-reader ranks before this one
+    deallocate(isrd)
     if (nwpn >= 0) then
-      io_rank_flag = (node_rank >= node_size - nwpn)
-      call check_node_layout(nwpn)
-    elseif (world_size >= 2) then
+      io_rank_flag = (.not. rd_flag) .and. (node_rank >= node_size - nrdpn - nwpn)
+      call check_node_layout(nwpn, nrdpn)
+    elseif (world_size - nrd >= 2) then
       call get_environment_variable('ROMS_GPU_IO_SERVER', val, status=stat)
       if (.not. (stat == 0 .and. len_trim(val) > 0 .and. val(1:1) == '0')) then
         ! ROMS_GPU_IO_SERVERS = number of writer ranks (default 1); they are
-        ! the last world ranks and share the output files (parallel NetCDF
-        ! when more than one).
+        ! the last world ranks (readers aside) and share the output files
+        ! (parallel NetCDF when more than one).
         ! Rule: the compute ranks are np_xi x np_eta from the namelist and
         ! every extra launched rank is a writer. ROMS_GPU_IO_SERVERS overrides.
         io_nserv = 1
         n = namelist_tiles()
-        if (n >= 1 .and. world_size > n) io_nserv = world_size - n
+        if (n >= 1 .and. world_size - nrd > n) io_nserv = world_size - nrd - n
         call get_environment_variable('ROMS_GPU_IO_SERVERS', val, status=stat)
         if (stat == 0 .and. len_trim(val) > 0) then
           read(val, *, iostat=stat) n
-          if (stat == 0 .and. n >= 1 .and. n < world_size) io_nserv = n
+          if (stat == 0 .and. n >= 1 .and. n < world_size - nrd) io_nserv = n
         endif
-        io_rank_w = world_size - io_nserv
+        io_rank_w = world_size - nrd - io_nserv   ! in the numbering of the non-reader ranks
       endif
-      io_rank_flag = (world_rank >= io_rank_w .and. io_rank_w >= 0)
+      io_rank_flag = (.not. rd_flag) .and. (below >= io_rank_w .and. io_rank_w >= 0)
     endif
-    ! the role of every world rank: writer and compute rank tables
+    ! the role of every world rank (0 compute, 1 writer, 2 reader): writer,
+    ! reader and compute rank tables
     allocate(role(0:world_size - 1), compute_of_world(0:world_size - 1))
     mine = merge(1, 0, io_rank_flag)
+    if (rd_flag) mine = 2
     call MPI_Allgather(mine, 1, MPI_INTEGER, role, 1, MPI_INTEGER, world_comm, ierr)
     if (ierr /= MPI_SUCCESS) error stop 'init_comm: MPI_Allgather roles'
     io_nserv = count(role == 1)
-    allocate(writer_world(0:max(io_nserv, 1) - 1))
+    rd_n = count(role == 2)
+    allocate(writer_world(0:max(io_nserv, 1) - 1), reader_world(0:max(rd_n, 1) - 1))
     writer_world = -1
+    reader_world = -1
     n = 0
     nw = 0
+    nrd = 0
     do r = 0, world_size - 1
       if (role(r) == 1) then
         writer_world(nw) = r
         nw = nw + 1
+        compute_of_world(r) = -1
+      elseif (role(r) == 2) then
+        reader_world(nrd) = r
+        nrd = nrd + 1
         compute_of_world(r) = -1
       else
         compute_of_world(r) = n
         n = n + 1
       endif
     enddo
+    ncompute_w = n
     deallocate(role)
     io_rank_w = -1
     if (io_nserv > 0) io_rank_w = writer_world(0)
-    if (io_rank_w >= 0) then
+    if (io_rank_w >= 0 .or. rd_n > 0) then
       color = merge(1, 0, io_rank_flag)
+      if (rd_flag) color = 2
       call MPI_Comm_split(world_comm, color, world_rank, compute_comm, ierr)
       if (ierr /= MPI_SUCCESS) error stop 'init_comm: MPI_Comm_split'
     else
@@ -174,17 +206,18 @@ contains
     nproc = int(n, ip)
     call get_environment_variable('MPICH_GPU_SUPPORT_ENABLED', val, status=stat)
     comm_gpu_direct = (stat == 0 .and. len_trim(val) > 0 .and. val(1:1) == '1')
-    if (my_rank == 0 .and. .not. io_rank_flag) &
+    if (my_rank == 0 .and. .not. io_rank_flag .and. .not. rd_flag) &
          write(*,'(a,l1)') 'comm: GPU-direct halo exchange (MPICH_GPU_SUPPORT_ENABLED) = ', comm_gpu_direct
 #endif
     ready = .true.
   end subroutine init_comm
 
-  subroutine check_node_layout(nwpn)
+  subroutine check_node_layout(nwpn, nrdpn)
     ! ROMS_GPU_NWRITERS = nwpn: every node needs at least one compute rank,
     ! and the compute ranks must number np_xi x np_eta. Every rank runs the
     ! same check on the same gathered numbers, so all stop together.
-    integer, intent(in) :: nwpn
+    ! nrdpn: forcing readers per node (0 or 1), the last rank of each node.
+    integer, intent(in) :: nwpn, nrdpn
 #ifdef USE_MPI
     integer :: ierr, nodes, ncomp, ntile, r, lo, hi
     integer, allocatable :: nr(:), ns(:)
@@ -196,7 +229,7 @@ contains
     lo = minval(ns); hi = maxval(ns)
     ncomp = 0
     do r = 0, world_size - 1
-      if (nr(r) < ns(r) - nwpn) ncomp = ncomp + 1
+      if (nr(r) < ns(r) - nwpn - nrdpn) ncomp = ncomp + 1
     enddo
     ntile = namelist_tiles()
     if (lo == hi) then
@@ -205,18 +238,18 @@ contains
       write(sz, '(i0,a,i0)') lo, '-', hi
     endif
     if (world_rank == 0) write(*,'(a,i0,a,i0,a,a,a,i0,a,i0,a)') 'comm: ', nodes, ' node(s), ', world_size, &
-         ' ranks (', trim(sz), ' per node), ', ncomp, ' compute + ', world_size - ncomp, &
+         ' ranks (', trim(sz), ' per node), ', ncomp, ' compute + ', world_size - ncomp - nodes * nrdpn, &
          ' writer ranks (ROMS_GPU_NWRITERS, writers per node)'
-    if (lo <= nwpn .or. (ntile >= 1 .and. ncomp /= ntile)) then
+    if (lo <= nwpn + nrdpn .or. (ntile >= 1 .and. ncomp /= ntile)) then
       if (world_rank == 0) then
         write(*,'(a,i0,a,i0,a,a,a)') 'init_comm: ROMS_GPU_NWRITERS = ', nwpn, ' writers per node, but the job has ', &
              nodes, ' node(s) with ', trim(sz), ' ranks each'
-        if (lo <= nwpn) write(*,'(a)') 'init_comm: a node has no rank left for computing'
+        if (lo <= nwpn + nrdpn) write(*,'(a)') 'init_comm: a node has no rank left for computing'
         if (ntile >= 1 .and. ncomp /= ntile) then
           write(*,'(a,i0,a,i0,a)') 'init_comm: that leaves ', ncomp, ' compute ranks; the namelist has np_xi x np_eta = ', &
                ntile, ' tiles'
           if (mod(ntile, nodes) == 0) write(*,'(a,i0,a,i0,a,i0,a,i0,a)') 'init_comm: expected ', nodes, &
-               ' node(s) x (', ntile / nodes, ' + ', nwpn, ') = ', nodes * (ntile / nodes + nwpn), ' ranks'
+               ' node(s) x (', ntile / nodes, ' + ', nwpn + nrdpn, ') = ', nodes * (ntile / nodes + nwpn + nrdpn), ' ranks'
         endif
         flush(6)
       endif
@@ -225,6 +258,75 @@ contains
     deallocate(nr, ns)
 #endif
   end subroutine check_node_layout
+
+  subroutine setup_readers(nwpn, isrd)
+    ! ROMS_GPU_FRC_READER = 1: isrd(r) is true for the last rank of every
+    ! node, when every node can spare it (see the module header); 0 or unset:
+    ! no readers. Every rank decides on the same gathered numbers.
+    integer, intent(in)  :: nwpn
+    logical, intent(out) :: isrd(0:world_size - 1)
+#ifdef USE_MPI
+    integer :: ierr, stat, nodes, ntile, lo, r, ncomp, want
+    integer, allocatable :: nr(:), ns(:)
+    character(len=8) :: val
+    character(len=160) :: why
+    logical :: srv_off
+    isrd = .false.
+    want = 0
+    val = ''
+    call get_environment_variable('ROMS_GPU_FRC_READER', val, status=stat)
+    if (stat == 0 .and. len_trim(val) > 0) then
+      read(val, *, iostat=stat) want
+      if (stat /= 0 .or. want < 0 .or. want > 1) then
+        if (world_rank == 0) write(*,'(3a)') 'init_comm: ROMS_GPU_FRC_READER = "', trim(val), &
+             '" is not 0 or 1 (forcing reader ranks per node)'
+        error stop 'init_comm: bad ROMS_GPU_FRC_READER'
+      endif
+    endif
+    if (want == 0) return
+    allocate(nr(0:world_size - 1), ns(0:world_size - 1))
+    call MPI_Allgather(node_rank, 1, MPI_INTEGER, nr, 1, MPI_INTEGER, world_comm, ierr)
+    call MPI_Allgather(node_size, 1, MPI_INTEGER, ns, 1, MPI_INTEGER, world_comm, ierr)
+    nodes = count(nr == 0)
+    lo = minval(ns)
+    ntile = namelist_tiles()
+    why = ''
+    if (ntile < 1) then
+      why = 'np_xi x np_eta is not known (namelist not found)'
+    elseif (lo < 2) then
+      why = 'a node has a single rank'
+    elseif (nwpn >= 0) then
+      ncomp = 0
+      do r = 0, world_size - 1
+        if (nr(r) < ns(r) - nwpn - 1) ncomp = ncomp + 1
+      enddo
+      if (lo <= nwpn + 1 .or. ncomp /= ntile) write(why, '(a,i0,a,i0,a)') 'with one reader per node the ranks give ', &
+           ncomp, ' compute ranks for ', ntile, ' tiles (ROMS_GPU_NWRITERS)'
+    else
+      call get_environment_variable('ROMS_GPU_IO_SERVER', val, status=stat)
+      srv_off = (stat == 0 .and. len_trim(val) > 0 .and. val(1:1) == '0')
+      if (srv_off .and. world_size - nodes /= ntile) then
+        write(why, '(a,i0,a,i0,a)') 'without them ', world_size - nodes, ' ranks are left for ', ntile, ' tiles'
+      elseif (.not. srv_off .and. world_size - nodes < ntile + 1) then
+        write(why, '(a,i0,a,i0,a)') 'without them ', world_size - nodes, ' ranks are left for ', ntile, &
+             ' tiles and at least one writer'
+      endif
+    endif
+    if (len_trim(why) > 0) then
+      if (world_rank == 0) write(*,'(a,i0,a,a,a)') 'comm: ROMS_GPU_FRC_READER = 1, but the job has no spare rank on its ', &
+           nodes, ' node(s) (', trim(why), '): no forcing reader (launch one more rank on every node)'
+    else
+      do r = 0, world_size - 1
+        isrd(r) = (nr(r) == ns(r) - 1)
+      enddo
+      if (world_rank == 0) write(*,'(a,i0,a)') 'comm: ', nodes, &
+           ' forcing reader rank(s) (ROMS_GPU_FRC_READER = 1): the last rank of every node'
+    endif
+    deallocate(nr, ns)
+#else
+    isrd = .false.
+#endif
+  end subroutine setup_readers
 
   integer function namelist_tiles() result(ntile)
     ! np_xi * np_eta from the namelist named on the command line (argument
@@ -329,6 +431,26 @@ contains
     is_io_rank = io_rank_flag
   end function is_io_rank
 
+  logical function is_reader_rank()
+    ! This rank is a forcing reader (src/host/frc_reader.F90).
+    is_reader_rank = rd_flag
+  end function is_reader_rank
+
+  integer function comm_reader_count()
+    comm_reader_count = rd_n
+  end function comm_reader_count
+
+  integer function comm_reader_world(i)
+    ! world rank of forcing reader i (0 .. comm_reader_count()-1)
+    integer, intent(in) :: i
+    comm_reader_world = reader_world(i)
+  end function comm_reader_world
+
+  integer function comm_ncompute()
+    ! number of compute ranks (world minus writers and readers)
+    comm_ncompute = ncompute_w
+  end function comm_ncompute
+
   integer function io_server_rank()
     io_server_rank = io_rank_w
   end function io_server_rank
@@ -350,7 +472,7 @@ contains
   end function comm_writer_world
 
   integer function comm_compute_index(r)
-    ! compute rank of world rank r (-1 for a writer)
+    ! compute rank of world rank r (-1 for a writer or reader)
     integer, intent(in) :: r
     comm_compute_index = r
     if (allocated(compute_of_world)) comm_compute_index = compute_of_world(r)
@@ -362,7 +484,8 @@ contains
   end function comm_node_rank
 
   integer function comm_writers()
-    ! The writer ranks' own communicator (the split gives it to colour 1).
+    ! The writer ranks' own communicator (the split gives it to colour 1;
+    ! on a reader rank, the readers' communicator).
     comm_writers = compute_comm
   end function comm_writers
 

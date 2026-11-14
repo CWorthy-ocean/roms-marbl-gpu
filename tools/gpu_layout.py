@@ -3,9 +3,10 @@ ranks from the history record size, and the PBS select line to launch it.
 
 usage: python gpu_layout.py <namelist> [--gpus-per-node 4] [--target-seconds 15]
                                        [--rate-gbps 0.6] [--max-writers 16] [--groups G]
-                                       [--per-node]
+                                       [--per-node] [--reader]
 Prints:  NTILE NWRITERS NRANKS SELECT   (one line, space separated)
          NTILE NWRITERS NRANKS SELECT NWPN   with --per-node
+NRANKS counts every rank, forcing readers included.
 
 Rule:
 - Writers per group: one writer streams about 0.6 GB/s (measured, Derecho
@@ -27,6 +28,10 @@ Layouts:
   model's ROMS_GPU_NWRITERS=NWPN mode. This is the layout a SLURM job
   (--ntasks-per-node) can express, and it spreads the writer groups over
   the nodes. np_xi x np_eta must divide evenly over the nodes.
+- --reader (with either layout): one more rank on every node, the forcing
+  reader that reads the forcing records ahead into the node's page cache
+  (the model's ROMS_GPU_FRC_READER=1 mode; the reader is the last rank of
+  each node).
 """
 import math
 import re
@@ -36,10 +41,13 @@ args = sys.argv[1:]
 opts = {'--gpus-per-node': 4, '--target-seconds': 15.0, '--rate-gbps': 0.6, '--max-writers': 16, '--groups': 0}
 path = None
 per_node = False
+reader = 0
 while args:
     a = args.pop(0)
     if a == '--per-node':
         per_node = True
+    elif a == '--reader':
+        reader = 1
     elif a in opts:
         opts[a] = type(opts[a])(args.pop(0))
     else:
@@ -98,18 +106,23 @@ if per_node:
                  'as a multiple of the node count' % (ntile, nodes, g))
     wpn = math.ceil(nw / nodes)
     nw = wpn * nodes
-    select = '%d:ncpus=64:mpiprocs=%d:ngpus=%d' % (nodes, ntile // nodes + wpn, g)
-    print('%d %d %d %s %d' % (ntile, nw, ntile + nw, select, wpn))
-    print('# per node: %d compute + %d writer rank(s); run with ROMS_GPU_NWRITERS=%d. SLURM: --nodes=%d '
-          '--ntasks-per-node=%d --gpus-per-node=%d' % (ntile // nodes, wpn, wpn, nodes, ntile // nodes + wpn, g),
-          file=sys.stderr)
+    select = '%d:ncpus=64:mpiprocs=%d:ngpus=%d' % (nodes, ntile // nodes + wpn + reader, g)
+    print('%d %d %d %s %d' % (ntile, nw, ntile + nw + reader * nodes, select, wpn))
+    print('# per node: %d compute + %d writer rank(s)%s; run with ROMS_GPU_NWRITERS=%d%s. SLURM: --nodes=%d '
+          '--ntasks-per-node=%d --gpus-per-node=%d' % (ntile // nodes, wpn, ' + 1 forcing reader' if reader else '',
+                                                      wpn, ' ROMS_GPU_FRC_READER=1' if reader else '', nodes,
+                                                      ntile // nodes + wpn + reader, g), file=sys.stderr)
 else:
     if nodes == 1:
-        select = '1:ncpus=64:mpiprocs=%d:ngpus=%d' % (ntile + nw, g)
+        select = '1:ncpus=64:mpiprocs=%d:ngpus=%d' % (ntile + nw + reader, g)
     else:
         last = ntile - g * (nodes - 1)
-        select = '%d:ncpus=64:mpiprocs=%d:ngpus=%d+1:ncpus=64:mpiprocs=%d:ngpus=%d' % (nodes - 1, g, g, last + nw, g)
-    print('%d %d %d %s' % (ntile, nw, ntile + nw, select))
+        select = '%d:ncpus=64:mpiprocs=%d:ngpus=%d+1:ncpus=64:mpiprocs=%d:ngpus=%d' % (nodes - 1, g + reader, g,
+                                                                                     last + nw + reader, g)
+    print('%d %d %d %s' % (ntile, nw, ntile + nw + reader * nodes, select))
+    if reader:
+        print('# + 1 forcing reader rank on each of %d node(s); run with ROMS_GPU_FRC_READER=1' % nodes,
+              file=sys.stderr)
 print('# history record ~%.1f GB -> %d writer(s) per group for <= %.0f s per record at %.1f GB/s each; '
       '%d group(s) -> %d writer(s)' % (record_gb, per_group, opts['--target-seconds'], opts['--rate-gbps'],
                                       groups, nw), file=sys.stderr)

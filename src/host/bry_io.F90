@@ -18,6 +18,7 @@ module bry_io
   use nc_io
   use arch_mod, only: sync_arch
   use pflx_mod, only: ub_tune, pf_w, pf_e, pf_s, pf_n
+  use frc_reader, only: frc_reader_on, frc_reader_ahead
 #ifdef USE_CUDA
   use cudafor
   use cudadevice, only: __dmul_rn
@@ -38,6 +39,7 @@ module bry_io
     integer, allocatable :: irec(:)
     real(rp), WORK_ATTR allocatable :: buf(:,:)   ! (n,2), managed: read on the device
     integer :: f0 = 1   ! file start of this tile's sub-range along the edge
+    integer :: ra_mark = 0   ! forcing reader: upper bracket last posted ahead
   end type series1d
 
   type :: series_z
@@ -51,6 +53,7 @@ module bry_io
     integer, allocatable :: irec(:)
     real(rp), WORK_ATTR allocatable :: buf(:,:,:) ! (n,nz,2), managed
     integer :: f0 = 1   ! file start of this tile's sub-range along the edge
+    integer :: ra_mark = 0   ! forcing reader: upper bracket last posted ahead
   end type series_z
 
   type(series1d) :: ser_zw, ser_ubw, ser_vbw, ser_ze, ser_ube, ser_vbe
@@ -166,7 +169,42 @@ contains
       enddo
     endif
     call dump_bry_north('after clim', tneed)
+    call bry_post_ahead()
   end subroutine set_bry_all
+
+  subroutine bry_post_ahead()
+    ! Forcing readers (frc_reader): post the boundary records after every
+    ! series' upper bracket (compute rank 0 only; nothing without readers).
+    ! Every rank advances every bound series, so rank 0's brackets are
+    ! everyone's; a reader reads a file's whole record, so one post covers
+    ! every variable of it.
+    integer(ip) :: m
+    if (.not. frc_reader_on()) return
+    call post1(ser_zw); call post1(ser_ubw); call post1(ser_vbw)
+    call post1(ser_ze); call post1(ser_ube); call post1(ser_vbe)
+    call post1(ser_zs); call post1(ser_ubs); call post1(ser_vbs)
+    call post1(ser_zn); call post1(ser_ubn); call post1(ser_vbn)
+    call postz(ser_uw); call postz(ser_vw); call postz(ser_tw); call postz(ser_sw)
+    call postz(ser_ue); call postz(ser_ve); call postz(ser_te); call postz(ser_se)
+    call postz(ser_us); call postz(ser_vs); call postz(ser_ts); call postz(ser_ss)
+    call postz(ser_un); call postz(ser_vn); call postz(ser_tn); call postz(ser_sn)
+    if (allocated(ser_tbw)) then
+      do m = 1, ntp
+        call postz(ser_tbw(m)); call postz(ser_tbe(m)); call postz(ser_tbs(m)); call postz(ser_tbn(m))
+      enddo
+    endif
+  contains
+    subroutine post1(s)
+      type(series1d), intent(inout) :: s
+      if (.not. s%ready) return
+      call frc_reader_ahead(s%paths, s%irec, s%nrec, s%cycle > 0.0_rp, s%it2, s%tname, s%ra_mark)
+    end subroutine post1
+    subroutine postz(s)
+      type(series_z), intent(inout) :: s
+      if (.not. s%ready) return
+      call frc_reader_ahead(s%paths, s%irec, s%nrec, s%cycle > 0.0_rp, s%it2, s%tname, s%ra_mark)
+    end subroutine postz
+  end subroutine bry_post_ahead
 
   subroutine set_pflx_bry(tneed)
     ! The CPU's set_pflx: the parent fluxes at time tneed (days), on the

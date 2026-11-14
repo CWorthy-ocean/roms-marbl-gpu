@@ -16,7 +16,9 @@ program roms_gpu
   use sponge_out, only: wrt_spn
   use upscale_out, only: wrt_upscale_final
   use arch_mod, only: init_arch, arch_name, select_device
-  use comm_mod, only: init_comm, finalize_comm, comm_rank, comm_size, is_io_rank, comm_node_rank, comm_world_rank
+  use comm_mod, only: init_comm, finalize_comm, comm_rank, comm_size, is_io_rank, comm_node_rank, comm_world_rank, &
+                      is_reader_rank
+  use frc_reader, only: frc_reader_run, frc_reader_stop
   use io_server, only: io_server_run, io_finalize
   use passive_mod, only: passive_exchange_finish
   use halo_mod, only: hg_audit_report
@@ -48,6 +50,13 @@ program roms_gpu
   if (is_io_rank()) then
     ! Output server: no GPU context, no model state. Serves until QUIT.
     call io_server_run()
+    call finalize_comm()
+    stop
+  endif
+  if (is_reader_rank()) then
+    ! Forcing reader (frc_reader): no GPU context, no model state. Reads the
+    ! records compute rank 0 posts until it says quit.
+    call frc_reader_run()
     call finalize_comm()
     stop
   endif
@@ -110,6 +119,7 @@ program roms_gpu
       call wrt_cdr_gas_final()        ! end-time bracket record of the CDR gas-exchange output
       call wall_stamp('loop done')
       call rt_tic(RT_FINAL)
+      call frc_reader_stop()
       call io_finalize()
       call rt_toc(RT_FINAL)
       call rt_report()
@@ -150,6 +160,7 @@ program roms_gpu
   call passive_exchange_finish()
   call frc_prefetch_drain()
   call hg_audit_report()
+  call frc_reader_stop()
   call io_finalize()
   call free_state()
   call finalize_comm()
@@ -157,13 +168,13 @@ end program roms_gpu
 
 subroutine wall_stamp(tag)
   ! Wall clock since the first stamp, printed by every compute rank.
-  use comm_mod, only: comm_rank, is_io_rank
+  use comm_mod, only: comm_rank, is_io_rank, is_reader_rank
   use run_timers, only: wall_time
   implicit none
   character(len=*), intent(in) :: tag
   real(8), save :: t0 = -1.0d0
   real(8) :: now
-  if (is_io_rank()) return
+  if (is_io_rank() .or. is_reader_rank()) return
   now = wall_time()
   if (t0 < 0.0d0) t0 = now
   write(*,'(a,i0,a,a,a,f10.2,a)') 'wall: rank ', comm_rank(), '  ', tag, '  t = ', now - t0, ' s'

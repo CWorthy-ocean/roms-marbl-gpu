@@ -1125,7 +1125,7 @@ contains
     comm = comm_world()
     nserv = io_server_count()
     me_w = io_server_index()
-    ncompute = comm_world_size() - nserv   ! every compute rank sends its own slabs and its own quit
+    ncompute = comm_ncompute()   ! every compute rank sends its own slabs and its own quit (not the readers)
     call writer_groups(nserv, wgroup_size, wgroups)
     my_group = me_w / wgroup_size
     me_g = mod(me_w, wgroup_size)
