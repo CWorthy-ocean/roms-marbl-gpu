@@ -237,6 +237,12 @@ v0.1.2-beta, bit for bit.
   stopped the run with a request to rebuild; `-DROMS_RHO0` is now
   ignored. A namelist without `&rho0_settings` stops the run, as in UCLA
   ROMS. Runs at rho0 = 1000 are unchanged, bit for bit.
+- Cyclic river forcing: a `cycle_length` attribute on `river_time` makes
+  the river records a climatology, bracketed across the end of the cycle
+  as UCLA ROMS does (and as the GPU model already did for the other
+  forcing fields). Before, the GPU model ignored the attribute and
+  stopped once the model time left the records. Runs whose river file has
+  no `cycle_length` are unchanged, bit for bit.
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
   depth-integrated internal-tide energy flux `up`/`vp` of the parent,
   written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS

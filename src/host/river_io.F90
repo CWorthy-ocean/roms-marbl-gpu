@@ -15,13 +15,16 @@ module river_io
   ! Records: one time catalog over all forcing files that hold river_volume,
   ! bracketed and weighted as frc_io advance_series / weights (the CPU's
   ! set_frc_data_1d/2d formula). Only the rivers this tile touches go to the
-  ! device.
+  ! device. A cycle_length attribute on river_time (of the first file with
+  ! river records) makes the records a climatology, bracketed by the CPU's
+  ! find_new_record_cycle rule (frc_io cyc_bracket), as for the other
+  ! forcing fields.
   use kinds
   use decomp_mod, only: decomp
   use gpu_state
   use time_state
   use nc_io
-  use frc_io, only: case_frcfiles, case_nfrc, frc_file_ncid
+  use frc_io, only: case_frcfiles, case_nfrc, frc_file_ncid, cyc_bracket
   use passive_mod, only: ntp, ncdr, cpu_tracer_index
   use rivers_mod
   use comm_mod, only: comm_rank
@@ -39,6 +42,7 @@ module river_io
   integer :: ncat = 0, it1 = 0, it2 = 0
   real(rp), allocatable :: cat_t(:)
   integer, allocatable :: cat_f(:), cat_r(:)
+  real(rp) :: cat_cycle                       ! cycle_length of river_time (<= 0: not cyclic)
   integer, allocatable :: fncid(:)            ! open handle per forcing file (0: no rivers)
   integer :: nriver_f = 0, ntr_f = 0          ! dims of the river variables in the files
   integer(ip) :: nloc = 0                     ! rivers this tile touches
@@ -85,7 +89,10 @@ contains
     integer(ip) :: iu_s2d0, iu_s2d1, jv_s2d0, jv_s2d1, iu_pre0, jv_pre0
     integer :: nbad, maxidx
     character(len=16) :: what
+    real(rp) :: cyc
+    logical :: lcyc
 
+    cat_cycle = -1.0_rp
     if (.not. river_source) return
     nx = int(decomp%nx); ny = int(decomp%ny)
     if (decomp%periodic_x .or. decomp%periodic_y) &
@@ -283,6 +290,14 @@ contains
     enddo
     call sort_catalog()
     it1 = 0; it2 = 0
+    do ifile = 1, case_nfrc
+      if (fncid(ifile) == 0) cycle
+      call nc_get_att_real(fncid(ifile), 'river_time', 'cycle_length', cyc, lcyc)
+      if (lcyc .and. cyc > 0.0_rp) cat_cycle = cyc
+      exit
+    enddo
+    if (cat_cycle > 0.0_rp .and. comm_rank() == 0) &
+      write(*,'(a,f10.3)') 'rivers: river_time is cyclic, cycle_length =', cat_cycle
     ! trc_l row ntr_f + 1 stays 0: the row of CDR_LITE tracers the file lacks
     allocate(vol_g(nriver_f), trc_g(nriver_f, ntr_f), vol_l(max(nloc, 1)), trc_l(ntr_f + 1, max(nloc, 1)))
     trc_l = 0.0_rp
@@ -416,11 +431,34 @@ contains
     ! bracket as frc_io advance_series, then the weights as frc_io weights.
     integer, intent(in) :: stage
     real(rp) :: tneed, t1, t2, dtm, c1, c2
-    integer :: rec, i, old1, old2
+    integer :: rec, i, old1, old2, i1, i2
     logical :: keep
     if (.not. river_on) return
     tneed = frc_modtime()
-    if (ncat >= 2) then
+    if (ncat >= 2 .and. cat_cycle > 0.0_rp) then
+      ! climatology: records shifted by whole cycles (t1, t2 the shifted times)
+      call cyc_bracket(cat_t, ncat, cat_cycle, tneed, i1, i2, t1, t2)
+      if (i1 /= it1) then
+        old2 = it2
+        it1 = i1
+        if (i1 == old2) then
+          call rivers_copy_upper()
+        else
+          call load_record(it1, 1)
+        endif
+      endif
+      if (i2 /= it2) then
+        it2 = i2
+        call load_record(it2, 2)
+      endif
+      dtm = t2 - t1
+      if (abs(dtm) < 1.0e-12_rp) then
+        c1 = 1.0_rp; c2 = 0.0_rp
+      else
+        c1 = (t2 - tneed) / dtm
+        c2 = (tneed - t1) / dtm
+      endif
+    elseif (ncat >= 2) then
       keep = .false.
       if (it1 >= 1) keep = (cat_t(it2) >= tneed .and. cat_t(it1) <= tneed)
       if (.not. keep) then
