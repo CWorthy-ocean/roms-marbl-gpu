@@ -19,7 +19,7 @@ module imex_red
   public :: red_ensure, red_sum
   public :: it_set, itw, itw2, it_step, it_reb, it_print
   integer, parameter :: RED_NT = 512, RED_MAXS = 4
-  ! Above RED_SPLIT_MIN columns the RED_NT strided sums run in RED_NT/RED_PW
+  ! From RED_SPLIT_MIN columns on, the RED_NT strided sums run in RED_NT/RED_PW
   ! blocks of RED_PW threads (red_kpart, one partial per thread into red_tmp), the tree in a second
   ! one-block kernel (red_ktree): the same additions in the same order as red_kernel, on several
   ! multiprocessors instead of one

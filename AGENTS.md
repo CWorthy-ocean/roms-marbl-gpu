@@ -78,7 +78,12 @@ first, on the smallest case that exercises it.
   perturbed by 1e-6 degC (`tools/noise_floor_eval.py` and its MARBL twin).
 - **Timing.** With probes off (the default) and no output, run base and new as
   A B B A in one job on the same nodes, and report the median steady step.
-  Do not claim a gain you did not measure.
+  Do not claim a gain you did not measure. The first run of a job is often
+  slower (input files not yet cached): leave it out, or start with a warm-up
+  run of the same length (a short one does not read the later forcing
+  records).
+  `fs_gpu_timers` and `imex_gpu_timers` (1, 2) give synchronised windows of
+  the free surface and of the IMEX step; results are unchanged.
 - **BGC tracer subcycling** (`src/device/bgc_subcycle.F90`,
   `bgc_window.F90`): `tools/bgcsub_gates.py` runs the fast gate set on a
   small MARBL case, as UCLA ROMS's pytest cases do (built on its
@@ -98,6 +103,10 @@ first, on the smallest case that exercises it.
   window on some levels) and a case with rivers and CDR releases, and compare
   with UCLA ROMS as above (the `BGCSUB` lines' m and Courant numbers must
   equal the CPU's).
+- **IMEX restart files** hold zeros in `imex_pgu`, `imex_pgv` at deep land
+  (the fused path skips it). Coastal land faces there still depend on the
+  run's history, so a restart comparison lists land-only differences of
+  these two variables apart.
 
 ## Repository layout
 
@@ -161,7 +170,10 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
     Inside them, compare with a CPU run whose initial temperature is perturbed
     by 1e-15 relative (pass at 3x), or exclude the columns and say so.
 - Put each GPU-only speed lever behind its own bit (as `fs_gpu_opt` does),
-  bit-identical or documented as rounding-level, so it can be bisected.
+  bit-identical or documented as rounding-level, so it can be bisected. A
+  bit-identical lever may become plain code once its gates pass, if the
+  history keeps it in a commit of its own (the IMEX levers: one commit per
+  lever, then one that removes their key).
 
 ## Gotchas
 
