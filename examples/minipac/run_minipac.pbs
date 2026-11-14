@@ -2,7 +2,8 @@
 # roms_gpu example: MiniPac with MARBL, 2 x 2 tiles on one 4-GPU node.
 #
 # Submit with the layout-aware launcher, which sets the PBS select line and
-# NRANKS (4 GPU ranks + the writer ranks for this namelist) for you:
+# NRANKS (4 GPU ranks + the writer ranks for this namelist + a forcing
+# reader, ROMS_GPU_FRC_READER=1) for you:
 #   tools/submit_gpu.sh examples/minipac/run_minipac.pbs
 # or qsub it directly with the defaults below (6 ranks = 4 GPU + 2 writers).
 #PBS -N minipac_gpu

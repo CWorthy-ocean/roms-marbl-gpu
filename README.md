@@ -137,8 +137,8 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   `python3 tools/gpu_layout.py namelist.nml [--per-node] [--reader]` prints
   the suggested numbers (compute ranks, writers, total, a PBS select line,
   and with `--per-node` the writers per node); `tools/submit_gpu.sh <job
-  script> [PERNODE=1] [READER=1]` does the same and submits a PBS job with
-  them.
+  script> [PERNODE=1] [READER=0]` does the same and submits a PBS job with
+  them, with the forcing reader unless `READER=0`.
 - **GPUs:** a compute rank uses GPU (its rank on the node mod the number of
   visible GPUs), so place ranks node by node and make all of a node's GPUs
   visible to every rank. `tools/numa_bind.sh` (launch with `mpiexec
@@ -226,8 +226,9 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
-- Forcing reader (`ROMS_GPU_FRC_READER=1`; `tools/submit_gpu.sh READER=1`
-  and `tools/gpu_layout.py --reader` add the rank): one more rank on every
+- Forcing reader (`ROMS_GPU_FRC_READER=1`; `tools/submit_gpu.sh` adds the
+  rank by default, `READER=0` leaves it out, and `tools/gpu_layout.py
+  --reader` prints the layout with it): one more rank on every
   node reads each surface forcing and boundary record ahead of the model,
   whole and in file order, into the node's page cache. The compute ranks
   read as before, so results are unchanged, but their reads no longer wait
