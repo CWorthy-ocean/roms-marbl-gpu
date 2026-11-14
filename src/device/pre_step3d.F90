@@ -9,6 +9,9 @@ module pre_step3d_mod
   use gpu_state
   use formulas
   use time_state
+  ! Column probes: the rank-local probe points (set_probe_windows).
+  use time_state, only: ncol_probe => nprb_pt, icol_probe => iprb_pt, jcol_probe => jprb_pt, &
+                        iprb_pt, jprb_pt
   use halo_mod
   use arch_mod, only: sync_arch
   use column_solve, only: implicit_tracer_columns
@@ -23,10 +26,6 @@ module pre_step3d_mod
   private
   public :: pre_step3d
   public :: ncol_probe, icol_probe, jcol_probe
-
-  integer(ip), parameter :: ncol_probe = nprb_pt
-  integer(ip), parameter :: icol_probe(ncol_probe) = iprb_pt
-  integer(ip), parameter :: jcol_probe(ncol_probe) = jprb_pt
 
 contains
 

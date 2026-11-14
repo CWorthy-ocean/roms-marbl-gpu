@@ -13,6 +13,8 @@
 # The submit script must name its namelist on an NML= line (it may use
 # ${CASE} from a CASE= line) and launch with "mpiexec -n ${NRANKS:-...}".
 # PBS (qsub) version; for Slurm, use the printed counts with sbatch/srun.
+# ROMS_GPU_PROBES=0 is passed for older binaries, where diagnostic probes were
+# on by default; current binaries have them off unless it is non-zero.
 set -euo pipefail
 # ---- settings: edit here, or set the environment variable ----
 ROOT=${ROMS_GPU_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}   # roms_gpu checkout

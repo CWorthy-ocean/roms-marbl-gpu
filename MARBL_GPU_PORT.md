@@ -2020,9 +2020,9 @@ maximum (cases/GPU namelist_roms_gpu_pacnm{40,70,70x,78x}.nml).
   - without the stray contexts the limit is 80.
   - A restart write adds one double tile field of device staging (about
     0.3 GB).
-- **Step time.** 70 tracers run at 0.41 s per step after the default
-  24-step probe window (3.7 s per step inside it; `ROMS_GPU_PROBES=0`
-  turns it off).
+- **Step time.** 70 tracers run at 0.41 s per step after the 24-step
+  probe window (3.7 s per step inside it). The window was then on by
+  default; probes are now off unless `ROMS_GPU_PROBES` is non-zero.
 - **Output size.** int_z_CDR_OAE_DIC* is double: 35 fields are 0.5 GB per
   record.
 - **Against the CPU code.**
