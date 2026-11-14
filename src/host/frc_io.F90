@@ -1385,10 +1385,13 @@ contains
     !   rho: coarse index 0.5 gi + 0.25 (file index 1 = coarse rho 0)
     !   u (xi) / v (eta): 0.5 gi + 0.5 (file index 1 = coarse u/v 1)
     ! The weights are exact (multiples of 1/4), so the result does not
-    ! depend on the tiling. Coarse points beyond the file extent (the last
-    ! fine row of an odd LLm / MMm, and the u/v end faces) count as 0, as
-    ! the CPU's zero-initialized coarse buffer; NaN propagates as on the
-    ! CPU and becomes 0 at the end unless kn (keep NaN).
+    ! depend on the tiling. With an odd LLm (MMm) in a closed direction the
+    ! last fine rho column (row) and the u (v) end face also take the coarse
+    ! point beyond the file's last one, which takes the last one's value
+    ! (coarse_caps; the CPU's clamp_coarse_edges, ucla-roms #439). Other
+    ! coarse points beyond the file extent count as 0, as the CPU's
+    ! zero-initialized coarse buffer; NaN propagates as on the CPU and
+    ! becomes 0 at the end unless kn (keep NaN).
     ! Filled: rho i = 0:nx+1, j = 0:ny+1; u i = 1:nx+1, j = 0:ny+1;
     ! v i = 0:nx+1, j = 1:ny+1 (the standard on-grid windows).
     integer,          intent(in) :: n1, n2
@@ -1397,10 +1400,11 @@ contains
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
     character(len=1), intent(in) :: gtype
     logical,          intent(in) :: kn
-    integer :: i, j, ib, jb, ie, je, gi0, gj0, ox, oy, ic, jc
+    integer :: i, j, ib, jb, ie, je, gi0, gj0, ox, oy, ic, jc, cx, cy, i0c, i1c, j0c, j1c
     real(rp) :: xo, yo, xg, yg, xl, yl
     real(rp) :: a00, a10, a01, a11, q00, q10, q01, q11, f1, f2, x
     logical :: in0, in1, jn0, jn1
+    call coarse_caps(n1, n2, cx, cy)
     ib = 0; jb = 0; xo = 0.25_rp; yo = 0.25_rp; ox = 1; oy = 1
     if (gtype == 'u') then
       ib = 1; xo = 0.5_rp; ox = 0
@@ -1422,23 +1426,27 @@ contains
         yl = yg - real(jc, rp)
         ic = ic + ox
         jc = jc + oy
-        in0 = (ic >= 1 .and. ic <= n1)
-        in1 = (ic + 1 >= 1 .and. ic + 1 <= n1)
-        jn0 = (jc >= 1 .and. jc <= n2)
-        jn1 = (jc + 1 >= 1 .and. jc + 1 <= n2)
+        i0c = min(ic, cx)
+        i1c = min(ic + 1, cx)
+        j0c = min(jc, cy)
+        j1c = min(jc + 1, cy)
+        in0 = (i0c >= 1 .and. i0c <= n1)
+        in1 = (i1c >= 1 .and. i1c <= n1)
+        jn0 = (j0c >= 1 .and. j0c <= n2)
+        jn1 = (j1c >= 1 .and. j1c <= n2)
         a00 = 0.0_rp; a10 = 0.0_rp; a01 = 0.0_rp; a11 = 0.0_rp
         q00 = 0.0_rp; q10 = 0.0_rp; q01 = 0.0_rp; q11 = 0.0_rp
         if (in0 .and. jn0) then
-          a00 = b(ic, jc, 1); q00 = b(ic, jc, 2)
+          a00 = b(i0c, j0c, 1); q00 = b(i0c, j0c, 2)
         endif
         if (in1 .and. jn0) then
-          a10 = b(ic + 1, jc, 1); q10 = b(ic + 1, jc, 2)
+          a10 = b(i1c, j0c, 1); q10 = b(i1c, j0c, 2)
         endif
         if (in0 .and. jn1) then
-          a01 = b(ic, jc + 1, 1); q01 = b(ic, jc + 1, 2)
+          a01 = b(i0c, j1c, 1); q01 = b(i0c, j1c, 2)
         endif
         if (in1 .and. jn1) then
-          a11 = b(ic + 1, jc + 1, 1); q11 = b(ic + 1, jc + 1, 2)
+          a11 = b(i1c, j1c, 1); q11 = b(i1c, j1c, 2)
         endif
         f1 = (1.0_rp - yl) * ((1.0_rp - xl) * a00 + xl * a10) + yl * ((1.0_rp - xl) * a01 + xl * a11)
         f2 = (1.0_rp - yl) * ((1.0_rp - xl) * q00 + xl * q10) + yl * ((1.0_rp - xl) * q01 + xl * q11)
@@ -1448,6 +1456,22 @@ contains
       enddo
     enddo
   end subroutine interp_coarse
+
+  subroutine coarse_caps(n1, n2, cx, cy)
+    ! The cap on the coarse file index (xi: cx, eta: cy) of interp_coarse
+    ! and missing_coarse, as UCLA ROMS's clamp_coarse_edges
+    ! (roms_read_write, ucla-roms #439, d8dda5b2): with an odd LLm (MMm) in
+    ! a closed direction the last fine rho column (row) and the u (v) end
+    ! face need the coarse point after the file's last one (file index
+    ! n1 + 1, n2 + 1), which takes the last one's value. With an even LLm
+    ! (MMm) that point has zero weight and stays 0 (no cap), and a periodic
+    ! direction is left alone, as on the CPU.
+    integer, intent(in)  :: n1, n2
+    integer, intent(out) :: cx, cy
+    cx = huge(cx); cy = huge(cy)
+    if (.not. decomp%periodic_x .and. mod(int(decomp%gnx), 2) == 1) cx = n1
+    if (.not. decomp%periodic_y .and. mod(int(decomp%gny), 2) == 1) cy = n2
+  end subroutine coarse_caps
 
   subroutine interp_on_grid(b, n1, n2, c1, c2, dest, i0, j0)
     ! Device time interpolation of two buffered records onto the grid,
@@ -1636,9 +1660,10 @@ contains
     logical,  intent(in) :: es
     real(rp), WORK_ATTR intent(inout) :: ddco2(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(inout) :: ddalk(decomp%is:decomp%ie, decomp%js:decomp%je)
-    integer :: i, j, ie, je, gi0, gj0, ic, jc, m
+    integer :: i, j, ie, je, gi0, gj0, ic, jc, m, cx, cy, i0c, i1c, j0c, j1c
     real(rp) :: xg, yg, xl, yl, w, f1, f2, a00, a10, a01, a11, q00, q10, q01, q11
     logical :: in0, in1, jn0, jn1, v1, v2
+    call coarse_caps(n1, n2, cx, cy)
     ie = int(decomp%nx) + 1; je = int(decomp%ny) + 1
     gi0 = int(decomp%i0) - 1; gj0 = int(decomp%j0) - 1
 #ifdef USE_CUDA
@@ -1654,23 +1679,27 @@ contains
         yl = yg - real(jc, rp)
         ic = ic + 1
         jc = jc + 1
-        in0 = (ic >= 1 .and. ic <= n1)
-        in1 = (ic + 1 >= 1 .and. ic + 1 <= n1)
-        jn0 = (jc >= 1 .and. jc <= n2)
-        jn1 = (jc + 1 >= 1 .and. jc + 1 <= n2)
+        i0c = min(ic, cx)
+        i1c = min(ic + 1, cx)
+        j0c = min(jc, cy)
+        j1c = min(jc + 1, cy)
+        in0 = (i0c >= 1 .and. i0c <= n1)
+        in1 = (i1c >= 1 .and. i1c <= n1)
+        jn0 = (j0c >= 1 .and. j0c <= n2)
+        jn1 = (j1c >= 1 .and. j1c <= n2)
         a00 = 0.0_rp; a10 = 0.0_rp; a01 = 0.0_rp; a11 = 0.0_rp
         q00 = 0.0_rp; q10 = 0.0_rp; q01 = 0.0_rp; q11 = 0.0_rp
         if (in0 .and. jn0) then
-          a00 = bb(ic, jc, 1); q00 = bb(ic, jc, 2)
+          a00 = bb(i0c, j0c, 1); q00 = bb(i0c, j0c, 2)
         endif
         if (in1 .and. jn0) then
-          a10 = bb(ic + 1, jc, 1); q10 = bb(ic + 1, jc, 2)
+          a10 = bb(i1c, j0c, 1); q10 = bb(i1c, j0c, 2)
         endif
         if (in0 .and. jn1) then
-          a01 = bb(ic, jc + 1, 1); q01 = bb(ic, jc + 1, 2)
+          a01 = bb(i0c, j1c, 1); q01 = bb(i0c, j1c, 2)
         endif
         if (in1 .and. jn1) then
-          a11 = bb(ic + 1, jc + 1, 1); q11 = bb(ic + 1, jc + 1, 2)
+          a11 = bb(i1c, j1c, 1); q11 = bb(i1c, j1c, 2)
         endif
         f1 = (1.0_rp - yl) * ((1.0_rp - xl) * a00 + xl * a10) + yl * ((1.0_rp - xl) * a01 + xl * a11)
         f2 = (1.0_rp - yl) * ((1.0_rp - xl) * q00 + xl * q10) + yl * ((1.0_rp - xl) * q01 + xl * q11)
@@ -1688,10 +1717,10 @@ contains
             ddco2(i, j) = f2 / w
             if (es) then           ! eta's record m at the fine point
               a00 = 0.0_rp; a10 = 0.0_rp; a01 = 0.0_rp; a11 = 0.0_rp
-              if (in0 .and. jn0) a00 = be(ic, jc, m)
-              if (in1 .and. jn0) a10 = be(ic + 1, jc, m)
-              if (in0 .and. jn1) a01 = be(ic, jc + 1, m)
-              if (in1 .and. jn1) a11 = be(ic + 1, jc + 1, m)
+              if (in0 .and. jn0) a00 = be(i0c, j0c, m)
+              if (in1 .and. jn0) a10 = be(i1c, j0c, m)
+              if (in0 .and. jn1) a01 = be(i0c, j1c, m)
+              if (in1 .and. jn1) a11 = be(i1c, j1c, m)
               ddalk(i, j) = (1.0_rp - yl) * ((1.0_rp - xl) * a00 + xl * a10) + yl * ((1.0_rp - xl) * a01 + xl * a11)
             endif
           else
