@@ -90,6 +90,11 @@ module case_io
   logical :: case_have_prev = .false.
   logical,     public :: case_periodic_x = .false.
   logical,     public :: case_periodic_y = .false.
+  ! Local index of the first u (v) point of a file window, relative to the
+  ! window's first rho point i0 (j0): the file's u point 1 is the tile's
+  ! u point i0 + 1 next to a boundary rho column (i0 = 0), and i0 itself in
+  ! a periodic direction, which has no boundary column (infer_layout).
+  integer :: case_du = 1, case_dv = 1
   real(rp),    public :: case_v_sponge = 0.0_rp
   ! UCLA ROMS reads akt_bak and tnu2 with one value per tracer (NT long), in
   ! its tracer order (T, S, nt_passive generic, CDR_LITE, MARBL; tracers.F90),
@@ -937,16 +942,16 @@ contains
         if (fs_on .and. take_rates .and. nc_has_var(ncid, 'fs_delta')) then
           fs_rates_read = .true.
           call fs_alloc_rates()
-          call pr_store_2d(ncid, 'fs_udu', udu(decomp%is, decomp%js), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-          call pr_store_2d(ncid, 'fs_gru', gru(decomp%is, decomp%js), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-          call pr_store_2d(ncid, 'fs_udv', udv(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
-          call pr_store_2d(ncid, 'fs_grv', grv(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+          call pr_store_2d(ncid, 'fs_udu', udu(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+          call pr_store_2d(ncid, 'fs_gru', gru(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+          call pr_store_2d(ncid, 'fs_udv', udv(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+          call pr_store_2d(ncid, 'fs_grv', grv(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
           call pr_store_2d(ncid, 'fs_qd', qd(decomp%is, decomp%js), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
           call pr_store_2d(ncid, 'fs_delta', xx(decomp%is, decomp%js), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
           if (take_mg) then
             call pr_store_2d(ncid, 'fs_mge0', mg_se0(decomp%is, decomp%js), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-            call pr_store_2d(ncid, 'fs_mgcu', mg_scu(decomp%is, decomp%js), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-            call pr_store_2d(ncid, 'fs_mgcv', mg_scv(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+            call pr_store_2d(ncid, 'fs_mgcu', mg_scu(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+            call pr_store_2d(ncid, 'fs_mgcv', mg_scv(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
           endif
         endif
       endif
@@ -990,8 +995,8 @@ contains
     logical, intent(in) :: n2r, om
     integer :: nz, is, js
     nz = decomp%nz; is = decomp%is; js = decomp%js
-    call pr_store_3d(ncid, 'imex_pgu', im_pgu(is, js, 1, ipg_nm1), i0+1, j0, xi_u, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_3d(ncid, 'imex_pgv', im_pgv(is, js, 1, ipg_nm1), i0, j0+1, nxi, eta_v, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_3d(ncid, 'imex_pgu', im_pgu(is, js, 1, ipg_nm1), i0+case_du, j0, xi_u, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_3d(ncid, 'imex_pgv', im_pgv(is, js, 1, ipg_nm1), i0, j0+case_dv, nxi, eta_v, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     call pr_store_3d(ncid, 'imex_dpw', im_dpw(is, js, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     if (imex_rst_has('imex_xp')) then
       if (imex_stage_on()) then
@@ -1028,8 +1033,8 @@ contains
   subroutine load_2d_record(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
     integer, intent(in) :: ncid, rec, i0, j0, nxi, neta, xi_u, eta_v
     call pr_store_2d(ncid, 'zeta', zeta(decomp%is, decomp%js, 1), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'ubar', ubar(decomp%is, decomp%js, 1), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'vbar', vbar(decomp%is, decomp%js, 1), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'ubar', ubar(decomp%is, decomp%js, 1), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'vbar', vbar(decomp%is, decomp%js, 1), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
     if (nc_has_var(ncid, 'hbls')) then
       call pr_store_2d(ncid, 'hbls', hbls(decomp%is, decomp%js), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
     endif
@@ -1040,13 +1045,13 @@ contains
     ! Clamped to [0, 1] as the CPU does (fill values on land), not masked
     ! with umask/vmask: river faces have umask = 0.
     if (nc_has_var(ncid, 'riv_umask')) then
-      call pr_store_2d(ncid, 'riv_umask', riv_umask(decomp%is, decomp%js), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+      call pr_store_2d(ncid, 'riv_umask', riv_umask(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
       if (pr_taking()) then
         where (riv_umask /= riv_umask .or. riv_umask < 0.0_rp .or. riv_umask > 1.0_rp) riv_umask = 0.0_rp
       endif
     endif
     if (nc_has_var(ncid, 'riv_vmask')) then
-      call pr_store_2d(ncid, 'riv_vmask', riv_vmask(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+      call pr_store_2d(ncid, 'riv_vmask', riv_vmask(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
       if (pr_taking()) then
         where (riv_vmask /= riv_vmask .or. riv_vmask < 0.0_rp .or. riv_vmask > 1.0_rp) riv_vmask = 0.0_rp
       endif
@@ -1056,8 +1061,8 @@ contains
   subroutine load_3d_record(ncid, rec, tindx, i0, j0, nxi, neta, xi_u, eta_v)
     integer, intent(in) :: ncid, rec, tindx, i0, j0, nxi, neta, xi_u, eta_v
     integer :: itp
-    call pr_store_3d(ncid, 'u', u(decomp%is, decomp%js, 1, tindx), i0+1, j0, xi_u, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_3d(ncid, 'v', v(decomp%is, decomp%js, 1, tindx), i0, j0+1, nxi, eta_v, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_3d(ncid, 'u', u(decomp%is, decomp%js, 1, tindx), i0+case_du, j0, xi_u, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_3d(ncid, 'v', v(decomp%is, decomp%js, 1, tindx), i0, j0+case_dv, nxi, eta_v, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     call pr_store_3d(ncid, 'temp', t(decomp%is, decomp%js, 1, tindx, 1), i0, j0, nxi, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     call pr_store_3d(ncid, 'salt', t(decomp%is, decomp%js, 1, tindx, 2), i0, j0, nxi, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     ! Passive tracers, when the file carries them (float32 in restarts).
@@ -1084,12 +1089,12 @@ contains
 
   subroutine load_coupling_fields(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
     integer, intent(in) :: ncid, rec, i0, j0, nxi, neta, xi_u, eta_v
-    call pr_store_2d(ncid, 'DU_avg1', DU_avg1(decomp%is, decomp%js), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'DV_avg1', DV_avg1(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'DU_avg2', DU_avg2(decomp%is, decomp%js), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'DV_avg2', DV_avg2(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'DU_avg_bak', DU_avg_bak(decomp%is, decomp%js), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'DV_avg_bak', DV_avg_bak(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'DU_avg1', DU_avg1(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'DV_avg1', DV_avg1(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'DU_avg2', DU_avg2(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'DV_avg2', DV_avg2(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'DU_avg_bak', DU_avg_bak(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'DV_avg_bak', DV_avg_bak(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
     ! CPU get_init: zero true land but keep river faces (umask = 0, riv_umask = 1)
     DU_avg1 = DU_avg1 * (umask + riv_umask)
     DV_avg1 = DV_avg1 * (vmask + riv_vmask)
@@ -1108,11 +1113,11 @@ contains
     ncid_has_uslow = nc_has_var(ncid, 'u_slow')
     ncid_has_vslow = nc_has_var(ncid, 'v_slow')
     if (ncid_has_uslow) then
-      call pr_store_3d(ncid, 'u_slow', u_slow(decomp%is, decomp%js, 1), i0+1, j0, xi_u, neta, decomp%nz, rec, &
+      call pr_store_3d(ncid, 'u_slow', u_slow(decomp%is, decomp%js, 1), i0+case_du, j0, xi_u, neta, decomp%nz, rec, &
                        i0f=tile_fi0, j0f=tile_fj0)
     endif
     if (ncid_has_vslow) then
-      call pr_store_3d(ncid, 'v_slow', v_slow(decomp%is, decomp%js, 1), i0, j0+1, nxi, eta_v, decomp%nz, rec, &
+      call pr_store_3d(ncid, 'v_slow', v_slow(decomp%is, decomp%js, 1), i0, j0+case_dv, nxi, eta_v, decomp%nz, rec, &
                        i0f=tile_fi0, j0f=tile_fj0)
     endif
     if (nc_has_var(ncid, 'p_slow')) then
@@ -1174,8 +1179,8 @@ contains
     else
       return
     endif
-    call pr_store_2d(ncid, trim(uname), rufrc_bak(decomp%is, decomp%js, tindx), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, trim(vname), rvfrc_bak(decomp%is, decomp%js, tindx), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, trim(uname), rufrc_bak(decomp%is, decomp%js, tindx), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, trim(vname), rvfrc_bak(decomp%is, decomp%js, tindx), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
     rufrc_bak(:, :, tindx) = rufrc_bak(:, :, tindx) * umask
     rvfrc_bak(:, :, tindx) = rvfrc_bak(:, :, tindx) * vmask
   end subroutine load_rufrc_slot
@@ -1189,11 +1194,13 @@ contains
       i0 = 0; j0 = 0
       case_periodic_x = .false.
       case_periodic_y = .false.
+      case_du = 1; case_dv = 1
       nxi = int(decomp%nx) + 2; neta = int(decomp%ny) + 2   ! this tile's window of the global grid
     elseif (xi_rho == case_llm .and. eta_rho == case_mmm) then
       i0 = 1; j0 = 1
       case_periodic_x = .true.
       case_periodic_y = .true.
+      case_du = 0; case_dv = 0
       nxi = int(decomp%nx); neta = int(decomp%ny)
     else
       write(*,*) 'grid dims', xi_rho, eta_rho, 'do not match LLm,MMm', case_llm, case_mmm

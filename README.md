@@ -224,6 +224,13 @@ v0.1.2-beta, bit for bit.
   of them stopped the run at the namelist read. BGC tracer subcycling is
   not on the GPU yet: `bgc_physics_subcycle = .true.` stops the run;
   `marbl_balance = .true.` is ignored with a note (see `NAMELIST_COMPAT`).
+- Periodic grids (a grid file of LLm x MMm points): history, average and
+  restart files are written, and a restart from them is exact. Before,
+  the first record stopped the run with "NetCDF: Start+count exceeds
+  dimension bound" (rho-point slabs started one point too far in a
+  periodic direction, `io_server.F90` `add_var`), and initial and
+  restart files were read with u and v points one point off
+  (`case_io.F90`). Non-periodic runs are unchanged, bit for bit.
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
   depth-integrated internal-tide energy flux `up`/`vp` of the parent,
   written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS
@@ -281,8 +288,7 @@ v0.1.2-beta, bit for bit.
     tilings are 0.3-1.3 times the CPU model's own 2x2 against 4x1
     difference (hbbl 1.8 times), and the GPU against the CPU at the same
     tiling 0.6-1.05 times (hbbl 1.8).
-  - Not tested on the GPU: periodic domains (the GPU model cannot write
-    output on a periodic grid), `fs_drag_implicit`, sponge tuning
+  - Not tested on the GPU: periodic domains, `fs_drag_implicit`, sponge tuning
     (`ub_tune`) together with the implicit free surface, more than two
     nodes. A closed basin and river and CDR volume sources were checked
     during the port's development, not on this branch's gate cases, of
