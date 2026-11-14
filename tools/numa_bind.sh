@@ -10,12 +10,18 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 r=${PALS_RANKID:-${PMI_RANK:-${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-0}}}}
 lr=${PALS_LOCAL_RANKID:-${SLURM_LOCALID:-${OMPI_COMM_WORLD_LOCAL_RANK:-${MPI_LOCALRANKID:-}}}}
 ls=${PALS_LOCAL_SIZE:-${OMPI_COMM_WORLD_LOCAL_SIZE:-${MPI_LOCALNRANKS:-${SLURM_NTASKS_PER_NODE:-}}}}
+nd=${PALS_NODEID:-${SLURM_NODEID:-}}
 # Writer ranks run unbound (binding them next to the GPU ranks slowed their
 # file writes ~20%). With ROMS_GPU_NWRITERS=w they are the last w ranks of each
-# node (before the forcing reader); otherwise every world rank from
-# NUMA_BIND_NRANKS on (the GPU compute rank count; submit_gpu.sh passes it).
-# A forcing reader (ROMS_GPU_FRC_READER=1: the last rank of every node) runs
-# unbound too.
+# node (before the forcing reader). Otherwise they are the ranks after the
+# first NUMA_BIND_NRANKS (the GPU compute rank count; submit_gpu.sh passes it)
+# in world order, counting the forcing readers out, as the model does
+# (src/shared/comm.F90): with a reader on every node, the readers before this
+# rank are one per earlier node, so the node index (PALS_NODEID or
+# SLURM_NODEID) is taken off the world rank. Without a node index the world
+# rank is used as it is, which leaves the last compute ranks of a multi-node
+# job unbound. A forcing reader (ROMS_GPU_FRC_READER=1: the last rank of
+# every node) runs unbound too.
 nrd=0
 if [ "${ROMS_GPU_FRC_READER:-0}" = 1 ]; then
   nrd=1
@@ -23,7 +29,11 @@ if [ "${ROMS_GPU_FRC_READER:-0}" = 1 ]; then
 fi
 if [ -n "$ROMS_GPU_NWRITERS" ]; then
   if [ -n "$lr" ] && [[ "$ls" =~ ^[0-9]+$ ]] && [ "$lr" -ge $(( ls - ROMS_GPU_NWRITERS - nrd )) ]; then exec "$@"; fi
-elif [ -n "$NUMA_BIND_NRANKS" ] && [ "$r" -ge "$NUMA_BIND_NRANKS" ]; then exec "$@"; fi
+elif [ -n "$NUMA_BIND_NRANKS" ]; then
+  below=$r                          # ranks before this one, readers not counted
+  if [ "$nrd" = 1 ] && [[ "$nd" =~ ^[0-9]+$ ]]; then below=$(( r - nd )); fi
+  if [ "$below" -ge "$NUMA_BIND_NRANKS" ]; then exec "$@"; fi
+fi
 ng=$(nvidia-smi -L 2>/dev/null | wc -l)
 if [ "$ng" -ge 1 ]; then
   g=$(( ${lr:-$r} % ng ))

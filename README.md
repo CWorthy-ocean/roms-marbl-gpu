@@ -241,6 +241,14 @@ v0.1.2-beta, bit for bit.
   each monthly boundary file fell from 157-415 ms to 7 ms. No cost when the
   files are already cached. Without a spare rank on every node the run has
   no reader and says so.
+- `tools/numa_bind.sh` binds every compute rank of a multi-node job with
+  the forcing reader. Before, on N nodes in the default layout, the last
+  N-1 compute ranks (world rank 8 of the 2-node 4 + reader | 4 + writer +
+  reader layout) ran unbound: the readers shift the world ranks, and the
+  script compared them with the compute rank count `submit_gpu.sh`
+  passes. It now counts the readers out as the model does, from the node
+  index (`PALS_NODEID` or `SLURM_NODEID`). Other layouts bind as before;
+  results are unchanged, bit for bit (binding only).
 
 - Averaged MARBL output as UCLA ROMS writes it from 0.13.0 (ucla-roms
   #400). `_bgc_avg` with `wrt_bgc_his = .false.`: the start-up state is
