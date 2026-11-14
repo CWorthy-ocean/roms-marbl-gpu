@@ -32,6 +32,8 @@ module step_driver
   use run_timers, only: rt_dev_collect, wall_time
   use arch_mod, only: sync_arch
   use upscale_out, only: wrt_upscale
+  use imex_igw, only: imex_on, imex_begin_step, imex_solve_stage, imex_stage_corr, &
+                      imex_shift_levels, imex_tsmix_active
   use implicit_fs_gpu, only: fs_on, fs_step, fs_srcdiag, fs_src_diag
   implicit none
   private
@@ -80,6 +82,7 @@ contains
          iic - ntstart < fast_probe_to)
     call begin_predictor_indices()
     call step_timer_init()
+    if (imex_on) call imex_begin_step()   ! IMEX_IGW: this step's weights; n-1 stores on the first
 
     ! --- predictor (nrhs = n, nnew = 3) ---
     frc_slot = 0
@@ -178,6 +181,15 @@ contains
       call step_mark('calc_pflx')
     endif
     call step3d_uv1()
+    if (imex_on) then
+      ! IMEX_IGW: elliptic correction of u, v(nnew) (Hz-weighted); rufrc
+      ! keeps the explicit rhs; then the halos of the corrected faces
+      call imex_solve_stage(imex_stage_corr)
+      call hg_begin()
+      call hg_add(F_U, nnew)
+      call hg_add(F_V, nnew)
+      call hg_end()
+    endif
     call visc3d()
     call step_mark('step3d_uv1+visc')
     if (ntp > 0) call passive_exchange_mid()   ! slot 3 of the passives: east-west done, post north-south
@@ -233,8 +245,18 @@ contains
     call dump_max_t('after step3d_t')
     call dump_col_probe('after step3d_t', nnew)
     call dump_rim('after step3d_t')
+    if (imex_tsmix_active()) then
+      ! IMEX_IGW: lateral tracer mixing from t^n (nstp), not
+      ! the predictor state (nrhs = 3)
+      n = nrhs
+      nrhs = nstp
+      call t3dmix()
+      if (ntp > 0) call passive_t3dmix()
+      nrhs = n
+    else
     call t3dmix()
     if (ntp > 0) call passive_t3dmix()
+    endif
     call dump_col_probe('after t3dmix', nnew)
     call rho_eos(nnew, 3)
     call step_mark('step3d_t')
@@ -254,6 +276,7 @@ contains
       write(*,'(a,es14.6)') 'step: max Akv = ', akvmax
       write(*,'(a,es14.6)') 'step: max hbls = ', hblmax
     endif
+    if (imex_on) call imex_shift_levels()   ! IMEX_IGW: level n becomes n-1
     call step_mark('baroclinic step')
     call rt_dev_collect()        ! the device is drained here
   end subroutine run_baroclinic_step

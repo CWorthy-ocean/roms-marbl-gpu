@@ -20,6 +20,7 @@ module case_io
   use cdr_gas_out, only: read_cdr_gas_output_namelist, set_cdr_gas_output_root, init_cdr_gas_output
   use cdr_out, only: read_cdr_output_namelist, set_cdr_output_root, init_cdr_output
   use upscale_out, only: read_upscale_namelist, set_upscale_root, init_upscale_output
+  use imex_igw, only: imex_read_namelist
   use implicit_fs_gpu, only: fs_read_namelist
   use his_io, only: read_output_namelist, read_refdate_namelist, set_output_root, init_output
   use avg_out, only: read_avg_namelist, set_avg_root, init_avg_output
@@ -41,6 +42,10 @@ module case_io
                        marbl_gpu_load_state
   use fs_data, only: fs_alloc_rates, udu, udv, gru, grv, qd, xx, mg_se0, mg_scu, mg_scv, fs_nsc, fs_pot_phase
   use implicit_fs_gpu, only: fs_rst_loaded, fs_on, fs_rst_scal_in, fs_mg_loaded
+  use imex_igw, only: imex_rst_has, imex_rst_accept, imex_rst_loaded, imex_nsc, imex_stage_on, &
+                      im_pgu => pgu, im_pgv => pgv, ipg_nm1, im_dpw => dpw, im_hs1 => hs1, im_hs2 => hs2, &
+                      im_hsol => hsol, im_mq => pf_mq, im_bref => bref_sav, im_n2raw => ad_n2raw, &
+                      im_hzop => hz_op, im_dza => dza, im_n2o => ad_n2o
   implicit none
   private
   logical :: passive_loaded = .false.
@@ -203,6 +208,7 @@ contains
     call read_cdr_gas_output_namelist(unit)
     call read_cdr_output_namelist(unit)
     call read_upscale_namelist(unit)
+    call imex_read_namelist(unit)         ! &imex_igw_settings: IMEX_IGW on when present
     call fs_read_namelist(unit)           ! &implicit_fs: implicit free surface when fs_mode = 'implicit'
     case_ntp_est = nt_bgc + ntp + ncdr        ! MARBL + generic + CDR_LITE (ntp = nt_passive here)
 
@@ -797,8 +803,9 @@ contains
     integer :: nrecs, rec, ibuf(8)
     real(rp) :: tbuf(1), time_bak, tscale
     logical :: times_ok, steps_ok, have_coup, has_tstep, fs_rates_read
-    logical :: have_sc, take_rates, take_mg
-    real(8) :: fsc(fs_nsc)
+    logical :: have_sc, take_rates, take_mg, take_imex, imex_n2r
+    integer :: nsf
+    real(8) :: fsc(fs_nsc), isc(imex_nsc)
     character(len=64) :: units
 
     case_exact_restart = .false.
@@ -890,6 +897,21 @@ contains
       if (have_sc) call nc_get_vec_rec_d(ncid, 'fs_rst_scal', fsc, rec)
       call fs_rst_scal_in(have_sc, fsc, take_rates, take_mg)
     endif
+    ! IMEX_IGW exact restart (CPU 22c05bc1 imex_rst_get): the IMEX state of the record when
+    ! the restart is exact and the record has a complete state for this run's settings
+    take_imex = .false.; imex_n2r = .false.
+    if (imex_rst_has('imex_rst_scal')) then
+      have_sc = nc_has_var(ncid, 'imex_rst_scal')
+      isc = 0.0d0
+      if (have_sc) then                   ! (files with 16 scalars, written before the 17th was added)
+        nsf = max(1, min(nc_dim_len(ncid, 'imex_nscal'), imex_nsc))
+        call nc_get_vec_rec_d(ncid, 'imex_rst_scal', isc(1:nsf), rec)
+      endif
+      take_imex = imex_rst_accept(case_exact_restart, have_sc, isc)
+      ! imex_n2raw: read when in the file (every file with a taper since CPU 72539140; no setup lag or
+      ! a file of e8fca7b-aeceaec before), else recomputed
+      imex_n2r = take_imex .and. nc_has_var(ncid, 'imex_n2raw')
+    endif
     ! All records through the collective reader: phase 1 queues every window,
     ! pr_flush reads whole variables in parallel and redistributes, phase 2
     ! stores the windows (same call sequence both times).
@@ -926,6 +948,7 @@ contains
         endif
       endif
       if (calc_pflx) call load_pflx_slow(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
+      if (take_imex) call load_imex_state(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v, imex_n2r)
       if (ld_phase == 1) then
         call wall_stamp('ini queued')
         call pr_flush(ncid)
@@ -933,6 +956,7 @@ contains
       endif
     enddo
     call pr_end()
+    if (take_imex) call imex_rst_loaded(isc, imex_n2r)
     if (fs_rates_read .and. take_mg) call fs_mg_loaded()
     if (fs_rates_read) then
       call fs_rst_loaded()
@@ -953,6 +977,42 @@ contains
     call fill_loaded_halos()
     call wall_stamp('ini halos')
   end subroutine load_init_records
+
+  subroutine load_imex_state(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v, n2r)
+    ! the IMEX_IGW state of the file (CPU 73a63afb imex_rst_get; his_io writes it): the time-less
+    ! copy, or (files of e8fca7b-aeceaec, a copy per record) record rec's (par_read takes the record
+    ! only for a variable that has the record dimension); only what the settings in effect use;
+    ! n2r: imex_n2raw is read (else imex_rst_loaded recomputes it)
+    integer, intent(in) :: ncid, rec, i0, j0, nxi, neta, xi_u, eta_v
+    logical, intent(in) :: n2r
+    integer :: nz, is, js
+    nz = decomp%nz; is = decomp%is; js = decomp%js
+    call pr_store_3d(ncid, 'imex_pgu', im_pgu(is, js, 1, ipg_nm1), i0+1, j0, xi_u, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_3d(ncid, 'imex_pgv', im_pgv(is, js, 1, ipg_nm1), i0, j0+1, nxi, eta_v, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_3d(ncid, 'imex_dpw', im_dpw(is, js, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    if (imex_rst_has('imex_xp')) then
+      if (imex_stage_on()) then
+        call pr_store_3d(ncid, 'imex_xp', im_hs1(is, js, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+        call pr_store_3d(ncid, 'imex_xc', im_hs2(is, js, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+      else
+        call pr_store_3d(ncid, 'imex_xp', im_hsol(is, js, 1, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+        call pr_store_3d(ncid, 'imex_xc', im_hsol(is, js, 1, 2), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+      endif
+    endif
+    if (imex_rst_has('imex_mxp')) then
+      call pr_store_3d(ncid, 'imex_mxp', im_mq(is, js, 1, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+      call pr_store_3d(ncid, 'imex_mxc', im_mq(is, js, 1, 2), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    endif
+    call pr_store_3d(ncid, 'imex_bref', im_bref(is, js, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    if (n2r) &
+         call pr_store_3d(ncid, 'imex_n2raw', im_n2raw(is, js, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    if (imex_rst_has('imex_hzop')) then
+      call pr_store_3d(ncid, 'imex_hzop', im_hzop(is, js, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+      call pr_store_3d(ncid, 'imex_dza', im_dza(is, js, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    else
+      call pr_store_3d(ncid, 'imex_n2o', im_n2o(is, js, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    endif
+  end subroutine load_imex_state
 
   logical function has_coupling_fields(ncid) result(ok)
     integer, intent(in) :: ncid

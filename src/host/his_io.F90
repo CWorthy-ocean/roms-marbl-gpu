@@ -22,6 +22,10 @@ module his_io
                        marbl_gpu_define_rst, marbl_gpu_write_rst, marbl_gpu_stage_rst8
   use fs_data, only: fs_on, udu, udv, gru, grv, qd, xx, mg_on, fs_mg_lag, mg_se0, mg_scu, mg_scv, fs_nsc
   use implicit_fs_gpu, only: fs_rst_prepare, fs_rst_scal_vals, fs_global_atts
+  use imex_igw, only: imex_rst_has, imex_rst_prepare, imex_rst_scal_vals, imex_nsc, imex_stage_on, &
+                      im_pgu => pgu, im_pgv => pgv, ipg_nm1, im_dpw => dpw, im_hs1 => hs1, im_hs2 => hs2, &
+                      im_hsol => hsol, im_mq => pf_mq, im_bref => bref_sav, im_n2raw => ad_n2raw, &
+                      im_hzop => hz_op, im_dza => dza, im_n2o => ad_n2o
   implicit none
   private
 
@@ -278,7 +282,7 @@ contains
 
   subroutine wrt_rst()
     integer :: ncid, n2, n3, itp, ir, nz, is, js
-    real(8) :: fsc(fs_nsc)
+    real(8) :: fsc(fs_nsc), isc(imex_nsc)
     real(rp) :: twrite
     character(len=512) :: open_rst
     open_rst = ''
@@ -341,6 +345,39 @@ contains
           call io_stage8_2d('fs_mgcv', mg_scv(is, js), ir0, ir1, jv0, jv1, ir0, 0)
         endif
       endif
+      if (imex_rst_has('imex_rst_scal')) then   ! IMEX_IGW exact restart (CPU 73a63afb imex_rst_wrt)
+        call imex_rst_scal_vals(isc, rec_rst)
+        call io_stage8_vec('imex_rst_scal', isc)
+        ! the 3-D state: one time-less copy per file, with the second record of the pair
+        if (rec_rst == 2 .and. imex_rst_has('imex_pgu')) then
+          call imex_rst_prepare()
+          call io_stage8_3d('imex_pgu', im_pgu(is, js, 1, ipg_nm1), 1, nz, iu0, iu1, jr0, jr1, 0, jr0)
+          call io_stage8_3d('imex_pgv', im_pgv(is, js, 1, ipg_nm1), 1, nz, ir0, ir1, jv0, jv1, ir0, 0)
+          call io_stage8_3d('imex_dpw', im_dpw(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+          if (imex_rst_has('imex_xp')) then
+            if (imex_stage_on()) then
+              call io_stage8_3d('imex_xp', im_hs1(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+              call io_stage8_3d('imex_xc', im_hs2(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+            else
+              call io_stage8_3d('imex_xp', im_hsol(is, js, 1, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+              call io_stage8_3d('imex_xc', im_hsol(is, js, 1, 2), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+            endif
+          endif
+          if (imex_rst_has('imex_mxp')) then
+            call io_stage8_3d('imex_mxp', im_mq(is, js, 1, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+            call io_stage8_3d('imex_mxc', im_mq(is, js, 1, 2), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+          endif
+          call io_stage8_3d('imex_bref', im_bref(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+          if (imex_rst_has('imex_n2raw')) &
+               call io_stage8_3d('imex_n2raw', im_n2raw(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+          if (imex_rst_has('imex_hzop')) then
+            call io_stage8_3d('imex_hzop', im_hzop(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+            call io_stage8_3d('imex_dza', im_dza(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+          else
+            call io_stage8_3d('imex_n2o', im_n2o(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+          endif
+        endif
+      endif
       call io_stage8_2d('rufrc', rufrc_bak(is, js, max(nstp, 1)), iu0, iu1, jr0, jr1, 0, jr0)
       call io_stage8_2d('rvfrc', rvfrc_bak(is, js, max(nstp, 1)), ir0, ir1, jv0, jv1, ir0, 0)
       if (river_on) then   ! river faces for the next run's initial masks (CPU wrt_rst)
@@ -398,6 +435,37 @@ contains
         call put_r2(ncid, 'fs_mge0', mg_se0, rec_rst)
         call put_u2(ncid, 'fs_mgcu', mg_scu, rec_rst)
         call put_v2(ncid, 'fs_mgcv', mg_scv, rec_rst)
+      endif
+    endif
+    if (imex_rst_has('imex_rst_scal')) then   ! IMEX_IGW exact restart (CPU 73a63afb imex_rst_wrt)
+      call imex_rst_scal_vals(isc, rec_rst)
+      call nc_put_vec_rec_d(ncid, 'imex_rst_scal', isc, rec_rst)
+      if (rec_rst == 2 .and. imex_rst_has('imex_pgu')) then   ! one time-less copy, with record 2
+        call imex_rst_prepare()
+        call put_u3(ncid, 'imex_pgu', im_pgu(:,:,:,ipg_nm1), rec_rst)
+        call put_v3(ncid, 'imex_pgv', im_pgv(:,:,:,ipg_nm1), rec_rst)
+        call put_r3(ncid, 'imex_dpw', im_dpw, rec_rst)
+        if (imex_rst_has('imex_xp')) then
+          if (imex_stage_on()) then
+            call put_r3(ncid, 'imex_xp', im_hs1, rec_rst)
+            call put_r3(ncid, 'imex_xc', im_hs2, rec_rst)
+          else
+            call put_r3(ncid, 'imex_xp', im_hsol(:,:,:,1), rec_rst)
+            call put_r3(ncid, 'imex_xc', im_hsol(:,:,:,2), rec_rst)
+          endif
+        endif
+        if (imex_rst_has('imex_mxp')) then
+          call put_r3(ncid, 'imex_mxp', im_mq(:,:,:,1), rec_rst)
+          call put_r3(ncid, 'imex_mxc', im_mq(:,:,:,2), rec_rst)
+        endif
+        call put_r3(ncid, 'imex_bref', im_bref, rec_rst)
+        if (imex_rst_has('imex_n2raw')) call put_r3(ncid, 'imex_n2raw', im_n2raw, rec_rst)
+        if (imex_rst_has('imex_hzop')) then
+          call put_r3(ncid, 'imex_hzop', im_hzop, rec_rst)
+          call put_r3(ncid, 'imex_dza', im_dza, rec_rst)
+        else
+          call put_r3(ncid, 'imex_n2o', im_n2o, rec_rst)
+        endif
       endif
     endif
     call put_u2(ncid, 'rufrc', rufrc_bak(:,:,max(nstp,1)), rec_rst)
@@ -518,6 +586,32 @@ contains
         id = nc_def_var(ncid, 'fs_mgcv', (/d_xi, d_etav, d_t/))
       endif
     endif
+    if (imex_rst_has('imex_rst_scal')) then   ! IMEX_IGW exact restart (CPU 73a63afb imex_rst_def)
+      d_sc = nc_def_dim(ncid, 'imex_nscal', imex_nsc)
+      id = nc_def_var(ncid, 'imex_rst_scal', (/d_sc, d_t/))
+      ! the 3-D state: no time dimension (one copy per file), only what the settings use
+      if (imex_rst_has('imex_pgu')) then
+        id = nc_def_var(ncid, 'imex_pgu', (/d_xiu, d_eta, d_s/))
+        id = nc_def_var(ncid, 'imex_pgv', (/d_xi, d_etav, d_s/))
+        id = nc_def_var(ncid, 'imex_dpw', (/d_xi, d_eta, d_s/))
+        if (imex_rst_has('imex_xp')) then
+          id = nc_def_var(ncid, 'imex_xp', (/d_xi, d_eta, d_s/))
+          id = nc_def_var(ncid, 'imex_xc', (/d_xi, d_eta, d_s/))
+        endif
+        if (imex_rst_has('imex_mxp')) then
+          id = nc_def_var(ncid, 'imex_mxp', (/d_xi, d_eta, d_s/))
+          id = nc_def_var(ncid, 'imex_mxc', (/d_xi, d_eta, d_s/))
+        endif
+        id = nc_def_var(ncid, 'imex_bref', (/d_xi, d_eta, d_s/))
+        if (imex_rst_has('imex_n2raw')) id = nc_def_var(ncid, 'imex_n2raw', (/d_xi, d_eta, d_s/))
+        if (imex_rst_has('imex_hzop')) then
+          id = nc_def_var(ncid, 'imex_hzop', (/d_xi, d_eta, d_s/))
+          id = nc_def_var(ncid, 'imex_dza', (/d_xi, d_eta, d_s/))
+        else
+          id = nc_def_var(ncid, 'imex_n2o', (/d_xi, d_eta, d_s/))
+        endif
+      endif
+    endif
     id = nc_def_var(ncid, 'rufrc', (/d_xiu, d_eta, d_t/))
     id = nc_def_var(ncid, 'rvfrc', (/d_xi, d_etav, d_t/))
     if (river_on) then
@@ -547,7 +641,7 @@ contains
 
   subroutine init_staging()
     ! Pinned staging capacity: one history record of float32 fields.
-    integer :: n2d, n3d, n3w, nh, nhw, nxy, cap_rec, cap_field
+    integer :: n2d, n3d, n3w, nh, nhw, nxy, cap_rec, cap_field, n3x
     nxy = max(nxi, nxi_u) * max(neta, neta_v)
     nh = decomp%nz
     nhw = decomp%nz + 1
@@ -560,8 +654,11 @@ contains
     cap_field = nxy * nhw
     if (wrt_file_his .or. wrt_file_rst) call io_init(cap_rec, cap_field)
     ! double-precision capacity for one restart record of this tile
-    ! (+ the implicit free surface's rates, scalars and fs_mg_lag fields, when on: 8 2-D fields and 64 values)
-    if (wrt_file_rst) call io_init8((15 + 2 + 8) * nxy + (4 + ntp + 2 + merge(3, 0, calc_pflx)) * nxy * nh &
+    ! (+ the implicit free surface's rates, scalars and fs_mg_lag fields, when on: 8 2-D fields and 64 values;
+    ! + the IMEX state, when on: 11 3-D fields and the scalars)
+    n3x = 0
+    if (imex_rst_has('imex_rst_scal')) n3x = 12
+    if (wrt_file_rst) call io_init8((15 + 2 + 8) * nxy + (4 + ntp + 2 + merge(3, 0, calc_pflx) + n3x) * nxy * nh &
          + 4 * (max(nxi, neta) + 2) + 64, nxy * nh)
   end subroutine init_staging
 
