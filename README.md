@@ -245,10 +245,8 @@ v0.1.2-beta, bit for bit.
   `&bgc_settings` `bgc_physics_subcycle` and `bgc_physics_timestep` (and the
   testing keys `bgc_subcycle_pos`, `bgc_subcycle_diag`) and
   `&marbl_biogeochemistry_settings` `marbl_balance` are read. Before, any
-  of them stopped the run at the namelist read. BGC tracer subcycling is
-  not on the GPU yet: `bgc_physics_subcycle = .true.` checks the keys and
-  the restart rule with UCLA ROMS's messages and then stops the run;
-  `marbl_balance = .true.` is ignored with a note (see `NAMELIST_COMPAT`).
+  of them stopped the run at the namelist read. `marbl_balance = .true.`
+  is ignored with a note (see `NAMELIST_COMPAT`).
 - Periodic grids (a grid file of LLm x MMm points): history, average and
   restart files are written, and a restart from them is exact. Before,
   the first record stopped the run with "NetCDF: Start+count exceeds
@@ -291,14 +289,21 @@ v0.1.2-beta, bit for bit.
   steps in its first 24 steps too; on the closed basin with rivers and
   CDR that changes results at round-off (1e-13 in `DU_avg1`), on sargasso
   and the N2 nest not at all.
-- BGC tracer subcycling, port in progress (`src/device/bgc_subcycle.F90`):
-  so far a test stub. With `bgc_physics_subcycle = .true.` and the
-  environment variable `ROMS_GPU_BGCSUB_STUB=1` the stock passive-tracer
-  step is switched off, the corrector transports are summed over each
-  window, and the window end runs MARBL (at MARBL steps), the exchange and
-  the copy to the other time slots, but no transport, mixing or sources:
-  the BGC tracers are held frozen. For testing and timing the port only;
-  it is not BGC subcycling.
+- BGC tracer subcycling, port in progress (`src/device/bgc_subcycle.F90`,
+  `src/device/bgc_window.F90`; UCLA ROMS #428/#430). With
+  `bgc_physics_subcycle = .true.` the BGC tracers are transported, mixed
+  and forced once per window of `bgc_physics_timestep` from the corrector
+  transports summed over the window, as UCLA ROMS does it: a Lin-Rood
+  swept-volume pass horizontally (with TS_DIF2 diffusion and the upwind
+  inflow rule on open sides), a 1-D swept flux vertically, the CFLX_CORR
+  surface restoring, implicit vertical mixing with the window-integrated
+  diffusivity, the window boundary conditions, then MARBL at MARBL steps.
+  Not yet on the GPU, so the run stops: at start-up with river sources,
+  CDR releases, CDR_LITE tracers, `bgc_subcycle_pos = .true.` or
+  `bgc_subcycle_diag >= 2`; at the first window whose Courant numbers need
+  more than one sub-pass on some level (UCLA ROMS splits such a level;
+  shorten the window). `bgc_subcycle_diag = 1` prints UCLA ROMS's `BGCSUB`
+  window diagnostics.
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
   depth-integrated internal-tide energy flux `up`/`vp` of the parent,
   written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS

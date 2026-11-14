@@ -16,14 +16,13 @@
 # namelist written from its template runs:
 #   &bgc_settings  bgc_physics_subcycle, bgc_physics_timestep (BGC tracer
 #     subcycling, #428), and its testing keys bgc_subcycle_pos and
-#     bgc_subcycle_diag. Subcycling is not on the GPU yet:
-#     bgc_physics_subcycle = .true. checks the keys and the restart rule
-#     as UCLA ROMS does (same messages; bgc_subcycle_pos = .true.,
-#     bgc_subcycle_diag >= 2 and builds without -DPASSIVE_FP64 are refused)
-#     and then stops the run at start-up; the other three keys act only
-#     with it. The port's test stub (environment variable
-#     ROMS_GPU_BGCSUB_STUB=1) runs with the BGC tracers held frozen: it
-#     does NOT transport, mix or force them (MARBL still runs).
+#     bgc_subcycle_diag, with UCLA ROMS's checks, restart rule and messages.
+#     The GPU port is partial: every level of a window is transported in
+#     one sub-pass, and a window that needs more stops the run (shorten
+#     bgc_physics_timestep); river sources, CDR releases, CDR_LITE tracers,
+#     bgc_subcycle_pos = .true., bgc_subcycle_diag >= 2 and builds without
+#     -DPASSIVE_FP64 are refused at start-up. bgc_subcycle_diag = 1 prints
+#     the BGCSUB window lines.
 #   &marbl_biogeochemistry_settings  marbl_balance (#430), which ships MARBL
 #     columns between CPU ranks and changes no result. Each GPU computes
 #     the wet columns of its tile (&tile_settings balances them), so

@@ -46,7 +46,7 @@ SRC_SHARED = src/shared/kinds.F90 src/shared/decomp.F90 src/shared/tile_balance.
 SRC_DEV    = src/device/implicit_fs_mgk.F90 src/device/gpu_state.F90 src/device/column_solve.F90 src/device/halo.F90 src/device/pflx.F90 src/device/rivers.F90 src/device/cdr_src.F90 src/device/cdr_lite.F90 src/device/carb_sens.F90 \
              src/device/geom.F90 src/device/obc.F90 src/device/imex_red.F90 src/device/imex_igw.F90 src/device/step2d.F90 src/device/prsgrd.F90 \
              src/device/advect.F90 src/device/rho_eos.F90 src/device/uv_rhs.F90 \
-             src/device/passive_column.F90 src/device/passive.F90 \
+             src/device/passive_column.F90 src/device/passive.F90 src/device/bgc_window.F90 \
              src/device/pre_step3d.F90 src/device/step3d_uv.F90 src/device/visc3d.F90 \
              src/device/step3d_t.F90 src/device/t3dmix.F90 src/device/lmd.F90 \
              src/device/bulk_coare.F90 src/device/wvlcty.F90 \
