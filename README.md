@@ -249,6 +249,20 @@ v0.1.2-beta, bit for bit.
   synchronised the device and read a managed array on the host (5 % of
   the step on the N2 nest with IMEX 'modal'). Results are unchanged, bit
   for bit.
+- Diagnostic probes are opt-in: they print only when `ROMS_GPU_PROBES` is
+  set to a non-zero value, and a start-up line says so. Before, they were
+  on unless `ROMS_GPU_PROBES=0`. The fixed probe points are now global
+  indices: each rank prints a point only if the point lies inside the
+  grid and inside the rank's own tile, and rank 0 names each point
+  outside the grid once at start-up. Before, the points were used as
+  local tile indices, so with probes on several probes read outside their
+  arrays and the sargasso and N2 cases stopped at the first step with a
+  segmentation fault. Runs with `ROMS_GPU_PROBES=0` are unchanged, bit for
+  bit, and so are runs with probes on (except for the probe lines). A run
+  that left the variable unset now uses the faster kernels of non-probe
+  steps in its first 24 steps too; on the closed basin with rivers and
+  CDR that changes results at round-off (1e-13 in `DU_avg1`), on sargasso
+  and the N2 nest not at all.
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
   depth-integrated internal-tide energy flux `up`/`vp` of the parent,
   written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS

@@ -1087,9 +1087,10 @@ contains
     real(rp) :: fomn, fomnW
     if (.not. probe_on) return
     if (.not. (k == 1 .or. k == 50 .or. k == 99 .or. k == 100)) return
-    call sync_arch()
     i = iprb_pt(1)
     j = jprb_pt(1)
+    if (i < 1 .or. i > decomp%nx .or. j < 1 .or. j > decomp%ny) return
+    call sync_arch()
     n_rhs = nrhs
     fomn = f(i, j) / max(pm(i, j) * pn(i, j), 1.0e-30_rp)
     fomnW = f(i - 1, j) / max(pm(i - 1, j) * pn(i - 1, j), 1.0e-30_rp)
@@ -1111,9 +1112,10 @@ contains
     integer(ip) :: i, j, n_rhs
     if (.not. probe_on) return
     if (.not. (k == 1 .or. k == 50 .or. k == 99 .or. k == 100)) return
-    call sync_arch()
     i = iprb_pt(1)
     j = jprb_pt(1)
+    if (i < 1 .or. i > decomp%nx .or. j < 1 .or. j > decomp%ny) return
+    call sync_arch()
     n_rhs = nrhs
     write(*,'(a,i6,a,i6,a,a,a,i8,a,i4,a,12es26.17)') 'diag: uvA  i=', i, &
          ' j=', j, '  ', trim(tag), '  iic=', iic, '  k=', k, &
@@ -1579,6 +1581,7 @@ contains
     do i = iprb_pt(1) - 1, iprb_pt(1) + 2
       if (i < 1 .or. i > decomp%nx) cycle
       do j = jprb_pt(1), jprb_pt(1) + 1
+        if (j < 1 .or. j > decomp%ny + 1) cycle
         do k = 1, decomp%nz
           if (k == 1 .or. k == 50 .or. k == 99 .or. k == 100) then
             write(*,'(a,i6,a,i6,a,a,a,i8,a,i4,a,8es26.17)') 'diag: vn3  i=', i, &
@@ -1603,6 +1606,7 @@ contains
     ibak = 3 - nstp
     igs = (/ iprb_pt(1), iprb_pt(1) - 1 /)
     j = jprb_pt(1)
+    if (igs(1) < 1 .or. igs(1) > decomp%nx .or. j < 1 .or. j > decomp%ny) return
     ks = (/ 1, 50, 99, 100 /)
     do ii = 1, 2
       i = igs(ii)
@@ -1630,6 +1634,7 @@ contains
     call sync_arch()
     igs = (/ iprb_pt(1), iprb_pt(1) - 1 /)
     j = jprb_pt(1)
+    if (igs(1) < 1 .or. igs(1) > decomp%nx .or. j < 1 .or. j > decomp%ny) return
     ks = (/ 1, 50, 99, 100 /)
     do ii = 1, 2
       i = igs(ii)
@@ -1652,6 +1657,7 @@ contains
     n_rhs = nrhs
     igs = (/ iprb_pt(1) - 1, iprb_pt(1), iprb_pt(1) + 1, iprb_pt(1) + 2 /)
     j = jprb_pt(1)
+    if (j < 1 .or. j > decomp%ny) return
     ks = (/ 1, 50, 99, 100 /)
     do ii = 1, 4
       i = igs(ii)
@@ -1680,6 +1686,7 @@ contains
     call sync_arch()
     igs = (/ iprb_pt(1) - 1, iprb_pt(1), iprb_pt(1) + 1, iprb_pt(1) + 2 /)
     j = jprb_pt(1)
+    if (j < 1 .or. j > decomp%ny) return
     ks = (/ 1, 50, 99, 100 /)
     do ii = 1, 4
       i = igs(ii)

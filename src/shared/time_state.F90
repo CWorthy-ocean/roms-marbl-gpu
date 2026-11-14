@@ -35,34 +35,46 @@ module time_state
   real(rp), WORK_ATTR public, allocatable :: Cs_r(:)       ! 1:nz
 
   integer(ip), public :: ntstart = 1
-  ! Diagnostic probes print only during the first probe_steps steps.
-  ! ROMS_GPU_PROBES=0 turns off all probe windows (set_probe_windows).
-  integer(ip), public :: probe_steps = 24
-  logical, public :: probe_on = .true.
-  ! Extra P1 fast-loop window: steps 5-8 (iic-ntstart = 4..7).
-  integer(ip), public :: fast_probe_from = 4, fast_probe_to = 8
+  ! Diagnostic probes are off unless ROMS_GPU_PROBES is set to a non-zero
+  ! value; set_probe_windows (step_driver) then opens the windows below:
+  ! the first 24 steps, the P1 fast-loop window at steps 5-8
+  ! (iic-ntstart = 4..7) and the KPP surface-layer window at steps 1-24
+  ! after the restart (iic-ntstart = 0..23).
+  integer(ip), public :: probe_steps = 0
+  logical, public :: probe_on = .false.
+  integer(ip), public :: fast_probe_from = 0, fast_probe_to = 0
   logical, public :: fast_probe_on = .false.
-  ! KPP surface-layer probe window, steps after the restart (dt = 900 s).
-  integer(ip), public :: kpp_probe_from = 0, kpp_probe_to = 23
-  ! Global rho points shared by all column, KPP, barotropic and momentum
-  ! probes. Chosen from the day-run CPU-GPU residual (i,j 1-based, as
-  ! stored in history files that include the 0-halo):
+  integer(ip), public :: kpp_probe_from = 0, kpp_probe_to = -1
+  ! Probe points, global model indices: the local indices of a 1 x 1 run
+  ! (and the 0-based indices of a history field that includes the
+  ! boundary points), chosen on the development grid from the day-run
+  ! CPU-GPU residual:
   !   P1 (433,432) NtT (closed)
   !   P2 (372,2)   south-rim
   !   P3 (512,266) east-edge
   !   P4 (456,56)  west U-face of the SW Ri neighbor
   ! P1 NtT, P2 wet AkvW rho (455,56), P3 east, P4 U-face (456,56).
+  ! The probes read the rank-local copies iprb_*/jprb_*, which
+  ! set_probe_windows (step_driver) fills when probes are on: the local
+  ! index if the point is inside the grid and owned by this rank,
+  ! otherwise prb_off, which every probe's range check rejects.
+  integer(ip), parameter, public :: prb_off = -100000
+  ! Rho points; a probe at rho cell (i,j) also reads its west U-face and
+  ! south V-face.
   integer(ip), parameter, public :: nprb_pt = 4
-  integer(ip), parameter, public :: iprb_pt(nprb_pt) = (/ 433, 455, 512, 456 /)
-  integer(ip), parameter, public :: jprb_pt(nprb_pt) = (/ 432, 56, 266, 56 /)
+  integer(ip), parameter, public :: iprb_pt_g(nprb_pt) = (/ 433, 455, 512, 456 /)
+  integer(ip), parameter, public :: jprb_pt_g(nprb_pt) = (/ 432, 56, 266, 56 /)
   ! U-faces at the retargeted rho cells.
   integer(ip), parameter, public :: nprb_u = 4
-  integer(ip), parameter, public :: iprb_u(nprb_u) = (/ 433, 372, 512, 456 /)
-  integer(ip), parameter, public :: jprb_u(nprb_u) = (/ 432, 2, 266, 56 /)
+  integer(ip), parameter, public :: iprb_u_g(nprb_u) = (/ 433, 372, 512, 456 /)
+  integer(ip), parameter, public :: jprb_u_g(nprb_u) = (/ 432, 2, 266, 56 /)
   ! V-faces: NtT last interior / NtT north OBC / south OBC / south first interior.
   integer(ip), parameter, public :: nprb_v = 4
-  integer(ip), parameter, public :: iprb_v(nprb_v) = (/ 433, 433, 372, 372 /)
-  integer(ip), parameter, public :: jprb_v(nprb_v) = (/ 432, 433, 1, 2 /)
+  integer(ip), parameter, public :: iprb_v_g(nprb_v) = (/ 433, 433, 372, 372 /)
+  integer(ip), parameter, public :: jprb_v_g(nprb_v) = (/ 432, 433, 1, 2 /)
+  integer(ip), public :: iprb_pt(nprb_pt) = prb_off, jprb_pt(nprb_pt) = prb_off
+  integer(ip), public :: iprb_u(nprb_u) = prb_off, jprb_u(nprb_u) = prb_off
+  integer(ip), public :: iprb_v(nprb_v) = prb_off, jprb_v(nprb_v) = prb_off
   ! FIRST_TIME_STEP is iic==forw_start. Exact restart keeps this at 1 so
   ! the first step after a two-record load uses both AB/AM time levels.
   ! Approximate / single-record start sets it to ntstart (forward step).

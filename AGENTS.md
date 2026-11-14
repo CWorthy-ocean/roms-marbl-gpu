@@ -72,7 +72,7 @@ first, on the smallest case that exercises it.
   dG = GPU(new) - GPU(old) with dC = CPU(new) - CPU(old).
 - **Long runs** diverge chaotically: compare GPU minus CPU with a CPU twin
   perturbed by 1e-6 degC (`tools/noise_floor_eval.py` and its MARBL twin).
-- **Timing.** With `ROMS_GPU_PROBES=0` and no output, run base and new as
+- **Timing.** With probes off (the default) and no output, run base and new as
   A B B A in one job on the same nodes, and report the median steady step.
   Do not claim a gain you did not measure.
 
@@ -139,9 +139,11 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   `rho0` (`case_io` `set_rho0`), which the EOS and pressure functions read
   in kernels. It is not a `parameter`: do not use it in constant
   expressions.
-- Diagnostic probes print in the first steps at fixed points of the
-  development grid: set `ROMS_GPU_PROBES=0` (`tools/submit_gpu.sh` does). CUDA
-  graphs (`ROMS_GPU_GRAPH=1`) damp zeta; keep them off for validation.
+- Diagnostic probes are off unless `ROMS_GPU_PROBES` is non-zero; then they
+  print in the first 24 steps at fixed global points of the development grid
+  (`time_state.F90`), on the rank that owns each point. A new probe reads the
+  rank-local `iprb_*`/`jprb_*` and must check them against the tile range.
+  CUDA graphs (`ROMS_GPU_GRAPH=1`) damp zeta; keep them off for validation.
 - nvfortran pitfalls (`value` arguments in device code, the inliner, stack
   size) are in `MARBL_GPU_PORT.md`, "Toolchain lessons".
 - If a run differs from its own bit-identical repeats, rerun it on other nodes
