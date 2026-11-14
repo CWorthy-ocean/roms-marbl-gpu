@@ -16,12 +16,19 @@ module imex_red
 #endif
   implicit none
   private
-  public :: red_ensure, red_sum
+  public :: red_ensure, red_sum, red_set_split
   public :: it_set, itw, itw2, it_step, it_reb, it_print
   integer, parameter :: RED_NT = 512, RED_MAXS = 4
+  ! imex_gpu_opt 4 (red_set_split): above RED_SPLIT_MIN columns the RED_NT strided sums run in RED_NT/RED_PW
+  ! blocks of RED_PW threads (red_kpart, one partial per thread into red_tmp), the tree in a second
+  ! one-block kernel (red_ktree): the same additions in the same order as red_kernel, on several
+  ! multiprocessors instead of one
+  integer, parameter :: RED_PW = 32, RED_SPLIT_MIN = 65536
+  logical :: red_split = .false.
 #ifdef USE_CUDA
   real(rp), device, allocatable, public :: red_part(:,:)
   real(rp), device, allocatable :: red_dres(:)
+  real(rp), device, allocatable :: red_tmp(:,:)
   real(rp), pinned, allocatable :: red_hres(:)
 #else
   real(rp), allocatable, public :: red_part(:,:)
@@ -55,8 +62,8 @@ contains
     allocate(red_part(n, RED_MAXS)); red_part = 0.0_rp
 #ifdef USE_CUDA
     if (.not. allocated(red_dres)) then
-      allocate(red_dres(RED_MAXS), red_hres(RED_MAXS))
-      red_dres = 0.0_rp; red_hres = 0.0_rp
+      allocate(red_dres(RED_MAXS), red_hres(RED_MAXS), red_tmp(RED_NT, RED_MAXS))
+      red_dres = 0.0_rp; red_hres = 0.0_rp; red_tmp = 0.0_rp
     endif
 #endif
     red_n = int(n)
@@ -89,7 +96,52 @@ contains
       call syncthreads()
     enddo
   end subroutine red_kernel
+
+  attributes(global) subroutine red_kpart(n, m, part, tmp)
+    ! imex_gpu_opt 4: red_kernel's strided sums, thread t of the grid = thread t of red_kernel
+    integer, value :: n, m
+    real(rp), device, intent(in) :: part(n, RED_MAXS)
+    real(rp), device :: tmp(RED_NT, RED_MAXS)
+    integer :: t, s, c
+    real(rp) :: a
+    t = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    do s = 1, m
+      a = 0.0_rp
+      do c = t, n, RED_NT
+        a = a + part(c, s)
+      enddo
+      tmp(t, s) = a
+    enddo
+  end subroutine red_kpart
+
+  attributes(global) subroutine red_ktree(m, tmp, res)
+    ! imex_gpu_opt 4: red_kernel's shared-memory tree over the RED_NT sums of red_kpart
+    integer, value :: m
+    real(rp), device, intent(in) :: tmp(RED_NT, RED_MAXS)
+    real(rp), device :: res(RED_MAXS)
+    real(rp), shared :: sh(RED_NT)
+    integer :: t, s, w
+    t = threadIdx%x
+    do s = 1, m
+      sh(t) = tmp(t, s)
+      call syncthreads()
+      w = RED_NT / 2
+      do while (w >= 1)
+        if (t <= w) sh(t) = sh(t) + sh(t + w)
+        call syncthreads()
+        w = w / 2
+      enddo
+      if (t == 1) res(s) = sh(1)
+      call syncthreads()
+    enddo
+  end subroutine red_ktree
 #endif
+
+  subroutine red_set_split(on)
+    ! imex_gpu_opt 4 (imex_igw check_settings)
+    logical, intent(in) :: on
+    red_split = on
+  end subroutine red_set_split
 
   subroutine red_sum(m, out)
     ! out(1:m) = the sums of red_part(:, 1:m) (after the kernels that wrote
@@ -98,7 +150,12 @@ contains
     real(rp), intent(out) :: out(m)
 #ifdef USE_CUDA
     integer :: ierr
-    call red_kernel<<<1, RED_NT, 0, work_stream>>>(red_n, m, red_part, red_dres)
+    if (red_split .and. red_n >= RED_SPLIT_MIN) then
+      call red_kpart<<<RED_NT / RED_PW, RED_PW, 0, work_stream>>>(red_n, m, red_part, red_tmp)
+      call red_ktree<<<1, RED_NT, 0, work_stream>>>(m, red_tmp, red_dres)
+    else
+      call red_kernel<<<1, RED_NT, 0, work_stream>>>(red_n, m, red_part, red_dres)
+    endif
     ierr = cudaMemcpyAsync(red_hres, red_dres, m, cudaMemcpyDeviceToHost, work_stream)
     if (ierr /= 0) error stop 'red_sum: cudaMemcpyAsync'
     ierr = cudaStreamSynchronize(work_stream)

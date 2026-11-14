@@ -78,7 +78,7 @@ module imex_igw
                       comm_gpu_direct, comm_ring_dev8, comm_shm_init, comm_shm_wanted, comm_fs_sum, &
                       comm_fs_sum_stats
   use arch_mod, only: sync_arch
-  use imex_red, only: red_ensure, red_sum, red_part, it_set, itw, itw2, it_reb
+  use imex_red, only: red_ensure, red_sum, red_part, it_set, itw, itw2, it_reb, red_set_split
   use rivers_mod, only: river_on, rivers_pred_flx
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
@@ -173,10 +173,11 @@ module imex_igw
   ! of roms-marbl-gpu dev 551565f. Bits: 1 the IMEX kernels skip deep land (the stock dry-column rule)
   ! and the mixing split's velocity is formed only where a stress kernel reads it (imex_pgu, imex_pgv
   ! are zero at deep land); 2 the FP32 z exchange of each PCG iteration in one round, one cell wide,
-  ! through the x exchange's real(8) ring (pf_zring4; with xring_on). Default 0, set in
+  ! through the x exchange's real(8) ring (pf_zring4; with xring_on); 4 the deterministic sums' strided
+  ! partial sums on several multiprocessors above a tile size (imex_red red_kpart). Default 0, set in
   ! imex_read_namelist (no initial value: see imex_gpu_timers)
   integer     :: imex_gpu_opt
-  integer, parameter :: OPT_BITS = 3                 ! the bits implemented
+  integer, parameter :: OPT_BITS = 7                 ! the bits implemented
   ! imex_gpu_opt in effect: bit 1 (opt_skip; visc3d reads imex_opt_skip); pg_dz: the deep-land faces of
   ! pgu, pgv were zeroed when the skip first applied
   logical, public, protected :: imex_opt_skip
@@ -560,6 +561,7 @@ contains
          // ' the default fused path (imex_gpu_stage, imex_gpu_sweep, imex_gpu_redu 1 in effect)')
     imex_opt_skip = iand(imex_gpu_opt, 1) /= 0
     opt_zring = iand(imex_gpu_opt, 2) /= 0
+    call red_set_split(iand(imex_gpu_opt, 4) /= 0)
     if (nerr > 0) error stop 'imex_igw: unsupported &imex_igw_settings (see above)'
   contains
     subroutine bad(what)
