@@ -33,15 +33,28 @@ Cases (k = window length in time steps; MARBL every 4 steps unless named):
   w_short, w_frac, w_nodiv   rejected window lengths: dt/2, 1.5 dt, 3 dt with MARBL every 4
   rst_period         restart period 3 dt at k = 4
   st2, inwin         a stock run with a restart at step 2, then k = 4 started from it
+  xoff, xoffi        subcycling off with the IMEX internal-wave step (&imex_igw_settings:
+                     'modal' open boundary, operator rebuilt every 9 steps, i.e. at steps 1
+                     and 10); split and implicit free surface
+  xk4, xk2m4, xk4i   k = 4, k = 2 with MARBL every 4, k = 4 implicit, with IMEX
+  xk4leg             xk4 restarted at step 8 (a MARBL step inside an IMEX rebuild period), 4 steps
+  xk4t22             xk4 on 2 x 2 tiles (with --tiles2x2)
 Gates:
-  G-RUN    each case that should finish writes its last restart record at its last step
+  G-RUN    each case that should finish writes its last restart record at its last step;
+           the IMEX cases print IMEX_SOLVE lines
   G-PHYS   physics (temp, salt, u, v, zeta, ubar, vbar) of every restart record identical
            to the subcycling-off twin; the BGC tracers differ
   G-BUD    BGCSUB lines (bgc_subcycle_diag = 1): one per window; budget <= 1e-14,
            shadow <= 1e-12, cont <= 1e-12 (UCLA ROMS: about 5e-15, 1e-14, 7e-15 on this case)
   G-RST    k4full and k4leg: every variable of the step-24 record identical; the leg's
-           BGCSUB lines equal the last ones of k4full
-  G-TILE   k4t22 and k4: every restart record identical (split free surface)
+           BGCSUB lines equal the last ones of k4full (the same for xk4 and xk4leg at step 12)
+  G-TILE   k4t22 and k4: every restart record identical (split free surface). xk4t22 and xk4:
+           the IMEX solve is not bitwise tiling-independent on the GPU (its sums depend on the
+           tiling, as with the implicit free surface), so every variable within 1e-12 of its
+           maximum and the BGCSUB lines equal but for the budget residual (a per-tile sum)
+  With IMEX, G-RST and G-TILE leave out imex_pgu and imex_pgv: the restart file holds a
+  different value at a single face after a restart or on another tiling, also without
+  subcycling, while the model state stays identical.
   G-MSG    the rejected settings stop at start-up with UCLA ROMS's message
 """
 import json
@@ -53,6 +66,7 @@ import sys
 import time
 
 PHYS = ['temp', 'salt', 'u', 'v', 'zeta', 'ubar', 'vbar']
+IMEX_SKIP = {'imex_pgu', 'imex_pgv'}   # see G-RST/G-TILE in the docstring
 SKIP = {'time_step', 'ocean_time', 'scrum_time', 'time'}
 MSG_STOP = 'ERROR STOP bgc_subcycle'
 
@@ -101,15 +115,24 @@ def get_key(text, group, key):
     return None
 
 
+def drop_group(text, group):
+    """Remove the group from namelist text (if present)."""
+    return re.sub(r'(?ims)^[ \t]*&' + group + r'\b[^\n]*\n.*?^[ \t]*/[ \t]*\n?', '', text)
+
+
 # --------------------------------------------------------------------------- cases
 def cases(dt, tiles2x2):
     """name -> (namelist edits, expectation); expectation 'ok' or a list of message parts."""
     sub = {'bgc_physics_subcycle': True, 'bgc_physics_timestep': 0.0, 'bgc_subcycle_diag': 1}
     off = {'bgc_physics_subcycle': False, 'bgc_physics_timestep': 0.0, 'bgc_subcycle_diag': 0}
 
-    def c(nt=12, rst=4, marbl=4, bgc=None, imp=False, tiles=(1, 1), ini=None):
+    # IMEX as UCLA ROMS's tests/test_imex_igw.py runs it with subcycling: 'modal' boundary, the
+    # operator rebuilt within the run (every 9 steps: at steps 1 and 10)
+    imex = {'imex_verbose': 1, 'imex_obc_mode': 'modal', 'imex_bref_hours': 9.0 * dt / 3600.0}
+
+    def c(nt=12, rst=4, marbl=4, bgc=None, imp=False, tiles=(1, 1), ini=None, imx=None):
         return {'nt': nt, 'rst': rst * dt, 'marbl': marbl * dt, 'bgc': bgc or off, 'imp': imp,
-                'tiles': tiles, 'ini': ini}
+                'tiles': tiles, 'ini': ini, 'imex': imx}
     rstmsg = ['restarts must fall on window boundaries', 'output_period_rst must be a multiple of']
     k = {
         'off': (c(), 'ok'),
@@ -128,9 +151,16 @@ def cases(dt, tiles2x2):
         'rst_period': (c(rst=3, bgc=sub), rstmsg),
         'st2': (c(nt=4, rst=2), 'ok'),
         'inwin': (c(nt=8, bgc=sub, ini=('st2', 1)), rstmsg + ['(time step 2 of the initial file']),
+        'xoff': (c(imx=imex), 'ok'),
+        'xoffi': (c(imp=True, imx=imex), 'ok'),
+        'xk4': (c(bgc=sub, imx=imex), 'ok'),
+        'xk2m4': (c(bgc=dict(sub, bgc_physics_timestep=2.0 * dt), imx=imex), 'ok'),
+        'xk4i': (c(bgc=sub, imp=True, imx=imex), 'ok'),
+        'xk4leg': (c(nt=4, bgc=sub, imx=imex, ini=('xk4', 2)), 'ok'),
     }
     if tiles2x2:
         k['k4t22'] = (c(bgc=sub, tiles=(2, 2)), 'ok')
+        k['xk4t22'] = (c(bgc=sub, tiles=(2, 2), imx=imex), 'ok')
     return k
 
 
@@ -155,10 +185,13 @@ def setup(a):
                  ('marbl_biogeochemistry_settings', 'marbl_timestep', float(s['marbl'])),
                  ('implicit_fs', 'fs_mode', 'implicit' if s['imp'] else 'split')]
         edits += [('bgc_settings', kk, v) for kk, v in s['bgc'].items()]
+        t = drop_group(t, 'imex_igw_settings')
+        edits += [('imex_igw_settings', kk, v) for kk, v in (s['imex'] or {}).items()]
         for g, kk, v in edits:
             t = set_key(t, g, kk, v)
         open(os.path.join(d, 'namelist.nml'), 'w').write(t)
         meta['cases'][name] = {'nt': s['nt'], 'tiles': s['tiles'], 'ini': s['ini'], 'expect': expect,
+                               'imex': bool(s['imex']),
                                'k': (0 if not s['bgc']['bgc_physics_subcycle'] else
                                      int(round((s['bgc']['bgc_physics_timestep'] or s['marbl']) / dt)))}
     json.dump(meta, open(os.path.join(root, 'gates.json'), 'w'), indent=1)
@@ -225,10 +258,10 @@ def check(a):
         res.append(ok)
         print('%s  %-8s %s' % ('PASS' if ok else 'FAIL', name, info))
 
-    def same_vars(fa, fb, names=None, rec=None):
+    def same_vars(fa, fb, names=None, skip=()):
         """variables of two restart files: (number identical, list differing)"""
         with nc.Dataset(fa) as A, nc.Dataset(fb) as B:
-            vs = [v for v in A.variables if v in B.variables and v not in SKIP]
+            vs = [v for v in A.variables if v in B.variables and v not in SKIP and v not in skip]
             if names is not None:
                 vs = [v for v in vs if v in names]
             nsame, bad = 0, []
@@ -239,6 +272,22 @@ def check(a):
                 else:
                     bad.append(v)
             return nsame, bad
+
+    def max_rel(fa, fb, skip=()):
+        """largest max|a - b| / max|a| over the variables of two restart files, and its variable"""
+        out = (0.0, 'none')
+        with nc.Dataset(fa) as A, nc.Dataset(fb) as B:
+            for v in A.variables:
+                if v in SKIP or v in skip or v not in B.variables:
+                    continue
+                x = np.asarray(A[v][:], dtype=np.float64)
+                y = np.asarray(B[v][:], dtype=np.float64)
+                if x.shape != y.shape:
+                    return (float('inf'), v)
+                r = float(np.nanmax(np.abs(x - y)) / (np.nanmax(np.abs(x)) or 1.0)) if x.size else 0.0
+                if r > out[0]:
+                    out = (r, v)
+        return out
 
     def tstep(f):
         # the last record's step (time_step(:, 1) is the step count of each record)
@@ -259,15 +308,20 @@ def check(a):
                 want += tstep(src[c['ini'][1] - 1]) if len(src) >= c['ini'][1] else 0
             last = tstep(f[-1]) if f else None
             ok = bool(f) and 'ERROR' not in log and last == want
+            if c.get('imex'):
+                ok = ok and 'IMEX_SOLVE' in log
             done[n] = ok
-            gate('G-RUN', ok, '%-10s %d restart file(s), last record step %s (run of %d steps)'
-                 % (n, len(f), last, want))
+            gate('G-RUN', ok, '%-10s %d restart file(s), last record step %s (run of %d steps)%s'
+                 % (n, len(f), last, want, ', IMEX' if c.get('imex') else ''))
         else:
             ok = MSG_STOP in log and all(p in log for p in c['expect'])
             ls = log.splitlines()
             m = [ls[i + 1].strip() for i, ln in enumerate(ls[:-1]) if 'ERROR [global]' in ln]
             gate('G-MSG', ok, '%-10s %s' % (n, (m[0] if m else 'no message')[:160]))
-    for k, o in (('k4', 'off'), ('k2', 'off2'), ('k2m4', 'off'), ('k4i', 'offi')):
+    for k, o in (('k4', 'off'), ('k2', 'off2'), ('k2m4', 'off'), ('k4i', 'offi'),
+                 ('xk4', 'xoff'), ('xk2m4', 'xoff'), ('xk4i', 'xoffi')):
+        if k not in C or o not in C:
+            continue
         if not (done.get(k) and done.get(o)):
             gate('G-PHYS', False, '%s vs %s: a run did not finish' % (k, o))
             continue
@@ -297,22 +351,37 @@ def check(a):
         ok = len(L) == nwin and mx['budget'] <= 1e-14 and mx['shadow'] <= 1e-12 and mx['cont'] <= 1e-12
         gate('G-BUD', ok, '%-10s windows %d/%d, max m %d, budget %.2e, shadow %.2e, cont %.2e'
              % (n, len(L), nwin, ms, mx['budget'], mx['shadow'], mx['cont']))
-    if done.get('k4full') and done.get('k4leg'):
-        ns, bad = same_vars(rst_files(d('k4full'))[-1], rst_files(d('k4leg'))[-1])
-        Lf, Ll = bgcsub_lines(d('k4full')), bgcsub_lines(d('k4leg'))
-        okl = len(Ll) > 0 and Lf[-len(Ll):] == Ll
-        gate('G-RST', not bad and okl, 'k4full vs k4leg at step 24: %d variables identical, differing: %s; '
-             'leg BGCSUB lines (%d) equal the last of k4full: %s' % (ns, ','.join(bad) or 'none', len(Ll), okl))
-    else:
-        gate('G-RST', False, 'k4full or k4leg did not finish')
-    if 'k4t22' in C:
-        if done.get('k4t22') and done.get('k4'):
-            pairs = list(zip(rst_files(d('k4')), rst_files(d('k4t22'))))
-            bad = [b for f1, f2 in pairs for b in same_vars(f1, f2)[1]]
-            gate('G-TILE', not bad and len(pairs) > 0, 'k4t22 vs k4: %d records, differing: %s'
-                 % (len(pairs), ','.join(sorted(set(bad))) or 'none'))
+    for full, leg, step in (('k4full', 'k4leg', 24), ('xk4', 'xk4leg', 12)):
+        if full not in C or leg not in C:
+            continue
+        if done.get(full) and done.get(leg):
+            sk = IMEX_SKIP if C[full].get('imex') else ()
+            ns, bad = same_vars(rst_files(d(full))[-1], rst_files(d(leg))[-1], skip=sk)
+            Lf, Ll = bgcsub_lines(d(full)), bgcsub_lines(d(leg))
+            okl = len(Ll) > 0 and Lf[-len(Ll):] == Ll
+            gate('G-RST', not bad and okl, '%s vs %s at step %d: %d variables identical, differing: %s; '
+                 'leg BGCSUB lines (%d) equal the last of %s: %s'
+                 % (full, leg, step, ns, ','.join(bad) or 'none', len(Ll), full, okl))
         else:
-            gate('G-TILE', False, 'k4 or k4t22 did not finish')
+            gate('G-RST', False, '%s or %s did not finish' % (full, leg))
+    for t22, t11 in (('k4t22', 'k4'), ('xk4t22', 'xk4')):
+        if t22 not in C:
+            continue
+        if done.get(t22) and done.get(t11) and C[t22].get('imex'):
+            pairs = list(zip(rst_files(d(t11)), rst_files(d(t22))))
+            mr = max([max_rel(f1, f2, IMEX_SKIP) for f1, f2 in pairs] or [(float('inf'), 'none')])
+            nob = lambda L: [re.sub(r'budget.*', '', ln) for ln in L]
+            okl = nob(bgcsub_lines(d(t11))) == nob(bgcsub_lines(d(t22))) and len(bgcsub_lines(d(t11))) > 0
+            gate('G-TILE', mr[0] <= 1e-12 and okl and len(pairs) > 0,
+                 '%s vs %s: %d records, largest relative difference %.2e (%s); BGCSUB lines equal but '
+                 'for the budget: %s' % (t22, t11, len(pairs), mr[0], mr[1], okl))
+        elif done.get(t22) and done.get(t11):
+            pairs = list(zip(rst_files(d(t11)), rst_files(d(t22))))
+            bad = [b for f1, f2 in pairs for b in same_vars(f1, f2)[1]]
+            gate('G-TILE', not bad and len(pairs) > 0, '%s vs %s: %d records, differing: %s'
+                 % (t22, t11, len(pairs), ','.join(sorted(set(bad))) or 'none'))
+        else:
+            gate('G-TILE', False, '%s or %s did not finish' % (t11, t22))
     if 'ref' in a:
         ref = os.path.abspath(a['ref'])
         for n in C:
