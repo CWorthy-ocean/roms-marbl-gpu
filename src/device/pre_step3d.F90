@@ -620,17 +620,19 @@ contains
       iAkt = min(itrc, 2)
       call implicit_tracer_columns(nx, ny, nz, n_new, itrc, iAkt, dtau, .true.)
     enddo
-    if (ntp > 0) call passive_predictor(dtau, cf_stp, cf_bak, n_stp, n_new, indx)
+    ! (tp_subcycled: the passives are updated at BGC window ends instead, as
+    ! in the stock predictor; the CPU's pass 2 loops over itrc = 1, nt_step)
+    if (ntp > 0 .and. .not. tp_subcycled) call passive_predictor(dtau, cf_stp, cf_bak, n_stp, n_new, indx)
     call t3dbc(itemp)
     call t3dbc(isalt)
-    if (ntp > 0) call passive_t3dbc()
+    if (ntp > 0 .and. .not. tp_subcycled) call passive_t3dbc()
     call hg_begin()
     call hg_add(F_U, nnew)
     call hg_add(F_V, nnew)
     call hg_add(F_T, nnew, itemp)
     call hg_add(F_T, nnew, isalt)
     call hg_end()
-    if (ntp > 0) then
+    if (ntp > 0 .and. .not. tp_subcycled) then
       if (tp_overlap_on(1)) then
         call halo_tp_start(tp, ntp, nnew)
       else
