@@ -23,6 +23,9 @@
 #     columns between CPU ranks and changes no result. Each GPU computes
 #     the wet columns of its tile (&tile_settings balances them), so
 #     .true. is ignored, with a start-up note.
+#   &imex_igw_settings  the IMEX internal-wave step and its 'modal' open
+#     boundary (#433, #434); keys and accepted values in the IMEX section
+#     below.
 #
 # GPU-only additions: the optional group &tile_settings (tile balancing),
 # &passive_tracers (n_passive, init_mode, write_passive), and in
