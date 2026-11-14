@@ -38,7 +38,7 @@ module case_io
   use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name, &
        passive_hold, set_cdr_lite, passive_finish_list, ncdr, tnu2_tp, n_marbl, cdr0, passive_mirror
   use marbl_gpu, only: marbl_gpu_init_diagnostics
-  use bgc_subcycle_mod, only: bgcsub_init
+  use bgc_subcycle_mod, only: bgcsub_init, bgc_physics_subcycle
   use marbl_gpu, only: marbl_on, read_marbl_namelist, marbl_gpu_setup_tracers, marbl_gpu_init_forcing, &
                        marbl_gpu_load_state
   use fs_data, only: fs_alloc_rates, udu, udv, gru, grv, qd, xx, mg_se0, mg_scu, mg_scv, fs_nsc, fs_pot_phase
@@ -767,7 +767,7 @@ contains
     ! after the initial state: the river faces add to riv_umask/riv_vmask
     ! as read from the initial file (CPU: get_init, then calc_river_flux);
     ! before close_frc_cache: it scans the forcing files' open handles
-    call init_rivers(case_grdname)
+    call init_rivers(case_grdname, bgc_physics_subcycle)   ! subcycling: also the window's halo faces
     call wall_stamp('river init')
     call init_cdr(case_grdname)       ! CDR releases (passive list and columns final)
     call wall_stamp('cdr init')
