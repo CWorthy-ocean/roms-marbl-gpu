@@ -15,6 +15,7 @@ module frc_io
   use arch_mod, only: sync_arch
   use comm_mod, only: comm_rank, comm_size, comm_compute
   use run_timers, only: wall_time
+  use frc_reader, only: frc_reader_on, frc_reader_ahead
   use netcdf, only: nf90_inquire, nf90_inq_varid, nf90_inquire_variable, nf90_inquire_dimension, nf90_get_var, &
                     nf90_double, nf90_float, nf90_max_var_dims, nf90_open, nf90_nowrite
 #ifdef USE_CUDA
@@ -85,6 +86,7 @@ module frc_io
     real(rp), allocatable :: pf_buf(:)
     integer, allocatable :: pf_sreq(:)
     type(fb_t), allocatable :: pf_sbuf(:)
+    integer :: ra_mark = 0            ! forcing reader: upper bracket last posted ahead
   end type series2d
 
   type(series2d), target :: s_sustr, s_svstr, s_shflx, s_swflx, s_swrad
@@ -998,6 +1000,7 @@ contains
     integer :: comm, ierr, t, m
     integer, allocatable :: mine(:,:), win(:,:,:)
 #endif
+    call frc_post_ahead()
     call frc_check_mode()
     if (iand(frc_mode, 6) /= 6) return
     n = 0
@@ -1077,6 +1080,32 @@ contains
     if (frc_timing) write(*,'(a,i0,a,i0,a,f8.4,a)') 'forcing: rank ', me, '  prefetch ', nb, &
          ' records  ', (c1 - c0), ' s'
   end subroutine frc_prefetch
+
+  subroutine frc_post_ahead()
+    ! Forcing readers (frc_reader): post the records after every series'
+    ! upper bracket (compute rank 0 only; nothing without readers).
+    integer :: d
+    if (.not. frc_reader_on()) return
+    call post_series(s_uwnd);  call post_series(s_vwnd);  call post_series(s_tair)
+    call post_series(s_qair);  call post_series(s_prate); call post_series(s_lwrad)
+    call post_series(s_bswrad); call post_series(s_sss);  call post_series(s_sst)
+    call post_series(s_sdic);  call post_series(s_salk);  call post_series(s_sustr)
+    call post_series(s_svstr); call post_series(s_shflx); call post_series(s_swflx)
+    call post_series(s_swrad); call post_series(s_dust);  call post_series(s_iron)
+    call post_series(s_nox);   call post_series(s_nhy);   call post_series(s_xco2)
+    call post_series(s_xco2a); call post_series(s_ddco2); call post_series(s_ddalk)
+    if (allocated(s_cflx)) then
+      do d = 1, size(s_cflx)
+        call post_series(s_cflx(d))
+      enddo
+    endif
+  end subroutine frc_post_ahead
+
+  subroutine post_series(s)
+    type(series2d), intent(inout) :: s
+    if (.not. s%ready) return
+    call frc_reader_ahead(s%paths, s%irec, s%ntot, s%cycle > 0.0_rp, s%it2, s%tname, s%ra_mark)
+  end subroutine post_series
 
   subroutine frc_prefetch_drain()
     ! End of run: complete and drop every prefetch in flight.
