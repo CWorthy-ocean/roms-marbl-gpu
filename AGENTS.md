@@ -100,9 +100,11 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
 - When ucla-roms adds a key, the GPU must read it or stop clearly. Declare it
   with the CPU default in the GPU reader. Then implement it, or accept its
   "off" value and stop on any other value, naming the key. Update
-  `NAMELIST_COMPAT`. Example: GPU `dev` stops on ucla-roms `dev` namelists,
-  which add `bgc_physics_subcycle`, `bgc_physics_timestep` (`&bgc_settings`,
-  `src/host/avg_out.F90`) and `marbl_balance` (`src/host/marbl_step.F90`).
+  `NAMELIST_COMPAT`. Example: `bgc_physics_subcycle` and
+  `bgc_physics_timestep` (`&bgc_settings`, `src/host/avg_out.F90`) are read,
+  and `.true.` stops with "not on the GPU yet"; `marbl_balance`
+  (`src/host/marbl_step.F90`) has no effect on the GPU, so `.true.` is
+  ignored with a start-up note.
 - A CPU cpp key becomes a GPU-only logical, such as `&surf_frc_settings
   sflx_corr`. A CPU case built with SFLX_CORR needs `sflx_corr = .true.` on the
   GPU, which warns when the forcing holds `sss` and the switch is off.
