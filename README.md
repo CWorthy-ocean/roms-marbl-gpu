@@ -298,6 +298,34 @@ v0.1.2-beta, bit for bit.
   at single points up to 3.6 times). A
   solve that meets a NaN or Inf stops the run with a message (the same
   test and message as the implicit free surface of UCLA ROMS).
+- IMEX internal-wave step (`&imex_igw_settings`; without the group the
+  model is unchanged): the port of UCLA ROMS's IMEX_IGW (ucla-roms
+  #433), which treats the internal-wave terms of the
+  LF-AM3 baroclinic step implicitly (an elliptic solve per stage, Jacobi
+  PCG with FP32 storage) so that the baroclinic step can be several times
+  longer than the internal-wave limit. It runs on the implicit free
+  surface with its defaults. Open faces take the boundary condition's
+  explicit value ('fixed'). Lateral mixing is a split step from the
+  corrected state (`imex_mix_split = 1`). The reference stratification,
+  and with it the operator, is rebuilt every 24 model hours
+  (`imex_bref_hours`). Restarts are exact (`imex_rst_state = 1`). The
+  settings are those of UCLA ROMS's namelist template (`imex_verbose`,
+  `imex_bref_hours`, `imex_rst_state`); keys removed from UCLA ROMS on
+  2026-11-13 stop the run with a message, and `NAMELIST_COMPAT` gives
+  the sed line that deletes them.
+  - Checked against UCLA ROMS #433 (strict build, FP64 solver storage,
+    tolerances 1e-12, 20 steps) on sargasso (dt 1440 s, sponge) and a
+    closed basin with walls and lateral viscosity: identical IMEX and
+    free-surface iteration counts; prognostic fields within 2.1 times
+    the CPU's own regular-to-strict build difference, every restart
+    variable within 5.3 times (the largest: the surface boundary-layer
+    depth, at a mixing threshold).
+  - Cost (Derecho, A100, no output, one 2-day run each, reference
+    stratification rebuilt every 6 hours): sargasso 2x2
+    (1 node) 1.61 s per simulated day at dt 1440 s against 6.88 for the
+    split step at 480 s (0.23) and 2.68 for the implicit free surface
+    alone at 480 s; Pac 8x1 (2 nodes, tides, rivers) 10.4 s per day at
+    1440 s against 12.5 (split, 900 s; 0.83) and 11.0 (implicit, 900 s).
 
 ## Numerics
 

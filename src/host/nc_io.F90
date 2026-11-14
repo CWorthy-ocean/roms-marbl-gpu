@@ -342,6 +342,10 @@ contains
     if (present(i0f)) i0 = i0f
     if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    if (nc_timeless(ncid, varid, 3)) then     ! a variable without the record dimension (rec ignored)
+      call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, 1/), count=(/n1, n2, n3/)), 'put '//trim(name))
+      return
+    endif
     call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, 1, rec/), &
                   count=(/n1, n2, n3, 1/)), 'putrec '//trim(name))
   end subroutine nc_put_3d_rec_d
@@ -379,6 +383,10 @@ contains
     if (present(i0f)) i0 = i0f
     if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    if (nc_timeless(ncid, varid, 3)) then     ! a variable without the record dimension (rec ignored)
+      call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, 1/), count=(/n1, n2, n3/)), 'put '//trim(name))
+      return
+    endif
     call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, 1, rec/), &
                   count=(/n1, n2, n3, 1/)), 'putrec '//trim(name))
   end subroutine nc_put_3d_rec_f
@@ -489,10 +497,24 @@ contains
     if (present(i0f)) i0 = i0f
     if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    if (nc_timeless(ncid, varid, 3)) then     ! a variable without the record dimension (rec ignored)
+      call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, 1/), &
+                    count=(/size(arr,1), size(arr,2), size(arr,3)/)), 'put '//trim(name))
+      return
+    endif
     call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, 1, rec/), &
                   count=(/size(arr,1), size(arr,2), size(arr,3), 1/)), &
                   'putrec '//trim(name))
   end subroutine nc_put_3d_rec
+
+  logical function nc_timeless(ncid, varid, nd)
+    ! the variable has nd dimensions (no record dimension): IMEX_IGW's time-less restart state
+    ! (CPU 73a63afb), written through the record routines with rec ignored
+    integer, intent(in) :: ncid, varid, nd
+    integer :: ndims
+    call nc_check(nf90_inquire_variable(ncid, varid, ndims=ndims), 'ndims')
+    nc_timeless = (ndims == nd)
+  end function nc_timeless
 
   subroutine nc_put_att_text(ncid, name, att, val)
     integer,          intent(in) :: ncid

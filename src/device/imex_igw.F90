@@ -35,7 +35,7 @@ module imex_igw
   ! imex_allow_explicit (with the weights it allows), the weights, the
   ! tolerances, imex_maxit, imex_verbose 0/1/2, imex_mix_split 0/1,
   ! imex_n2_ref, imex_n2_taper, imex_bref_hours, imex_warm 0/1,
-  ! imex_setup_lag 0/1, and the solver paths
+  ! imex_setup_lag 0/1, imex_rst_state 0/1, and the solver paths
   ! imex_pcg_start 0 (the CPU's imex_pcg_warm/imex_pcg) or imex_pcg_start 2/3
   ! with imex_pcg_fused 1 (imex_pcgf8/4, storage imex_solver_prec 8/4;
   ! imex_pf.inc). imex_am3_crv other than 1/6, imex_selftest 1,
@@ -80,13 +80,20 @@ module imex_igw
 
   public :: imex_read_namelist, imex_begin_step, imex_pg_store_combine, imex_solve_stage
   public :: imex_predictor_transport, imex_shift_levels, imex_tsmix_active
+  ! Exact restart (CPU 22c05bc1 imex_rst_*, FS_SPEC 9b-C): his_io writes and case_io reads the
+  ! state below under the CPU's names (imex_pgu ... imex_rst_scal); these routines decide and
+  ! finish it, and the arrays are public for the two I/O paths
+  public :: imex_rst_prepare, imex_rst_scal_vals, imex_rst_accept, imex_rst_loaded, imex_rst_has, imex_rst_alloc
+  public :: imex_stage_on
+  public :: pgu, pgv, ipg_nm1, dpw, hs1, hs2, hsol, pf_mq, bref_sav, ad_n2raw, hz_op, dza, ad_n2o
+  integer, parameter, public :: imex_nsc = 17
 
   logical, public, protected :: imex_on = .false.     ! &imex_igw_settings present
 
   integer(ip), parameter, public :: imex_stage_pred = 1, imex_stage_corr = 2
 
   ! Namelist IMEX_IGW_SETTINGS: the CPU's keys and defaults (UCLA ROMS imex-core 640c086f). The
-  ! template keys (the ones a user sets): imex_verbose, imex_bref_hours; the others
+  ! template keys (the ones a user sets): imex_verbose, imex_bref_hours, imex_rst_state; the others
   ! are solver and development settings (NAMELIST_COMPAT)
   real(rp)    :: imex_theta_p = 0.5_rp, imex_phi = 0.25_rp, imex_theta_c = 0.6_rp
   real(rp)    :: imex_mu = 0.0_rp, imex_nu = 0.3_rp, imex_rho = 0.1_rp
@@ -142,15 +149,18 @@ module imex_igw
   ! face transports F formed in the cell kernel; sweep 2 skips land
   ! columns. 0: the session-2 kernels. Default 1 since session 3.
   integer     :: imex_gpu_sweep = 1
-  ! imex_redu (CPU: rank-count-independent integer-digit sums) read, only 0 on the GPU
-  ! (imex_gpu_redu = 1 is the GPU's deterministic sum within a device)
+  ! CPU 73a63afb (FS_SPEC 3.8, 9b-H): imex_rst_state 1 (default) the IMEX state in the EXACT_RESTART
+  ! files (one time-less copy, with the second record of each pair), 0 none (small files, the old
+  ! inexact restart); imex_redu (CPU: rank-count-independent integer-digit sums) read, only 0 on
+  ! the GPU (imex_gpu_redu = 1 is the GPU's deterministic sum within a device)
+  integer     :: imex_rst_state = 1
   integer     :: imex_redu = 0
   ! CPU 1b3132bd, default 1 since 903b3aca (IMEX_SPONGE_INSTABILITY.md): lateral mixing as a split step
   ! from the corrected state, 1 visc3d's Laplacian from u^n plus the baroclinic part of this step's
   ! corrected increment (visc3d.F90); 0 as before (visc3d from u^n added after the implicit
   ! correction). With the additive form the explicit Laplacian of a sponge band made the IMEX step
   ! unstable at C_igw > ~2.
-  integer, public, protected :: imex_mix_split   ! default 1: set in imex_read_namelist
+  integer, public, protected :: imex_mix_split = 1
 
   ! Former keys, fixed at their former defaults (removed from the namelist 2026-11-13, UCLA ROMS
   ! IMEX_KEY_TRIM): the N2 regularization of the diagonal [s-2], the b_ref smoothing passes along
@@ -174,7 +184,7 @@ module imex_igw
        imex_verbose, imex_solver_enabled, imex_allow_explicit, imex_selftest, &
        imex_n2_ref, imex_n2_taper, imex_warm, &
        imex_bref_hours, imex_setup_lag, imex_pcg_start, imex_pcg_fused, imex_solver_prec, imex_stage_fused, &
-       imex_redu, imex_mix_split, &
+       imex_redu, imex_rst_state, imex_mix_split, &
        imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep
 
   ! Weights (set_derived_weights): regular step and first step of a run
@@ -267,6 +277,12 @@ module imex_igw
   real(rp), WORK_ATTR allocatable :: pf_ru4(:,:), pf_rv4(:,:)
 
   logical :: first_step = .true.
+  ! Exact restart: rst_read the state was read from the initial file (the first step is an
+  ! ordinary step), rst_pend rst_replay due at the first imex_step_setup, rst_on the replay's
+  ! adj_setup (b_ref from bref_sav, no rescale), rst_mvalid the stored W M x of a stage applies
+  ! to the replayed operator
+  logical :: rst_read = .false., rst_pend = .false., rst_on = .false.
+  integer :: rst_mvalid(2) = 0
   logical :: geometry_ready = .false., eta_old = .false., have_bref = .false.
   integer(ip) :: coef_iic = -huge(1_ip), bref_last = -100000000
   integer :: nbref_builds = 0
@@ -290,7 +306,6 @@ contains
     character(len=1024) :: found
     talk = (comm_world_rank() == 0)
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
-    imex_mix_split = 1                   ! the default (see the declaration)
     rewind(unit)
     msg = ''
     read(unit, nml=imex_igw_settings, iostat=ios, iomsg=msg)
@@ -408,6 +423,7 @@ contains
     if (imex_pcg_start < 0 .or. imex_pcg_start > 3) call bad('imex_pcg_start must be 0, 1, 2 or 3')
     if (imex_pcg_fused < 0 .or. imex_pcg_fused > 1) call bad('imex_pcg_fused must be 0 or 1')
     if (imex_solver_prec /= 4 .and. imex_solver_prec /= 8) call bad('imex_solver_prec must be 8 or 4')
+    if (imex_rst_state < 0 .or. imex_rst_state > 1) call bad('imex_rst_state must be 0 or 1')
     ! What the GPU port has (the CPU's default path); the other values of the CPU's solver and
     ! development settings are CPU-only
     if (abs(imex_am3_crv - AM3_crv) > tol) call bad('imex_am3_crv: only 1/6 (the stock LF-AM3) on the GPU')
@@ -488,7 +504,8 @@ contains
          // ' imex_solver_prec = 8'
     write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_gpu_redu =', imex_gpu_redu, &
          '  imex_gpu_stage =', merge(1, 0, stage_on), '  imex_gpu_sweep =', merge(1, 0, sweep_on)
-    write(*,'(3x,a,i2,a,i2)') 'imex_redu =', imex_redu, '  imex_mix_split =', imex_mix_split
+    write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_redu =', imex_redu, '  imex_rst_state =', imex_rst_state, &
+         '  imex_mix_split =', imex_mix_split
     if (imex_gpu_stage == 1 .and. .not. stage_on) write(*,'(3x,a)') 'imex_gpu_stage = 1 needs the fused solve,' &
          // ' imex_warm = 1 and theta_p, theta_c > 0: the session-2 stage is used'
     write(*,*)
@@ -576,8 +593,9 @@ contains
     ! the first-step weights and u_nm1, v_nm1 := level n.
     if (.not. imex_on) return
     if (.not. allocated(pgu)) call imex_alloc()
-    ! (a restart starts the IMEX stores as a first step: inexact)
-    first_step = (iic == ntstart) .or. is_first_time_step()
+    ! (exact restart with the IMEX state read, rst_read: an ordinary step; u^n-1 is the
+    ! restart's earlier record, in slot 3-nstp; pg_nm1 and the solver state come from the file)
+    first_step = ((iic == ntstart) .and. .not. rst_read) .or. is_first_time_step()
     if (first_step) then
       wpg_pred = wpg_pred_1st; wflx_pred = wflx_pred_1st
       wpg_corr = wpg_corr_1st; wflx_corr = wflx_corr_1st; wrhs_corr = wflx_corr_1st
@@ -585,6 +603,7 @@ contains
     else
       wpg_pred = wpg_pred_reg; wflx_pred = wflx_pred_reg
       wpg_corr = wpg_corr_reg; wflx_corr = wflx_corr_reg; wrhs_corr = wflx_corr_reg
+      if (iic == ntstart) call copy_level_nm1()       ! rst_read
     endif
   end subroutine imex_begin_step
 
@@ -1231,6 +1250,10 @@ contains
     lag_skip = .false.
     if (lag_on) lag_skip = .not. bref_due()
     if (.not. geometry_ready) call setup_geometry()
+    if (rst_pend) then                     ! exact restart: the operator of the last rebuild
+      if (lag_on) call rst_replay()
+      rst_pend = .false.
+    endif
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
@@ -1363,8 +1386,8 @@ contains
     real(8) :: loc(2), glob(2)
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     nbref = imex_nbref()
-    if (nbref > 1 .and. have_bref .and. iic - bref_last < nbref .and. iic >= bref_last) then
-      call copy3(bref_sav, ad_bb)
+    if (rst_on .or. (nbref > 1 .and. have_bref .and. iic - bref_last < nbref .and. iic >= bref_last)) then
+      call copy3(bref_sav, ad_bb)          ! (rst_on: rst_replay, b_ref from the restart file)
     else
       ! bb relative to its domain mean over the active cells
       s1 = 0.0_rp; s2 = 0.0_rp
@@ -2889,5 +2912,299 @@ contains
       enddo
     enddo
   end subroutine store3s
+
+  !======================================================================
+  ! Exact restart (CPU 22c05bc1 imex_rst_def/wrt/wrt_scal/get, imex_rst_replay; FS_SPEC 9b-C).
+  ! The state a step reads from earlier steps, written after the step (his_io; after
+  ! imex_shift_levels, so the pg slot ipg_nm1 is the next step's pg_nm1) and read by
+  ! case_io on an exact restart, under the CPU's names:
+  !   imex_pgu, imex_pgv  pgu, pgv(:,:,:,ipg_nm1) (u, v faces; the next step's pg_nm1)
+  !   imex_dpw            the memory term dPw (imex_gpu_stage: hs1 + hs2, formed for the write)
+  !   imex_xp, imex_xc    each stage's last solution (hs1, hs2; or hsol(:,:,:,1:2))
+  !   imex_mxp, imex_mxc  W M x of each stage's last solve (pf_mq(:,:,:,1:2))
+  !   imex_bref           b_ref of the last rebuild, imex_n2raw its N2 before the floor (taper)
+  !   imex_hzop, imex_dza Hz and dza of the last rebuild step (setup lag: rst_replay rebuilds the
+  !                       frozen operator from them); imex_n2o (no lag: the last setup's N2)
+  !   imex_rst_scal(17)   the CPU's scalars (imex_rst_scal_vals), per record
+  ! u^n-1 needs no variable (the earlier record, slot 3-nstp).
+  ! Layout of CPU 73a63afb (FS_SPEC 3.8, 9b-H item 1): the 3-D imex_* variables have no time
+  ! dimension (one copy per file) and are written with the second record of the EXACT_RESTART pair
+  ! only (rec 2, the record a restart continues from); imex_rst_scal stays per record, flag 1 = 1
+  ! only on the record whose state is in the file, 15 = layout (2; 0 in the files of e8fca7b-aeceaec,
+  ! a copy per record, still read), 16 = mode (rst_mode: 1; files with removed options or the 'modal'
+  ! boundary are read as inexact restarts, with a note), 17 = 0 (the CPU's 'modal' ramp count).
+  ! Only the variables the settings in effect use are written (imex_rst_has): x with imex_warm > 0,
+  ! mx with imex_pcg_start 3 + imex_warm 1 + the setup lag, n2raw whenever the taper uses it (CPU
+  ! 72539140; before it, with the lag and 'coef', n2raw was recomputed on read from imex_bref and
+  ! imex_dza, which did not reproduce the rebuild's values to the bit: restarts off the b_ref
+  ! cadence were inexact; files without it still get that recompute, logged).
+  ! imex_rst_state = 0: imex_rst_scal only (flag 1 = 0; inexact restart, logged).
+  ! Every mode of the GPU restarts exactly (imex_pcg_start 0 too: its warm start is hsol, nh).
+  !======================================================================
+  logical function imex_rst_has(name)
+    ! the variable is in this run's restart files (CPU imex_rst_def, rst_has_*)
+    character(len=*), intent(in) :: name
+    imex_rst_has = .false.
+    if (.not. (imex_on .and. imex_solver_enabled)) return
+    if (trim(name) == 'imex_rst_scal') then
+      imex_rst_has = .true.
+      return
+    endif
+    if (imex_rst_state == 0) return
+    select case (trim(name))
+    case ('imex_pgu', 'imex_pgv', 'imex_dpw', 'imex_bref')
+      imex_rst_has = .true.
+    case ('imex_xp', 'imex_xc')
+      imex_rst_has = (imex_warm > 0)
+    case ('imex_mxp', 'imex_mxc')
+      imex_rst_has = (pcg_start == 3 .and. imex_warm == 1 .and. lag_on)
+    case ('imex_n2raw')
+      imex_rst_has = (imex_n2_taper > 0.0_rp)      ! whenever the taper uses it (CPU 72539140)
+    case ('imex_hzop', 'imex_dza')
+      imex_rst_has = lag_on
+    case ('imex_n2o')
+      imex_rst_has = .not. lag_on
+    end select
+  end function imex_rst_has
+
+  logical function imex_stage_on()
+    ! imex_gpu_stage = 1 in effect: the stage solutions are hs1, hs2 (else hsol(:,:,:,1:2))
+    imex_stage_on = stage_on
+  end function imex_stage_on
+
+  subroutine imex_rst_alloc()
+    ! the arrays exist (a restart written or read before the first IMEX step)
+    if (.not. imex_on) return
+    if (.not. allocated(pgu)) call imex_alloc()
+    if (.not. allocated(pf_mq)) then
+      allocate(pf_mq(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)); pf_mq = 0.0_rp
+    endif
+  end subroutine imex_rst_alloc
+
+  subroutine imex_rst_prepare()
+    ! before a restart record is written: imex_gpu_stage keeps no dpw array between steps,
+    ! dpw = hs1 + hs2 (the CPU's dps + dp_corr; dpw is only read after eta_setup1 rewrites
+    ! it); the device is drained so the host can read the managed arrays
+    integer(ip) :: i, j, k, is, ie, js, je, nz
+#ifdef USE_CUDA
+    integer :: ierr
+#endif
+    if (.not. (imex_on .and. imex_solver_enabled)) return
+    call imex_rst_alloc()
+    if (stage_on) then
+      is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je; nz = decomp%nz
+      CUF_DO3
+      do k = 1, nz
+        do j = js, je
+          do i = is, ie
+            dpw(i, j, k) = hs1(i, j, k) + hs2(i, j, k)
+          enddo
+        enddo
+      enddo
+    endif
+#ifdef USE_CUDA
+    ierr = cudaDeviceSynchronize()
+#endif
+  end subroutine imex_rst_prepare
+
+  subroutine imex_rst_scal_vals(sc, rec)
+    ! imex_rst_scal of record rec of the file (the CPU's layout): 1 state complete in this file
+    ! (only with rec 2, the record the 3-D state is written with, and imex_rst_state 1), 2 lag on,
+    ! 3 b_ref age in steps, 4 eta_old, 5-6 warm-start history count, 7-8 stored W M x valid for the
+    ! operator in use, 9-10 its c2, 11 imex_warm, 12 imex_pcg_start in effect, 13 b_ref cadence,
+    ! 14 solver storage, 15 layout (2: one time-less copy per file), 16 mode (rst_mode), 17 0 (the CPU's
+    ! 'modal' reference update count)
+    real(8), intent(out) :: sc(imex_nsc)
+    integer, intent(in) :: rec
+    integer :: s
+    sc = 0.0d0
+    if (.not. (imex_on .and. imex_solver_enabled)) return
+    if (allocated(pgu) .and. have_bref .and. coef_version > 0 .and. imex_rst_state == 1 .and. rec == 2) sc(1) = 1.0d0
+    sc(2) = merge(1.0d0, 0.0d0, lag_on)
+    if (have_bref) sc(3) = dble(iic - bref_last)
+    sc(4) = merge(1.0d0, 0.0d0, eta_old)
+    sc(5:6) = dble(nh)
+    do s = 1, 2
+      if (pcg_start == 3 .and. imex_warm == 1 .and. lag_on .and. ps_mver(s) == coef_version) sc(6 + s) = 1.0d0
+    enddo
+    sc(9:10) = ps_mc2
+    sc(11) = dble(imex_warm); sc(12) = dble(pcg_start); sc(13) = dble(imex_nbref())
+    sc(14) = dble(merge(pf_prec, 0, pf_on))
+    sc(15) = 2.0d0; sc(16) = dble(rst_mode()); sc(17) = 0.0d0
+  end subroutine imex_rst_scal_vals
+
+  integer function rst_mode()
+    ! imex_rst_scal(16) (CPU rst_mode): 1. Older files may carry options that this version does not
+    ! have, so that a restart from them is refused as inexact (obc_mode_change): written before the
+    ! key trim of 2026-11-13, 2 in place of 1 imex_force_mode 'gradient', + 10 imex_bt_mode 'step2d';
+    ! written with the 'modal' open boundary, + 100 and its settings in the higher digits
+    rst_mode = 1
+  end function rst_mode
+
+  function obc_mode_change(mold) result(txt)
+    ! the rst_mode of an older file in words (CPU obc_mode_change, the inexact-restart note)
+    integer, intent(in) :: mold
+    character(len=256) :: txt
+    character(len=128) :: rm
+    rm = ''
+    if (mod(mold, 10) == 2) rm = "imex_force_mode 'gradient'"
+    if (mod(mold / 10, 10) == 1) rm = trim(rm) // "  imex_bt_mode 'step2d'"
+    txt = ''
+    if (len_trim(rm) > 0) txt = 'the file was written with options removed on 2026-11-13: ' // trim(adjustl(rm))
+    if (mod(mold / 100, 10) == 1) then
+      if (len_trim(txt) > 0) txt = trim(txt) // '; '
+      txt = trim(txt) // "the file was written with the 'modal' open boundary, which this version does not have"
+    endif
+    if (len_trim(txt) == 0) txt = 'restart mode'
+  end function obc_mode_change
+
+  logical function imex_rst_accept(exact, have, sc)
+    ! case_io, before reading the fields: the state is read when the restart is exact and the
+    ! record has a complete state for this run's settings; otherwise the first step starts the
+    ! IMEX stores as before (first-step weights; inexact), with the CPU's note
+    logical, intent(in) :: exact, have
+    real(8), intent(in) :: sc(imex_nsc)
+    character(len=512) :: why
+    integer :: md
+    imex_rst_accept = .false.
+    if (.not. (imex_on .and. imex_solver_enabled)) return
+    why = ''
+    md = nint(sc(16))
+    if (md == 0) md = 1                       ! (files of e8fca7b-aeceaec: adjoint)
+    if (.not. exact) then
+      why = 'not an exact restart'
+    else if (.not. have) then
+      why = 'no IMEX state in the initial file'
+    else if (imex_rst_state == 0) then
+      why = 'imex_rst_state = 0'
+    else if (nint(sc(1)) /= 1) then
+      why = 'the record has no IMEX state (written with imex_rst_state = 0, incomplete, or not the second'// &
+            ' record of an exact-restart pair)'
+    else if (nint(sc(2)) /= merge(1, 0, lag_on) .or. nint(sc(11)) /= imex_warm .or. nint(sc(12)) /= pcg_start &
+             .or. nint(sc(13)) /= imex_nbref() .or. nint(sc(14)) /= merge(pf_prec, 0, pf_on) .or. md /= rst_mode()) then
+      why = 'IMEX settings differ from the run that wrote it (setup lag, warm start, b_ref cadence, solver, mode'
+      if (nint(sc(11)) >= 2) why = trim(why) // '; the file was written with imex_warm = 2 or 3, removed on' // &
+           ' 2026-11-13'
+      if (md /= rst_mode()) why = trim(why) // '; ' // trim(obc_mode_change(md))
+      why = trim(why) // ')'
+    endif
+    if (why /= '') then
+      if (talk) write(*,'(1x,A)') 'IMEX_IGW: '//trim(why)//': the IMEX stores start as on a first step'// &
+           ' (inexact restart)'
+      return
+    endif
+    call imex_rst_alloc()
+    imex_rst_accept = .true.
+  end function imex_rst_accept
+
+  subroutine imex_rst_loaded(sc, n2raw_read)
+    ! after case_io has read the fields (imex_rst_accept true): halos, the scalars; the
+    ! frozen operator is rebuilt at the first imex_step_setup (rst_replay). n2raw_read: imex_n2raw
+    ! was in the file (else, with a taper, it is recomputed from b_ref and dza on the tile and its
+    ! ring, as bref_build made it: files written with the setup lag before CPU 72539140; exact only
+    ! when the restart step rebuilds b_ref, logged)
+    real(8), intent(in) :: sc(imex_nsc)
+    logical, intent(in) :: n2raw_read
+    integer(ip) :: i, j, k, nx, ny, nz
+    if (imex_warm > 0) then
+      if (stage_on) then
+        call halo_fill_3d(hs1, STAGGER_RHO)
+        call halo_fill_3d(hs2, STAGGER_RHO)
+      else
+        call halo_fill_3d(hsol(:,:,:,1), STAGGER_RHO)
+        call halo_fill_3d(hsol(:,:,:,2), STAGGER_RHO)
+      endif
+    endif
+    nh = nint(sc(5:6))
+    ps_mver = -1; rst_mvalid = 0
+    if (imex_rst_has('imex_mxp')) then
+      rst_mvalid = nint(sc(7:8)); ps_mc2 = sc(9:10)
+    endif
+    call halo_fill_3d(bref_sav, STAGGER_RHO)
+    have_bref = .true.
+    bref_last = ntstart - 1 - nint(sc(3))   ! the same age at the next step
+    if (lag_on) then
+      call halo_fill_3d(hz_op, STAGGER_RHO)
+      call halo_fill_3d(dza, STAGGER_RHO)
+    else
+      eta_old = (nint(sc(4)) == 1)
+    endif
+    if (imex_n2_taper > 0.0_rp) then
+      if (n2raw_read) then
+        call halo_fill_3d(ad_n2raw, STAGGER_RHO)
+      else
+        if (talk) write(*,'(1x,A)') 'IMEX_IGW: no imex_n2raw in the initial file: N2 of b_ref'// &
+             ' recomputed (exact only at a b_ref rebuild)'
+        nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+#ifdef USE_CUDA
+        !$cuf kernel do(3) <<<*,*>>>
+#endif
+        do k = 1, nz
+          do j = 0, ny + 1
+            do i = 0, nx + 1
+              ad_n2raw(i, j, k) = dza(i, j, k) * (bref_sav(i, j, min(k + 1, nz)) - bref_sav(i, j, max(k - 1, 1_ip)))
+            enddo
+          enddo
+        enddo
+      endif
+    endif
+    rst_read = .true.; rst_pend = .true.
+    if (talk) write(*,'(1x,A,I4,A,2I3)') 'IMEX_IGW: IMEX state read from the initial file (exact restart);'// &
+         ' b_ref age', nint(sc(3)), ' steps, warm-start history', nh
+  end subroutine imex_rst_loaded
+
+  subroutine rst_replay()
+    ! imex_setup_lag = 1, first imex_step_setup after an exact restart: the operator of the last
+    ! b_ref rebuild step rebuilt from that step's inputs, as that step built it (the CPU's
+    ! imex_rst_replay): Hz := hz_op for the call, rshu, rshv from it, dza as read, adj_setup
+    ! with b_ref from bref_sav and no rescale of the memory terms (eta_old false; ad_n2o := its
+    ! n2t); then a new coef_version, and the stored W M x of a stage valid for it when it was
+    ! for the operator in use when written. bw0 (b_ref build scratch) holds the step's Hz.
+    integer(ip) :: i, j, k, nx, ny, nz, is, ie, js, je
+    integer :: s
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    call copy3(Hz, bw0)
+    call copy3(hz_op, Hz)
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, ny
+      do i = 1, nx + 1
+        rshu(i, j) = 0.0_rp
+        do k = 1, nz
+          rshu(i, j) = rshu(i, j) + 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k))
+        enddo
+        rshu(i, j) = 1.0_rp / rshu(i, j)
+      enddo
+    enddo
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, ny + 1
+      do i = 1, nx
+        rshv(i, j) = 0.0_rp
+        do k = 1, nz
+          rshv(i, j) = rshv(i, j) + 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k))
+        enddo
+        rshv(i, j) = 1.0_rp / rshv(i, j)
+      enddo
+    enddo
+    CUF_DO2
+    do j = js, je
+      do i = is, ie
+        rshu_op(i, j) = rshu(i, j)
+        rshv_op(i, j) = rshv(i, j)
+      enddo
+    enddo
+    eta_old = .false.; rst_on = .true.
+    call adj_setup()
+    rst_on = .false.
+    call copy3(bw0, Hz)
+    coef_version = coef_version + 1
+    do s = 1, 2
+      if (rst_mvalid(s) == 1) ps_mver(s) = coef_version
+    enddo
+  end subroutine rst_replay
 
 end module imex_igw
