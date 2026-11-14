@@ -142,7 +142,8 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
 - Diagnostic probes are off unless `ROMS_GPU_PROBES` is non-zero; then they
   print in the first 24 steps at fixed global points of the development grid
   (`time_state.F90`), on the rank that owns each point. A new probe reads the
-  rank-local `iprb_*`/`jprb_*` and must check them against the tile range.
+  rank-local `iprb_*`/`jprb_*` (or `iprb_x`/`jprb_x`), checks them against the
+  tile range, and checks any fixed level against nz.
   CUDA graphs (`ROMS_GPU_GRAPH=1`) damp zeta; keep them off for validation.
 - nvfortran pitfalls (`value` arguments in device code, the inliner, stack
   size) are in `MARBL_GPU_PORT.md`, "Toolchain lessons".

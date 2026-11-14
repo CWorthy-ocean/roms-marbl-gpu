@@ -442,7 +442,7 @@ contains
 
   subroutine dump_visc_sum()
     integer(ip) :: i, j, k, nz
-    real(rp) :: vsum
+    real(rp) :: vsum, v50, v99
 
     if (.not. probe_on) return
     call sync_arch()
@@ -455,10 +455,13 @@ contains
         do k = 1, nz
           vsum = vsum + v(i, j, k, nnew)
         enddo
+        v50 = 0.0_rp; v99 = 0.0_rp   ! levels above nz print 0
+        if (nz >= 50) v50 = v(i, j, 50, nnew)
+        if (nz >= 99) v99 = v(i, j, 99, nnew)
         write(*,'(a,i6,a,i6,a,i8,a,5es26.17)') 'diag: visc  i=', i, &
              ' j=', j, '  after visc3d sum  iic=', iic, &
              '  vsum,v1,v50,v99,v100=', vsum, v(i, j, 1, nnew), &
-             v(i, j, 50, nnew), v(i, j, 99, nnew), v(i, j, nz, nnew)
+             v50, v99, v(i, j, nz, nnew)
       enddo
     enddo
     flush(6)

@@ -261,6 +261,7 @@ contains
     real(rp) :: dmv, DVavg1, vmsk, den, termU, termD
     real(rp) :: Hz1, Hz50, Hz99, Hz100
     integer(ip) :: nz
+    ! Levels 50 and 99 print 0 when they are above nz.
 
     if (.not. probe_on) return
     if (i /= iprb_pt(4) .or. j /= jprb_pt(4)) return
@@ -275,13 +276,17 @@ contains
     if (abs(Dcol) > 1.0e-30_rp) termU = uint / Dcol
     if (abs(den) > 1.0e-30_rp) termD = DVavg1 / den
     Hz1 = 0.5_rp * (Hz(i, j, 1) + Hz(i, j - 1, 1))
-    Hz50 = 0.5_rp * (Hz(i, j, 50) + Hz(i, j - 1, 50))
-    Hz99 = 0.5_rp * (Hz(i, j, 99) + Hz(i, j - 1, 99))
+    Hz50 = 0.0_rp; Hz99 = 0.0_rp
+    if (nz >= 50) Hz50 = 0.5_rp * (Hz(i, j, 50) + Hz(i, j - 1, 50))
+    if (nz >= 99) Hz99 = 0.5_rp * (Hz(i, j, 99) + Hz(i, j - 1, 99))
     Hz100 = 0.5_rp * (Hz(i, j, nz) + Hz(i, j - 1, nz))
     if (present(vel)) then
       vd = vel
     else
-      vd = (/ v(i, j, 1, nnew), v(i, j, 50, nnew), v(i, j, 99, nnew), v(i, j, nz, nnew) /)
+      vd = 0.0_rp
+      vd(1) = v(i, j, 1, nnew); vd(4) = v(i, j, nz, nnew)
+      if (nz >= 50) vd(2) = v(i, j, 50, nnew)
+      if (nz >= 99) vd(3) = v(i, j, 99, nnew)
     endif
     write(*,'(a,i6,a,i6,a,i8,a,8es26.17)') 'diag: cpl1v B  i=', i, &
          ' j=', j, '  couple1  iic=', iic, &
@@ -300,8 +305,9 @@ contains
     integer(ip), intent(in) :: i, j
     real(rp), intent(in) :: uint, Dcol, mis
     real(rp), intent(in), optional :: vel(4)
-    real(rp) :: dnu, DUavg1, umsk, den, termU, termD, ud(4)
+    real(rp) :: dnu, DUavg1, umsk, den, termU, termD, ud(4), hzl(4)
     integer(ip) :: nz
+    ! Levels 50 and 99 print 0 when they are above nz.
 
     if (.not. probe_on) return
     if (i /= iprb_pt(4) .or. j /= jprb_pt(4)) return
@@ -318,19 +324,23 @@ contains
     if (present(vel)) then
       ud = vel
     else
-      ud = (/ u(i, j, 1, nnew), u(i, j, 50, nnew), u(i, j, 99, nnew), u(i, j, nz, nnew) /)
+      ud = 0.0_rp
+      ud(1) = u(i, j, 1, nnew); ud(4) = u(i, j, nz, nnew)
+      if (nz >= 50) ud(2) = u(i, j, 50, nnew)
+      if (nz >= 99) ud(3) = u(i, j, 99, nnew)
     endif
+    hzl = 0.0_rp
+    hzl(1) = 0.5_rp * (Hz(i, j, 1) + Hz(i - 1, j, 1))
+    if (nz >= 50) hzl(2) = 0.5_rp * (Hz(i, j, 50) + Hz(i - 1, j, 50))
+    if (nz >= 99) hzl(3) = 0.5_rp * (Hz(i, j, 99) + Hz(i - 1, j, 99))
+    hzl(4) = 0.5_rp * (Hz(i, j, nz) + Hz(i - 1, j, nz))
     write(*,'(a,i6,a,i6,a,i8,a,8es26.17)') 'diag: cpl1u B  i=', i, &
          ' j=', j, '  couple1  iic=', iic, &
          '  uint,Dcol,dnu,DUavg1,mis,umask,termU,termD=', &
          uint, Dcol, dnu, DUavg1, mis, umsk, termU, termD
     write(*,'(a,i6,a,i6,a,i8,a,8es26.17)') 'diag: cpl1u B  i=', i, &
          ' j=', j, '  couple1 Hz  iic=', iic, &
-         '  Hz1,Hz50,Hz99,Hz100,ud1,ud50,ud99,ud100=', &
-         0.5_rp * (Hz(i, j, 1) + Hz(i - 1, j, 1)), &
-         0.5_rp * (Hz(i, j, 50) + Hz(i - 1, j, 50)), &
-         0.5_rp * (Hz(i, j, 99) + Hz(i - 1, j, 99)), &
-         0.5_rp * (Hz(i, j, nz) + Hz(i - 1, j, nz)), ud
+         '  Hz1,Hz50,Hz99,Hz100,ud1,ud50,ud99,ud100=', hzl, ud
     flush(6)
   end subroutine dump_cpl1_u
 
@@ -692,8 +702,9 @@ contains
           mis = (uint * dn_u(i, j) - DU_avg1(i, j)) / (Dcol * dn_u(i, j))
           if (probe_c .and. i == ip4 .and. j == jp4) then
             cpl_prb(1) = uint; cpl_prb(2) = Dcol; cpl_prb(3) = mis
-            cpl_prb(4) = u(i, j, 1, n_new); cpl_prb(5) = u(i, j, 50, n_new)
-            cpl_prb(6) = u(i, j, 99, n_new); cpl_prb(7) = u(i, j, nz, n_new)
+            cpl_prb(4) = u(i, j, 1, n_new); cpl_prb(7) = u(i, j, nz, n_new)
+            if (nz >= 50) cpl_prb(5) = u(i, j, 50, n_new)   ! else 0 (zeroed on the host)
+            if (nz >= 99) cpl_prb(6) = u(i, j, 99, n_new)
             cpl_prb(30) = 1.0_rp
           endif
           if (ic_on .and. i == icu_i .and. j == icu_j) then
@@ -772,8 +783,9 @@ contains
           mis = (uint * dm_v(i, j) - DV_avg1(i, j)) / (Dcol * dm_v(i, j))
           if (probe_c .and. i == ip4 .and. j == jp4) then
             cpl_prb(8) = uint; cpl_prb(9) = Dcol; cpl_prb(10) = mis
-            cpl_prb(11) = v(i, j, 1, n_new); cpl_prb(12) = v(i, j, 50, n_new)
-            cpl_prb(13) = v(i, j, 99, n_new); cpl_prb(14) = v(i, j, nz, n_new)
+            cpl_prb(11) = v(i, j, 1, n_new); cpl_prb(14) = v(i, j, nz, n_new)
+            if (nz >= 50) cpl_prb(12) = v(i, j, 50, n_new)
+            if (nz >= 99) cpl_prb(13) = v(i, j, 99, n_new)
             cpl_prb(31) = 1.0_rp
           endif
           do k = 1, nz
@@ -782,8 +794,9 @@ contains
         else
           if (probe_c .and. i == ip4 .and. j == jp4) then
             cpl_prb(8) = 0.0_rp; cpl_prb(9) = 0.0_rp; cpl_prb(10) = 0.0_rp
-            cpl_prb(11) = v(i, j, 1, n_new); cpl_prb(12) = v(i, j, 50, n_new)
-            cpl_prb(13) = v(i, j, 99, n_new); cpl_prb(14) = v(i, j, nz, n_new)
+            cpl_prb(11) = v(i, j, 1, n_new); cpl_prb(14) = v(i, j, nz, n_new)
+            if (nz >= 50) cpl_prb(12) = v(i, j, 50, n_new)
+            if (nz >= 99) cpl_prb(13) = v(i, j, 99, n_new)
             cpl_prb(31) = 1.0_rp
           endif
           do k = 1, nz

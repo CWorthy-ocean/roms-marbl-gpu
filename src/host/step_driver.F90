@@ -609,6 +609,7 @@ contains
     logical, save :: checked = .false.
     character(len=16) :: val
     integer :: stat, ios, ival
+    integer(ip) :: n
     if (checked) return
     checked = .true.
     call get_environment_variable('ROMS_GPU_PROBES', val, status=stat)
@@ -622,45 +623,61 @@ contains
     kpp_probe_to = 23
     if (decomp%rank == 0) write(*,'(3a)') 'step_driver: diagnostic probes on (ROMS_GPU_PROBES=', &
          trim(val), ')'
-    call set_probe_points('rho', 0, 0, iprb_pt_g, jprb_pt_g, iprb_pt, jprb_pt)
-    call set_probe_points('u', 1, 0, iprb_u_g, jprb_u_g, iprb_u, jprb_u)
-    call set_probe_points('v', 0, 1, iprb_v_g, jprb_v_g, iprb_v, jprb_v)
+    do n = 1, nprb_pt
+      call set_probe_point('rho', n, 0, 0, iprb_pt_g(n), jprb_pt_g(n), iprb_pt(n), jprb_pt(n))
+    enddo
+    do n = 1, nprb_u
+      call set_probe_point('u', n, 1, 0, iprb_u_g(n), jprb_u_g(n), iprb_u(n), jprb_u(n))
+    enddo
+    do n = 1, nprb_v
+      call set_probe_point('v', n, 2, 0, iprb_v_g(n), jprb_v_g(n), iprb_v(n), jprb_v(n))
+    enddo
+    do n = 1, nprb_x
+      call set_probe_point('extra', n, sprb_x(n), 1, iprb_x_g(n), jprb_x_g(n), iprb_x(n), jprb_x(n))
+    enddo
   end subroutine set_probe_windows
 
-  subroutine set_probe_points(stag, su, sv, ig, jg, il, jl)
-    ! Rank-local probe points from the global ones: the local index where
-    ! the point is inside the grid and owned by this rank, else prb_off.
-    ! su = 1 for U-faces (global i = 1..gnx+1, the east boundary face owned
-    ! by the east-edge tile), sv = 1 for V-faces (j = 1..gny+1). Rank 0
-    ! names each point outside the grid once.
-    character(len=*), intent(in) :: stag
-    integer(ip), intent(in) :: su, sv, ig(:), jg(:)
-    integer(ip), intent(out) :: il(:), jl(:)
-    integer(ip) :: n, gimax, gjmax, iimax, jjmax, li, lj
-    gimax = decomp%gnx
-    gjmax = decomp%gny
-    iimax = decomp%nx
-    jjmax = decomp%ny
-    if (su == 1 .and. .not. decomp%periodic_x) gimax = gimax + 1
-    if (sv == 1 .and. .not. decomp%periodic_y) gjmax = gjmax + 1
-    if (su == 1 .and. decomp%edge_e) iimax = iimax + 1
-    if (sv == 1 .and. decomp%edge_n) jjmax = jjmax + 1
-    do n = 1, size(ig)
-      il(n) = prb_off
-      jl(n) = prb_off
-      if (ig(n) < 1 .or. ig(n) > gimax .or. jg(n) < 1 .or. jg(n) > gjmax) then
-        if (decomp%rank == 0) write(*,'(3a,i2,a,2i6,a,i6,a,i6,a)') &
-             'step_driver: probe point ', stag, ' P', n, ' (i,j =', ig(n), jg(n), &
-             ') is outside the', gimax, ' x', gjmax, ' grid: skipped'
-        cycle
-      endif
-      li = ig(n) - decomp%i0 + 1
-      lj = jg(n) - decomp%j0 + 1
-      if (li < 1 .or. li > iimax .or. lj < 1 .or. lj > jjmax) cycle
-      il(n) = li
-      jl(n) = lj
-    enddo
-  end subroutine set_probe_points
+  subroutine set_probe_point(name, n, stag, ring, ig, jg, il, jl)
+    ! Rank-local probe point from a global one: the local index where the
+    ! point is inside the grid and owned by this rank, else prb_off.
+    ! stag: 0 rho, 1 U-face (global i = 1..gnx+1, the east boundary face
+    ! owned by the east-edge tile), 2 V-face (j = 1..gny+1, north edge).
+    ! ring = 1 also accepts the boundary ring of a non-periodic axis
+    ! (index 0 and the index after the last), owned by the edge tile.
+    ! Rank 0 names each point outside the grid.
+    character(len=*), intent(in) :: name
+    integer(ip), intent(in) :: n, stag, ring, ig, jg
+    integer(ip), intent(out) :: il, jl
+    integer(ip) :: gilo, gihi, gjlo, gjhi, lilo, lihi, ljlo, ljhi, rx, ry, li, lj
+    rx = ring; ry = ring
+    if (decomp%periodic_x) rx = 0
+    if (decomp%periodic_y) ry = 0
+    gilo = 1 - rx; gihi = decomp%gnx + rx
+    gjlo = 1 - ry; gjhi = decomp%gny + ry
+    lilo = 1; lihi = decomp%nx
+    ljlo = 1; ljhi = decomp%ny
+    if (stag == 1 .and. .not. decomp%periodic_x) gihi = gihi + 1
+    if (stag == 2 .and. .not. decomp%periodic_y) gjhi = gjhi + 1
+    if (stag == 1 .and. decomp%edge_e) lihi = lihi + 1
+    if (stag == 2 .and. decomp%edge_n) ljhi = ljhi + 1
+    if (decomp%edge_w) lilo = lilo - rx
+    if (decomp%edge_e) lihi = lihi + rx
+    if (decomp%edge_s) ljlo = ljlo - ry
+    if (decomp%edge_n) ljhi = ljhi + ry
+    il = prb_off
+    jl = prb_off
+    if (ig < gilo .or. ig > gihi .or. jg < gjlo .or. jg > gjhi) then
+      if (decomp%rank == 0) write(*,'(3a,i2,a,2i6,a,i6,a,i6,a)') &
+           'step_driver: probe point ', name, ' P', n, ' (i,j =', ig, jg, &
+           ') is outside the', gihi - gilo + 1, ' x', gjhi - gjlo + 1, ' grid: skipped'
+      return
+    endif
+    li = ig - decomp%i0 + 1
+    lj = jg - decomp%j0 + 1
+    if (li < lilo .or. li > lihi .or. lj < ljlo .or. lj > ljhi) return
+    il = li
+    jl = lj
+  end subroutine set_probe_point
 
   subroutine step_timer_init()
     clock_start = wall_time()

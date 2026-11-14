@@ -250,14 +250,13 @@ contains
     ! Call immediately after horiz_up3_fluxes(itemp), before the update.
     character(len=*), intent(in) :: tag
     real(rp),         intent(in) :: dtau_in
-    integer(ip), parameter :: iprobe = 154_ip, jprobe = 136_ip
     integer(ip) :: i, j, k, kmax, nz
     real(rp) :: div, dT, absmax, hzv
 
     if (.not. probe_on) return
     call sync_arch()
-    i = iprobe
-    j = jprobe
+    i = iprb_x(1)   ! X1 (154,136), rank-local (time_state)
+    j = jprb_x(1)
     nz = decomp%nz
     if (i < 1 .or. i > decomp%nx .or. j < 1 .or. j > decomp%ny) return
 

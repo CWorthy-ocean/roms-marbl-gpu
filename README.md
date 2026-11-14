@@ -257,7 +257,10 @@ v0.1.2-beta, bit for bit.
   outside the grid once at start-up. Before, the points were used as
   local tile indices, so with probes on several probes read outside their
   arrays and the sargasso and N2 cases stopped at the first step with a
-  segmentation fault. Runs with `ROMS_GPU_PROBES=0` are unchanged, bit for
+  segmentation fault. The probes' single-purpose points (the coastal
+  `huv`/`flux` cell and the `rim` sites) follow the same rule, and probes
+  that print fixed levels (50, 99) print 0 for a level above `nz` instead
+  of reading past the array. Runs with `ROMS_GPU_PROBES=0` are unchanged, bit for
   bit, and so are runs with probes on (except for the probe lines). A run
   that left the variable unset now uses the faster kernels of non-probe
   steps in its first 24 steps too; on the closed basin with rivers and

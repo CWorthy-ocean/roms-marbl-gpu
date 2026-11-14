@@ -692,15 +692,14 @@ contains
     ! Face u/v, thickness, and mass flux at the coastal cell that climbs.
     ! Call after set_HUV, set_HUV1, and step3d_uv2.
     character(len=*), intent(in) :: tag
-    integer(ip), parameter :: iprobe = 154_ip, jprobe = 136_ip
     integer(ip) :: i, j, k, nz
     real(rp) :: hzu_w, hzu_e, hzv_s, hzv_n
     real(rp) :: flu_w, flu_e, flv_s, flv_n
 
     if (.not. probe_on) return
     call sync_arch()
-    i = iprobe
-    j = jprobe
+    i = iprb_x(1)   ! X1 (154,136), rank-local
+    j = jprb_x(1)
     nz = decomp%nz
     if (i < 1 .or. i > decomp%nx .or. j < 1 .or. j > decomp%ny) return
 
@@ -994,14 +993,15 @@ contains
 
   subroutine dump_rim(tag)
     ! Hour-1 leftover sites from the bak-fix day run (history python
-    ! j,i on the 0-halo field). Halo rows/columns are included.
+    ! j,i on the 0-halo field). Halo rows/columns are included. The
+    ! points are time_state's X2-X5, rank-local (prb_off off this rank):
     !   NeZ zeta (511,433)  north ghost, near east
-    !   NtT temp (433,432)  last interior north, k=nz
-    !   SeU u    (512,  0)  south ghost, east U-face, k=10
+    !   NtT temp (433,432)  last interior north, k=nz (and k=50 if nz >= 50)
+    !   SeU u    (512,  0)  south ghost, east U-face, k=10 (if nz >= 10)
     !   NeV v    (513,432)  east ghost, last interior V, k=nz
     character(len=*), intent(in) :: tag
-    integer(ip) :: nz, n_rhs, n_new, ku
-    real(rp) :: hzu, hzv
+    integer(ip) :: nz, n_rhs, n_new, ku, i, j
+    real(rp) :: hzu, hzv, t50
 
     if (.not. probe_on) return
     call sync_arch()
@@ -1010,39 +1010,45 @@ contains
     n_new = nnew
     ku = 10_ip
 
-    if (in_alloc(511_ip, 433_ip)) then
+    i = iprb_x(2); j = jprb_x(2)
+    if (in_alloc(i, j)) then
       write(*,'(a,i8,a,a,a,8es18.10)') 'diag: rim NeZ  iic=', iic, &
            '  ', trim(tag), &
            '  zeta,Zt_avg1,rmask,h,HzNz,Tnz,DUbak,DVbak=', &
-           zeta(511, 433, knew), zt_avg1(511, 433), rmask(511, 433), &
-           h(511, 433), Hz(511, 433, nz), t(511, 433, nz, n_new, itemp), &
-           DU_avg_bak(511, 433), DV_avg_bak(511, 433)
+           zeta(i, j, knew), zt_avg1(i, j), rmask(i, j), &
+           h(i, j), Hz(i, j, nz), t(i, j, nz, n_new, itemp), &
+           DU_avg_bak(i, j), DV_avg_bak(i, j)
     endif
-    if (in_alloc(433_ip, 432_ip)) then
+    i = iprb_x(3); j = jprb_x(3)
+    if (in_alloc(i, j)) then
+      t50 = 0.0_rp
+      if (nz >= 50) t50 = t(i, j, 50, n_new, itemp)
       write(*,'(a,i8,a,a,a,8es18.10)') 'diag: rim NtT  iic=', iic, &
            '  ', trim(tag), &
            '  Tnz,T50,hbls,zeta,HzNz,rmask,AktNz,WeNz=', &
-           t(433, 432, nz, n_new, itemp), t(433, 432, 50, n_new, itemp), &
-           hbls(433, 432), zeta(433, 432, knew), Hz(433, 432, nz), &
-           rmask(433, 432), Akt(433, 432, nz, itemp), We(433, 432, nz)
+           t(i, j, nz, n_new, itemp), t50, &
+           hbls(i, j), zeta(i, j, knew), Hz(i, j, nz), &
+           rmask(i, j), Akt(i, j, nz, itemp), We(i, j, nz)
     endif
-    if (in_alloc(512_ip, 0_ip) .and. in_alloc(511_ip, 0_ip)) then
-      hzu = 0.5_rp * (Hz(512, 0, ku) + Hz(511, 0, ku))
+    i = iprb_x(4); j = jprb_x(4)
+    if (nz >= ku .and. in_alloc(i, j) .and. in_alloc(i - 1, j)) then
+      hzu = 0.5_rp * (Hz(i, j, ku) + Hz(i - 1, j, ku))
       write(*,'(a,i8,a,a,a,8es18.10)') 'diag: rim SeU  iic=', iic, &
            '  ', trim(tag), &
            '  uNrhs,uNnew,ubar,umask,HzU,DU1,DU2,DUbak=', &
-           u(512, 0, ku, n_rhs), u(512, 0, ku, n_new), ubar(512, 0, knew), &
-           umask(512, 0), hzu, DU_avg1(512, 0), DU_avg2(512, 0), &
-           DU_avg_bak(512, 0)
+           u(i, j, ku, n_rhs), u(i, j, ku, n_new), ubar(i, j, knew), &
+           umask(i, j), hzu, DU_avg1(i, j), DU_avg2(i, j), &
+           DU_avg_bak(i, j)
     endif
-    if (in_alloc(513_ip, 432_ip) .and. in_alloc(513_ip, 431_ip)) then
-      hzv = 0.5_rp * (Hz(513, 432, nz) + Hz(513, 431, nz))
+    i = iprb_x(5); j = jprb_x(5)
+    if (in_alloc(i, j) .and. in_alloc(i, j - 1)) then
+      hzv = 0.5_rp * (Hz(i, j, nz) + Hz(i, j - 1, nz))
       write(*,'(a,i8,a,a,a,8es18.10)') 'diag: rim NeV  iic=', iic, &
            '  ', trim(tag), &
            '  vNrhs,vNnew,vbar,vmask,HzV,DV1,DV2,DVbak=', &
-           v(513, 432, nz, n_rhs), v(513, 432, nz, n_new), &
-           vbar(513, 432, knew), vmask(513, 432), hzv, &
-           DV_avg1(513, 432), DV_avg2(513, 432), DV_avg_bak(513, 432)
+           v(i, j, nz, n_rhs), v(i, j, nz, n_new), &
+           vbar(i, j, knew), vmask(i, j), hzv, &
+           DV_avg1(i, j), DV_avg2(i, j), DV_avg_bak(i, j)
     endif
     flush(6)
   contains
@@ -1167,6 +1173,7 @@ contains
     character(len=*), intent(in) :: tag
     real(rp), intent(in) :: extra
     integer(ip) :: i, j, nz
+    real(rp) :: rv50
 
     if (.not. probe_on) return
     i = iprb_pt(1)
@@ -1174,9 +1181,11 @@ contains
     if (i < 1 .or. i > decomp%nx .or. j < 1 .or. j > decomp%ny) return
     call sync_arch()
     nz = decomp%nz
+    rv50 = 0.0_rp   ! level 50 only if nz >= 50
+    if (nz >= 50) rv50 = rv(i, j, 50)
     write(*,'(a,a,a,i8,a,6es26.17)') 'diag: rv3d P1  ', trim(tag), &
          '  iic=', iic, '  sum_rv,rv1,rv50,rv100,rvfrc,extra=', &
-         sum(rv(i, j, 1:nz)), rv(i, j, 1), rv(i, j, 50), rv(i, j, nz), &
+         sum(rv(i, j, 1:nz)), rv(i, j, 1), rv50, rv(i, j, nz), &
          rvfrc(i, j), extra
     flush(6)
   end subroutine dump_rv3d

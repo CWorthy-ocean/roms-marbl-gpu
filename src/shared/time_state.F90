@@ -72,7 +72,17 @@ module time_state
   integer(ip), parameter, public :: nprb_v = 4
   integer(ip), parameter, public :: iprb_v_g(nprb_v) = (/ 433, 433, 372, 372 /)
   integer(ip), parameter, public :: jprb_v_g(nprb_v) = (/ 432, 433, 1, 2 /)
+  ! Single-purpose points, which may lie on the boundary ring (index 0 or
+  ! gnx+1 / gny+1, owned by the edge tile): X1 (154,136) rho, the coastal
+  ! cell that climbs (huv B, flux B); the rim probes' development-grid
+  ! ghosts X2 NeZ (511,433) rho, X3 NtT (433,432) rho, X4 SeU (512,0) u,
+  ! X5 NeV (513,432) v. sprb_x: 0 rho, 1 U-face, 2 V-face.
+  integer(ip), parameter, public :: nprb_x = 5
+  integer(ip), parameter, public :: iprb_x_g(nprb_x) = (/ 154, 511, 433, 512, 513 /)
+  integer(ip), parameter, public :: jprb_x_g(nprb_x) = (/ 136, 433, 432, 0, 432 /)
+  integer(ip), parameter, public :: sprb_x(nprb_x) = (/ 0, 0, 0, 1, 2 /)
   integer(ip), public :: iprb_pt(nprb_pt) = prb_off, jprb_pt(nprb_pt) = prb_off
+  integer(ip), public :: iprb_x(nprb_x) = prb_off, jprb_x(nprb_x) = prb_off
   integer(ip), public :: iprb_u(nprb_u) = prb_off, jprb_u(nprb_u) = prb_off
   integer(ip), public :: iprb_v(nprb_v) = prb_off, jprb_v(nprb_v) = prb_off
   ! FIRST_TIME_STEP is iic==forw_start. Exact restart keeps this at 1 so
