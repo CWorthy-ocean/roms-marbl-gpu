@@ -243,6 +243,12 @@ v0.1.2-beta, bit for bit.
   forcing fields). Before, the GPU model ignored the attribute and
   stopped once the model time left the records. Runs whose river file has
   no `cycle_length` are unchanged, bit for bit.
+- The `diag: uv2 couple1 IC-jet` line of `step3d_uv2` prints on probe
+  steps only (none with `ROMS_GPU_PROBES=0`). Before, it printed on every
+  step on every rank whose initial u is non-zero, and each print
+  synchronised the device and read a managed array on the host (5 % of
+  the step on the N2 nest with IMEX 'modal'). Results are unchanged, bit
+  for bit.
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
   depth-integrated internal-tide energy flux `up`/`vp` of the parent,
   written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS

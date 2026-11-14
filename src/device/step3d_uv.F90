@@ -623,7 +623,9 @@ contains
       cpl_prb = 0.0_rp
     endif
     probe_c = probe_on
-    ic_on = (ic_u_k >= 1)
+    ! The IC-jet line prints on probe steps only: each print synchronises
+    ! the device and reads the managed cpl_prb on the host.
+    ic_on = (ic_u_k >= 1) .and. probe_on
     icu_i = ic_u_i; icu_j = ic_u_j; icu_k = ic_u_k
     ip4 = iprb_pt(4); jp4 = jprb_pt(4)
     if (probe_c .or. ic_on) then
