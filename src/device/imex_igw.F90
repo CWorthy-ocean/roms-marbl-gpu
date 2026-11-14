@@ -75,7 +75,8 @@ module imex_igw
   use halo_mod, only: hg_begin, hg_add, hg_end, halo_fill_3d, halo_fill_3d_w, halo_fill_2d, &
                       F_U, F_V, F_FLXU, F_FLXV
   use comm_mod, only: comm_world_rank, comm_allreduce_sum, comm_allreduce_max, comm_allreduce_min, &
-                      comm_gpu_direct, comm_ring_dev8
+                      comm_gpu_direct, comm_ring_dev8, comm_shm_init, comm_shm_wanted, comm_fs_sum, &
+                      comm_fs_sum_stats
   use arch_mod, only: sync_arch
   use imex_red, only: red_ensure, red_sum, red_part, it_set, itw, itw2, it_reb
   use rivers_mod, only: river_on, rivers_pred_flx
@@ -180,6 +181,13 @@ module imex_igw
   ! pgu, pgv were zeroed when the skip first applied
   logical, public, protected :: imex_opt_skip
   logical :: pg_dz, opt_zring
+  ! fs_gpu_opt bit 512 (decided at the first fused solve, pf_sum): the fused PCG's reductions through the
+  ! shared-memory window when all compute ranks (1, 2 or 4) share a node (comm_fs_sum; MPI_Allreduce
+  ! otherwise). IMEX makes the window itself (comm_shm_init; the free surface makes it only at its first
+  ! step, after this step's IMEX solves, and not at all in the split loop), so every solve of a run sums
+  ! the same way and a restart stays exact. On 4 ranks the pairwise order differs from MPI_Allreduce's
+  ! (rounding level); the diagnostics' reductions stay on MPI_Allreduce
+  logical :: shm_set, shm_use
   ! CPU 73a63afb (FS_SPEC 3.8, 9b-H): imex_rst_state 1 (default) the IMEX state in the EXACT_RESTART
   ! files (one time-less copy, with the second record of each pair), 0 none (small files, the old
   ! inexact restart); imex_redu (CPU: rank-count-independent integer-digit sums) read, only 0 on
@@ -381,6 +389,7 @@ contains
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
     imex_gpu_timers = 0                  ! the default (see the declaration)
     imex_gpu_opt = 0; imex_opt_skip = .false.; pg_dz = .false.; opt_zring = .false.
+    shm_set = .false.; shm_use = .false.
     rewind(unit)
     msg = ''
     read(unit, nml=imex_igw_settings, iostat=ios, iomsg=msg)
@@ -772,7 +781,44 @@ contains
     call copy_level_n()
     call itw(17, 1)
     call imex_diag_line()
+    if (iic == ntstart + ntimes - 1) call pf_sum_stats()
   end subroutine imex_shift_levels
+
+  subroutine pf_sum(n, loc, glob)
+    ! the fused PCG's sums over the compute ranks (fs_gpu_opt bit 512: see shm_use). Collective; the
+    ! first call (the run's first fused solve, every rank) makes the window
+    integer, intent(in) :: n
+    real(8), intent(in) :: loc(n)
+    real(8), intent(out) :: glob(n)
+    logical :: ok
+    if (.not. shm_set) then
+      shm_set = .true.
+      shm_use = comm_shm_wanted()
+      if (shm_use) call comm_shm_init(ok)
+      if (talk) write(*,'(1x,a,l2)') 'IMEX_IGW: fs_gpu_opt 512: PCG reductions through shared memory (when the' &
+           // ' compute ranks share one node):', shm_use
+    endif
+    if (shm_use) then
+      call comm_fs_sum(n, loc, glob)
+    else
+      call comm_allreduce_sum(n, loc, glob)
+    endif
+  end subroutine pf_sum
+
+  subroutine pf_sum_stats()
+    ! last step: with ROMS_GPU_FS_SHM_CMP, comm_fs_sum's comparison with MPI_Allreduce (the free surface's and
+    ! IMEX's sums together; collective)
+    logical :: son, scmp
+    integer(8) :: sn, sd
+    real(8) :: c(2), cg(2)
+    if (.not. shm_use) return
+    call comm_fs_sum_stats(son, scmp, sn, sd)
+    if (.not. (son .and. scmp)) return
+    c(1) = real(sn, 8); c(2) = real(sd, 8)
+    call comm_allreduce_max(2, c, cg)
+    if (talk) write(*,'(1x,a,i12,a,i10,a)') 'IMEX_STAT shared-memory sums (ROMS_GPU_FS_SHM_CMP, free surface and' &
+         // ' IMEX):', nint(cg(1), 8), ' reductions, ', nint(cg(2), 8), ' values differing from MPI_Allreduce'
+  end subroutine pf_sum_stats
 
   subroutine imex_diag_line()
     ! CPU imex_diag_line: stage statistics since the last line (cadence as

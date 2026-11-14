@@ -58,6 +58,9 @@ module comm_mod
   ! and the bit differences counted (shm_ndiff), the shared-memory result is used.
   integer, parameter :: SHM_SEG = 32
   logical :: shm_on = .false., shm_cmp = .false.
+  ! shm_want: fs_gpu_opt bit 512 as read by fs_read_namelist (comm_shm_want), for the other solvers that
+  ! follow it (IMEX_IGW's PCG); shm_done: comm_shm_init has run (a second call returns its decision)
+  logical :: shm_want = .false., shm_done = .false.
   integer :: shm_win = 0, shm_np = 0, shm_me = 0
   integer(8) :: shm_q = 0, shm_ncall = 0, shm_ndiff = 0
   real(8), pointer, volatile :: shm(:,:) => null()
@@ -76,7 +79,7 @@ module comm_mod
   public :: comm_reduce_maxsum
   public :: comm_reduce_sum
   public :: comm_allreduce_sum, comm_allreduce_max, comm_allreduce_min
-  public :: comm_shm_init, comm_fs_sum, comm_fs_sum_stats
+  public :: comm_shm_init, comm_fs_sum, comm_fs_sum_stats, comm_shm_want, comm_shm_wanted
   public :: comm_allgather_i4, comm_allgatherv_r8, comm_allgatherv_dev, comm_allgatherv_h8
   public :: comm_gpu_direct
   public :: comm_exchange3
@@ -732,6 +735,11 @@ contains
     character(len=8) :: val
     integer :: st
     if (.not. ready) call init_comm()
+    if (shm_done) then                     ! made already (by the free surface or by IMEX)
+      on = shm_on
+      return
+    endif
+    shm_done = .true.
     on = .false.
     val = ''
     call get_environment_variable('ROMS_GPU_FS_SHM_CMP', val, status=st)
@@ -768,9 +776,20 @@ contains
     call MPI_Barrier(compute_comm, ierr)
     shm_np = int(nproc); shm_me = int(my_rank); shm_q = 0; shm_on = .true.; on = .true.
 #else
+    shm_done = .true.
     shm_np = 1; shm_on = .true.; on = .true.
 #endif
   end subroutine comm_shm_init
+
+  subroutine comm_shm_want(on)
+    ! fs_read_namelist: fs_gpu_opt bit 512 (the shared-memory sums), also for the other solvers that follow it
+    logical, intent(in) :: on
+    shm_want = on
+  end subroutine comm_shm_want
+
+  logical function comm_shm_wanted()
+    comm_shm_wanted = shm_want
+  end function comm_shm_wanted
 
   subroutine comm_fs_sum(n, x, xsum)
     ! Sum of x(1:n) (n <= 8) over the compute ranks, on every compute rank. With the shared-memory

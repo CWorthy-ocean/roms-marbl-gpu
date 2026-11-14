@@ -70,7 +70,7 @@
       call PF_START(r0, hv, pf_mq, 3_ip, 0.0_rp, dinv, s, z, s1, s2)
     endif
     loc = [real(s1, 8), real(s2, 8)]
-    call comm_allreduce_sum(2, loc, glob)
+    call pf_sum(2, loc, glob)
     call itw2(9, 1)
     rho = glob(1); rho0 = glob(1)
     if (warm) then
@@ -109,7 +109,7 @@
       pend = .false.                               ! (x += alpha p_old done in the sweep)
       loc(1) = real(pq, 8)
       call itw2(12, 0)
-      call comm_allreduce_sum(1, loc(1:1), glob(1:1))
+      call pf_sum(1, loc(1:1), glob(1:1))
       call itw2(12, 1)
       pq = glob(1)
       if (.not. ieee_is_finite(pq) .or. pq <= 0.0_rp) then
@@ -123,7 +123,7 @@
       pend = .true.                                ! x += alpha p pending
       loc(1) = real(s1, 8)
       call itw2(12, 0)
-      call comm_allreduce_sum(1, loc(1:1), glob(1:1))
+      call pf_sum(1, loc(1:1), glob(1:1))
       call itw2(12, 1)
       iters = it
       if (.not. ieee_is_finite(glob(1)) .or. glob(1) < 0.0_8) then
