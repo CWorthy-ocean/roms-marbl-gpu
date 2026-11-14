@@ -66,6 +66,7 @@ module imex_igw
                        rmask, umask, vmask, rho1, ru, rv, DU_avg1, DU_avg2, DU_avg_bak, &
                        DV_avg1, DV_avg2, DV_avg_bak, h, &
                        t_west, u_west, t_east, u_east, t_south, v_south, t_north, v_north
+  use gpu_state, only: colact, dry_lim, G_MOM, G_PGF
   use time_state, only: nstp, nnew, nrhs, iic, ntstart, ntimes, dt, is_first_time_step, ninfo_steps
   use formulas, only: g, rho0, AM3_crv, qp2, eos_r00, eos_r01, eos_r02, eos_r03, eos_r04, eos_r05, eos_r10, &
                       eos_r11, eos_r12, eos_r13, eos_r14, eos_rS0, eos_rS1, eos_rS2, eos_r20, eos_K00, eos_K01, &
@@ -166,6 +167,17 @@ module imex_igw
   ! here: declaration initial values in this module have crashed nvfortran 25.9, GPU_IMEX_MODAL_PORT.md
   ! sec. 9.6)
   integer     :: imex_gpu_timers
+  ! GPU only, working key of the optimization stages (GPU_IMEX_OPT_REVIEW.md sec. 2.3): bit mask of
+  ! levers on the default fused path (imex_gpu_stage, imex_gpu_sweep, imex_gpu_redu 1); 0 = the path
+  ! of roms-marbl-gpu dev 551565f. Bits: 1 the IMEX kernels skip deep land (the stock dry-column rule)
+  ! and the mixing split's velocity is formed only where a stress kernel reads it (imex_pgu, imex_pgv
+  ! are zero at deep land). Default 0, set in imex_read_namelist (no initial value: see imex_gpu_timers)
+  integer     :: imex_gpu_opt
+  integer, parameter :: OPT_BITS = 1                 ! the bits implemented
+  ! imex_gpu_opt in effect: bit 1 (opt_skip; visc3d reads imex_opt_skip); pg_dz: the deep-land faces of
+  ! pgu, pgv were zeroed when the skip first applied
+  logical, public, protected :: imex_opt_skip
+  logical :: pg_dz
   ! CPU 73a63afb (FS_SPEC 3.8, 9b-H): imex_rst_state 1 (default) the IMEX state in the EXACT_RESTART
   ! files (one time-less copy, with the second record of each pair), 0 none (small files, the old
   ! inexact restart); imex_redu (CPU: rank-count-independent integer-digit sums) read, only 0 on
@@ -214,7 +226,7 @@ module imex_igw
        imex_redu, imex_rst_state, imex_mix_split, &
        imex_obc_mode, imex_obc_nmodes, imex_obc_q0, imex_obc_tref, &
        imex_obc_mprint, imex_obc_cmin, &
-       imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep, imex_gpu_timers
+       imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep, imex_gpu_timers, imex_gpu_opt
 
   ! Weights (set_derived_weights): regular step and first step of a run
   real(rp) :: wpg_pred(2), wflx_pred(3), wpg_corr(3), wrhs_corr(4)
@@ -366,6 +378,7 @@ contains
     talk = (comm_world_rank() == 0)
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
     imex_gpu_timers = 0                  ! the default (see the declaration)
+    imex_gpu_opt = 0; imex_opt_skip = .false.; pg_dz = .false.
     rewind(unit)
     msg = ''
     read(unit, nml=imex_igw_settings, iostat=ios, iomsg=msg)
@@ -523,6 +536,7 @@ contains
                .and. imex_theta_p > 0.0_rp .and. imex_theta_c > 0.0_rp
     if (imex_gpu_sweep < 0 .or. imex_gpu_sweep > 1) call bad('imex_gpu_sweep must be 0 or 1')
     if (imex_gpu_timers < 0 .or. imex_gpu_timers > 2) call bad('imex_gpu_timers must be 0, 1 or 2')
+    if (imex_gpu_opt < 0 .or. iand(imex_gpu_opt, not(OPT_BITS)) /= 0) call bad('imex_gpu_opt: unknown bits')
     sweep_on = (imex_gpu_sweep == 1) .and. pf_on
     ! 'modal' on the GPU (obm_decide): the face term lives in the restructured sweep (PF_OPS), the face
     ! values in the fused stage (solve_stage_fast); imex_pcg_start 0 (apply_m, CPU's unfused operator)
@@ -531,6 +545,9 @@ contains
     if (trim(imex_obc_mode) == 'modal' .and. .not. obm_gpu_ok) call bad("imex_obc_mode = 'modal' on the GPU" &
          // ' needs imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm 1, theta_p, theta_c > 0, imex_gpu_stage 1' &
          // ' and imex_gpu_sweep 1')
+    if (imex_gpu_opt /= 0 .and. .not. (stage_on .and. sweep_on .and. redu_on)) call bad('imex_gpu_opt /= 0 needs' &
+         // ' the default fused path (imex_gpu_stage, imex_gpu_sweep, imex_gpu_redu 1 in effect)')
+    imex_opt_skip = iand(imex_gpu_opt, 1) /= 0
     if (nerr > 0) error stop 'imex_igw: unsupported &imex_igw_settings (see above)'
   contains
     subroutine bad(what)
@@ -579,9 +596,9 @@ contains
          '  imex_solver_prec =', pf_prec
     if (imex_solver_prec /= pf_prec) write(*,'(3x,a)') 'imex_solver_prec = 4 needs imex_pcg_fused = 1 in effect:' &
          // ' imex_solver_prec = 8'
-    write(*,'(3x,a,i2,a,i2,a,i2,a,i2)') 'imex_gpu_redu =', imex_gpu_redu, &
+    write(*,'(3x,a,i2,a,i2,a,i2,a,i2,a,i6)') 'imex_gpu_redu =', imex_gpu_redu, &
          '  imex_gpu_stage =', merge(1, 0, stage_on), '  imex_gpu_sweep =', merge(1, 0, sweep_on), &
-         '  imex_gpu_timers =', imex_gpu_timers
+         '  imex_gpu_timers =', imex_gpu_timers, '  imex_gpu_opt =', imex_gpu_opt
     write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_redu =', imex_redu, '  imex_rst_state =', imex_rst_state, &
          '  imex_mix_split =', imex_mix_split
     write(*,'(3x,a,a,a)') "imex_obc_mode = '", trim(imex_obc_mode), "' (resolved at the first step: 'auto'" &
@@ -695,9 +712,26 @@ contains
 
   subroutine copy_level_n()
     ! u_nm1, v_nm1 := u, v(nstp) (whole arrays, halos included)
-    integer(ip) :: i, j, k, is, ie, js, je, nz, n
+    integer(ip) :: i, j, k, is, ie, js, je, nz, n, lmd
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je; nz = decomp%nz
     n = nstp
+    if (imex_opt_skip) then
+      ! imex_gpu_opt 1: one thread per column, deep land skipped (its u, v are constant)
+      lmd = dry_lim(G_MOM)
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = js, je
+        do i = is, ie
+          if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
+          do k = 1, nz
+            u_nm1(i, j, k) = u(i, j, k, n)
+            v_nm1(i, j, k) = v(i, j, k, n)
+          enddo
+        enddo
+      enddo
+      return
+    endif
     CUF_DO3
     do k = 1, nz
       do j = js, je
@@ -776,7 +810,7 @@ contains
     ! them by the weighted combination, and restore the current level's
     ! depth mean (the weights act on the baroclinic part only).
     integer(ip), intent(in) :: i_ru_lo, i_ru_hi, j_rv_lo, j_rv_hi
-    integer(ip) :: i, j, k, nx, ny, nz, sc, s1, s2
+    integer(ip) :: i, j, k, nx, ny, nz, sc, s1, s2, lmd
     real(rp) :: w1, w2, w3, sc_u, sr_u, sh_u, hf
     if (.not. imex_on) return
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
@@ -788,11 +822,43 @@ contains
       sc = ipg_n; s1 = ipg_nm1; s2 = ipg_nm1
       w1 = wpg_pred(1); w2 = wpg_pred(2); w3 = 0.0_rp
     endif
+    ! imex_gpu_opt 1: deep-land faces skipped (G_PGF, as prsgrd); their stores are zeroed once, when the
+    ! skip first applies, so that the restart files hold zeros there whatever the run's history
+    lmd = 0
+    if (imex_opt_skip) lmd = dry_lim(G_PGF)
+    if (lmd > 0 .and. .not. pg_dz) then
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = 1, ny
+        do i = i_ru_lo, i_ru_hi
+          if (colact(i, j) == 0) then
+            do k = 1, nz
+              pgu(i, j, k, 1) = 0.0_rp; pgu(i, j, k, 2) = 0.0_rp; pgu(i, j, k, 3) = 0.0_rp
+            enddo
+          endif
+        enddo
+      enddo
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = j_rv_lo, j_rv_hi
+        do i = 1, nx
+          if (colact(i, j) == 0) then
+            do k = 1, nz
+              pgv(i, j, k, 1) = 0.0_rp; pgv(i, j, k, 2) = 0.0_rp; pgv(i, j, k, 3) = 0.0_rp
+            enddo
+          endif
+        enddo
+      enddo
+      pg_dz = .true.
+    endif
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 1, ny
       do i = i_ru_lo, i_ru_hi
+        if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
         sc_u = 0.0_rp; sr_u = 0.0_rp; sh_u = 0.0_rp
         do k = 1, nz
           pgu(i, j, k, sc) = ru(i, j, k)
@@ -816,6 +882,7 @@ contains
 #endif
     do j = j_rv_lo, j_rv_hi
       do i = 1, nx
+        if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
         sc_u = 0.0_rp; sr_u = 0.0_rp; sh_u = 0.0_rp
         do k = 1, nz
           pgv(i, j, k, sc) = rv(i, j, k)
@@ -847,13 +914,15 @@ contains
     ! imex_pred_btfix_tile); exchange; omega (We, Wi). set_HUV1 overwrites
     ! FlxU, FlxV later as usual.
     use geom, only: omega
-    integer(ip) :: i, j, k, nx, ny, nz, is, ie, js, je, n_new, n_stp, first
+    integer(ip) :: i, j, k, nx, ny, nz, is, ie, js, je, n_new, n_stp, first, lmd
     integer(ip) :: i_v0, i_v1, j_u0, j_u1
     real(rp) :: w1, w2, w3, sd, sf, dcc, mis, pbx
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     n_new = nnew; n_stp = nstp
     call itw(15, 0)
+    lmd = 0
+    if (imex_opt_skip) lmd = dry_lim(G_MOM)   ! imex_gpu_opt 1: deep land skipped
     w1 = wflx_pred(1); w2 = wflx_pred(2); w3 = wflx_pred(3)
     first = merge(1_ip, 0_ip, is_first_time_step())
     i_v0 = 1; i_v1 = nx; j_u0 = 1; j_u1 = ny
@@ -873,6 +942,7 @@ contains
 #endif
       do j = j_u0, j_u1
         do i = 1, nx + 1
+          if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
           sd = 0.0_rp; sf = 0.0_rp
           do k = 1, nz
             dcc = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * dn_u(i, j)
@@ -895,6 +965,7 @@ contains
 #endif
       do j = 1, ny + 1
         do i = i_v0, i_v1
+          if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
           sd = 0.0_rp; sf = 0.0_rp
           do k = 1, nz
             dcc = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * dm_v(i, j)
@@ -1368,7 +1439,7 @@ contains
     ! then imex_adj_setup. imex_setup_lag = 1: dza and imex_adj_setup only
     ! on the steps that rebuild b_ref (coef_version bumped there, Hz, rshu,
     ! rshv saved as the operator's hz_op, rshu_op, rshv_op).
-    integer(ip) :: i, j, k, nx, ny, nz, is, ie, js, je
+    integer(ip) :: i, j, k, nx, ny, nz, is, ie, js, je, lmd
     logical :: lag_skip
     if (coef_iic == iic) return
     lag_skip = .false.
@@ -1379,11 +1450,14 @@ contains
       rst_pend = .false.
     endif
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    lmd = 0
+    if (imex_opt_skip) lmd = dry_lim(G_MOM)   ! imex_gpu_opt 1: deep land skipped (constant Hz)
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 1, ny
       do i = 1, nx + 1
+        if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
         rshu(i, j) = 0.0_rp
         do k = 1, nz
           rshu(i, j) = rshu(i, j) + 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k))
@@ -1396,6 +1470,7 @@ contains
 #endif
     do j = 1, ny + 1
       do i = 1, nx
+        if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
         rshv(i, j) = 0.0_rp
         do k = 1, nz
           rshv(i, j) = rshv(i, j) + 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k))
