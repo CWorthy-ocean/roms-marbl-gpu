@@ -53,6 +53,10 @@ module case_io
   ! file start indices of this tile's local point 0 (rho) / 1 (u,v): the same
   ! pair for every stagger; 1 for a single tile
   integer :: tile_fi0 = 1, tile_fj0 = 1
+  ! file start of this tile's first u (v) point: tile_fi0 (tile_fj0), except
+  ! in a periodic direction of a file in the UCLA ROMS layout, whose rho points
+  ! start one later than its u (v) points (set_file_layout)
+  integer :: tile_fu0, tile_fv0
   integer :: ld_phase = 0        ! 1 = queue reads, 2 = take them (par_read)
 
   character(len=512), public :: case_nml = ''
@@ -90,6 +94,11 @@ module case_io
   logical :: case_have_prev = .false.
   logical,     public :: case_periodic_x = .false.
   logical,     public :: case_periodic_y = .false.
+  ! GPU-only group &periodic_settings (ew_periodic, ns_periodic) present:
+  ! the periodicity is the namelist's and every file's layout is checked
+  ! (set_file_layout); absent: inferred from the grid file size
+  ! (infer_layout), as before.
+  logical :: case_periodic_set = .false.
   ! Local index of the first u (v) point of a file window, relative to the
   ! window's first rho point i0 (j0): the file's u point 1 is the tile's
   ! u point i0 + 1 next to a boundary rho column (i0 = 0), and i0 itself in
@@ -161,6 +170,7 @@ contains
       write(*,*) 'PARAM_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_namelist'
     endif
+    call read_periodic_settings(unit)   ! optional GPU-only group
     call set_cdr_lite(nt_cdr_oae, nt_cdr_dor)
     case_nt_passive = max(nt_passive, 0_ip)
 
@@ -255,6 +265,27 @@ contains
     call apply_decomp(case_periodic_x, case_periodic_y)
     call init_time_state(nz, ndtfast_in, dt_in, ntimes_in, 2_ip)
   end subroutine read_namelist
+
+  subroutine read_periodic_settings(unit)
+    ! Optional GPU-only group &periodic_settings: ew_periodic, ns_periodic,
+    ! UCLA ROMS's cpp keys EW_PERIODIC / NS_PERIODIC (param.F90). Present:
+    ! the periodicity is set here (a key left out is .false.) and each file's
+    ! layout is checked (set_file_layout). Absent: inferred from the grid
+    ! file size (infer_layout). UCLA ROMS does not read the group, so one
+    ! namelist serves both models.
+    integer, intent(in) :: unit
+    integer :: ios
+    character(len=512) :: msg
+    logical :: ew_periodic, ns_periodic
+    namelist /periodic_settings/ ew_periodic, ns_periodic
+    ew_periodic = .false.; ns_periodic = .false.
+    rewind(unit)
+    read(unit, nml=periodic_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'PERIODIC_SETTINGS')
+    case_periodic_set = (ios == 0)
+    case_periodic_x = case_periodic_set .and. ew_periodic
+    case_periodic_y = case_periodic_set .and. ns_periodic
+  end subroutine read_periodic_settings
 
   subroutine read_tile_settings(unit)
     ! Optional &tile_settings group (absent = 'wet' balance, land weight 0.25).
@@ -391,6 +422,7 @@ contains
                        periodic_x, periodic_y, xcut(0:npx), ycut(0:npy))
     endif
     tile_fi0 = int(decomp%i0); tile_fj0 = int(decomp%j0)
+    tile_fu0 = tile_fi0; tile_fv0 = tile_fj0
   end subroutine apply_decomp
 
   subroutine tile_cuts(npx, npy, xcut, ycut)
@@ -404,7 +436,7 @@ contains
     real(rp), allocatable :: mask(:,:), cost(:,:)
     real(rp) :: wland, tcost, cmax, cmean
     real(rp) :: ratio, memlim, mcell, mwet, memmax, mem
-    integer :: cellmax
+    integer :: cellmax, mx, my
     character(len=16) :: mode
     gnx = case_llm; gny = case_mmm
     mode = case_tile_balance
@@ -413,7 +445,12 @@ contains
     mask = 1.0_rp
     call nc_open_read(case_grdname, ncid)
     if (nc_has_var(ncid, 'mask_rho')) then
-      call nc_read_2d(ncid, 'mask_rho', mask, int(gnx) + 2, int(gny) + 2)
+      ! a periodic direction in the roms_gpu layout (LLm or MMm points) has no
+      ! boundary points: the file is the interior of mask
+      mx = merge(1, 0, nc_dim_len(ncid, 'xi_rho') == gnx)
+      my = merge(1, 0, nc_dim_len(ncid, 'eta_rho') == gny)
+      call nc_read_2d(ncid, 'mask_rho', mask(1 + mx:gnx + 2 - mx, 1 + my:gny + 2 - my), &
+                      int(gnx) + 2 - 2 * mx, int(gny) + 2 - 2 * my)
     elseif (mode == 'wet') then
       mode = 'uniform'
     endif
@@ -643,7 +680,7 @@ contains
     call nc_open_read(case_grdname, ncid)
     xi_rho = nc_dim_len(ncid, 'xi_rho')
     eta_rho = nc_dim_len(ncid, 'eta_rho')
-    call infer_layout(xi_rho, eta_rho, i0, j0, nxi, neta)
+    call infer_layout(ncid, xi_rho, eta_rho, i0, j0, nxi, neta)
     write(*,'(a,a)') 'grid file: ', trim(case_grdname)
     write(*,'(a,2i6,a,2i4)') '  xi_rho, eta_rho =', xi_rho, eta_rho, '  mapped i0,j0 =', i0, j0
 
@@ -714,6 +751,8 @@ contains
 
     call nc_open_read(case_inifile, ncid)
     write(*,'(a,a)') 'init file: ', trim(case_inifile)
+    ! the initial or restart file may have the other periodic layout
+    if (case_periodic_set) call set_file_layout(ncid, 'initial', case_inifile)
     ! tile extents of the staggered fields (the file dims are global)
     xi_u = merge(nxi, nxi - 1, case_periodic_x)
     eta_v = merge(neta, neta - 1, case_periodic_y)
@@ -947,16 +986,16 @@ contains
         if (fs_on .and. take_rates .and. nc_has_var(ncid, 'fs_delta')) then
           fs_rates_read = .true.
           call fs_alloc_rates()
-          call pr_store_2d(ncid, 'fs_udu', udu(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-          call pr_store_2d(ncid, 'fs_gru', gru(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-          call pr_store_2d(ncid, 'fs_udv', udv(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
-          call pr_store_2d(ncid, 'fs_grv', grv(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+          call pr_store_2d(ncid, 'fs_udu', udu(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fu0, j0f=tile_fj0)
+          call pr_store_2d(ncid, 'fs_gru', gru(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fu0, j0f=tile_fj0)
+          call pr_store_2d(ncid, 'fs_udv', udv(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fv0)
+          call pr_store_2d(ncid, 'fs_grv', grv(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fv0)
           call pr_store_2d(ncid, 'fs_qd', qd(decomp%is, decomp%js), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
           call pr_store_2d(ncid, 'fs_delta', xx(decomp%is, decomp%js), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
           if (take_mg) then
             call pr_store_2d(ncid, 'fs_mge0', mg_se0(decomp%is, decomp%js), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-            call pr_store_2d(ncid, 'fs_mgcu', mg_scu(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-            call pr_store_2d(ncid, 'fs_mgcv', mg_scv(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+            call pr_store_2d(ncid, 'fs_mgcu', mg_scu(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fu0, j0f=tile_fj0)
+            call pr_store_2d(ncid, 'fs_mgcv', mg_scv(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fv0)
           endif
         endif
       endif
@@ -1000,8 +1039,8 @@ contains
     logical, intent(in) :: n2r, om
     integer :: nz, is, js
     nz = decomp%nz; is = decomp%is; js = decomp%js
-    call pr_store_3d(ncid, 'imex_pgu', im_pgu(is, js, 1, ipg_nm1), i0+case_du, j0, xi_u, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_3d(ncid, 'imex_pgv', im_pgv(is, js, 1, ipg_nm1), i0, j0+case_dv, nxi, eta_v, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_3d(ncid, 'imex_pgu', im_pgu(is, js, 1, ipg_nm1), i0+case_du, j0, xi_u, neta, nz, rec, i0f=tile_fu0, j0f=tile_fj0)
+    call pr_store_3d(ncid, 'imex_pgv', im_pgv(is, js, 1, ipg_nm1), i0, j0+case_dv, nxi, eta_v, nz, rec, i0f=tile_fi0, j0f=tile_fv0)
     call pr_store_3d(ncid, 'imex_dpw', im_dpw(is, js, 1), i0, j0, nxi, neta, nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     if (imex_rst_has('imex_xp')) then
       if (imex_stage_on()) then
@@ -1038,8 +1077,8 @@ contains
   subroutine load_2d_record(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
     integer, intent(in) :: ncid, rec, i0, j0, nxi, neta, xi_u, eta_v
     call pr_store_2d(ncid, 'zeta', zeta(decomp%is, decomp%js, 1), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'ubar', ubar(decomp%is, decomp%js, 1), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'vbar', vbar(decomp%is, decomp%js, 1), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'ubar', ubar(decomp%is, decomp%js, 1), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fu0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'vbar', vbar(decomp%is, decomp%js, 1), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fv0)
     if (nc_has_var(ncid, 'hbls')) then
       call pr_store_2d(ncid, 'hbls', hbls(decomp%is, decomp%js), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
     endif
@@ -1050,13 +1089,13 @@ contains
     ! Clamped to [0, 1] as the CPU does (fill values on land), not masked
     ! with umask/vmask: river faces have umask = 0.
     if (nc_has_var(ncid, 'riv_umask')) then
-      call pr_store_2d(ncid, 'riv_umask', riv_umask(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+      call pr_store_2d(ncid, 'riv_umask', riv_umask(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fu0, j0f=tile_fj0)
       if (pr_taking()) then
         where (riv_umask /= riv_umask .or. riv_umask < 0.0_rp .or. riv_umask > 1.0_rp) riv_umask = 0.0_rp
       endif
     endif
     if (nc_has_var(ncid, 'riv_vmask')) then
-      call pr_store_2d(ncid, 'riv_vmask', riv_vmask(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+      call pr_store_2d(ncid, 'riv_vmask', riv_vmask(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fv0)
       if (pr_taking()) then
         where (riv_vmask /= riv_vmask .or. riv_vmask < 0.0_rp .or. riv_vmask > 1.0_rp) riv_vmask = 0.0_rp
       endif
@@ -1066,8 +1105,8 @@ contains
   subroutine load_3d_record(ncid, rec, tindx, i0, j0, nxi, neta, xi_u, eta_v)
     integer, intent(in) :: ncid, rec, tindx, i0, j0, nxi, neta, xi_u, eta_v
     integer :: itp
-    call pr_store_3d(ncid, 'u', u(decomp%is, decomp%js, 1, tindx), i0+case_du, j0, xi_u, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_3d(ncid, 'v', v(decomp%is, decomp%js, 1, tindx), i0, j0+case_dv, nxi, eta_v, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_3d(ncid, 'u', u(decomp%is, decomp%js, 1, tindx), i0+case_du, j0, xi_u, neta, decomp%nz, rec, i0f=tile_fu0, j0f=tile_fj0)
+    call pr_store_3d(ncid, 'v', v(decomp%is, decomp%js, 1, tindx), i0, j0+case_dv, nxi, eta_v, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fv0)
     call pr_store_3d(ncid, 'temp', t(decomp%is, decomp%js, 1, tindx, 1), i0, j0, nxi, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     call pr_store_3d(ncid, 'salt', t(decomp%is, decomp%js, 1, tindx, 2), i0, j0, nxi, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     ! Passive tracers, when the file carries them (float32 in restarts).
@@ -1094,12 +1133,12 @@ contains
 
   subroutine load_coupling_fields(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
     integer, intent(in) :: ncid, rec, i0, j0, nxi, neta, xi_u, eta_v
-    call pr_store_2d(ncid, 'DU_avg1', DU_avg1(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'DV_avg1', DV_avg1(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'DU_avg2', DU_avg2(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'DV_avg2', DV_avg2(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'DU_avg_bak', DU_avg_bak(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, 'DV_avg_bak', DV_avg_bak(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'DU_avg1', DU_avg1(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fu0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'DV_avg1', DV_avg1(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fv0)
+    call pr_store_2d(ncid, 'DU_avg2', DU_avg2(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fu0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'DV_avg2', DV_avg2(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fv0)
+    call pr_store_2d(ncid, 'DU_avg_bak', DU_avg_bak(decomp%is, decomp%js), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fu0, j0f=tile_fj0)
+    call pr_store_2d(ncid, 'DV_avg_bak', DV_avg_bak(decomp%is, decomp%js), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fv0)
     ! CPU get_init: zero true land but keep river faces (umask = 0, riv_umask = 1)
     DU_avg1 = DU_avg1 * (umask + riv_umask)
     DV_avg1 = DV_avg1 * (vmask + riv_vmask)
@@ -1119,11 +1158,11 @@ contains
     ncid_has_vslow = nc_has_var(ncid, 'v_slow')
     if (ncid_has_uslow) then
       call pr_store_3d(ncid, 'u_slow', u_slow(decomp%is, decomp%js, 1), i0+case_du, j0, xi_u, neta, decomp%nz, rec, &
-                       i0f=tile_fi0, j0f=tile_fj0)
+                       i0f=tile_fu0, j0f=tile_fj0)
     endif
     if (ncid_has_vslow) then
       call pr_store_3d(ncid, 'v_slow', v_slow(decomp%is, decomp%js, 1), i0, j0+case_dv, nxi, eta_v, decomp%nz, rec, &
-                       i0f=tile_fi0, j0f=tile_fj0)
+                       i0f=tile_fi0, j0f=tile_fv0)
     endif
     if (nc_has_var(ncid, 'p_slow')) then
       call pr_store_3d(ncid, 'p_slow', p_slow(decomp%is, decomp%js, 1), i0, j0, nxi, neta, decomp%nz, rec, &
@@ -1184,15 +1223,30 @@ contains
     else
       return
     endif
-    call pr_store_2d(ncid, trim(uname), rufrc_bak(decomp%is, decomp%js, tindx), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
-    call pr_store_2d(ncid, trim(vname), rvfrc_bak(decomp%is, decomp%js, tindx), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call pr_store_2d(ncid, trim(uname), rufrc_bak(decomp%is, decomp%js, tindx), i0+case_du, j0, xi_u, neta, rec, i0f=tile_fu0, j0f=tile_fj0)
+    call pr_store_2d(ncid, trim(vname), rvfrc_bak(decomp%is, decomp%js, tindx), i0, j0+case_dv, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fv0)
     rufrc_bak(:, :, tindx) = rufrc_bak(:, :, tindx) * umask
     rvfrc_bak(:, :, tindx) = rvfrc_bak(:, :, tindx) * vmask
   end subroutine load_rufrc_slot
 
-  subroutine infer_layout(xi_rho, eta_rho, i0, j0, nxi, neta)
-    integer, intent(in)  :: xi_rho, eta_rho
+  subroutine infer_layout(ncid, xi_rho, eta_rho, i0, j0, nxi, neta)
+    ! The window of the grid file each tile reads (i0, j0: local start of the
+    ! rho window; nxi, neta: its size) and the periodicity.
+    ! Without &periodic_settings (ew_periodic, ns_periodic): inferred from
+    ! the file size, LLm+2 x MMm+2 = closed, LLm x MMm = doubly periodic.
+    ! Otherwise the namelist's, with the file's layout checked
+    ! (set_file_layout).
+    integer, intent(in)  :: ncid, xi_rho, eta_rho
     integer, intent(out) :: i0, j0, nxi, neta
+    if (case_periodic_set) then
+      ! decomp was made with the namelist's periodicity (apply_decomp)
+      i0 = merge(1, 0, case_periodic_x); j0 = merge(1, 0, case_periodic_y)
+      case_du = merge(0, 1, case_periodic_x); case_dv = merge(0, 1, case_periodic_y)
+      nxi = int(decomp%nx) + merge(0, 2, case_periodic_x)
+      neta = int(decomp%ny) + merge(0, 2, case_periodic_y)
+      call set_file_layout(ncid, 'grid', case_grdname)
+      return
+    endif
     nxi = xi_rho
     neta = eta_rho
     if (xi_rho == case_llm + 2 .and. eta_rho == case_mmm + 2) then
@@ -1211,6 +1265,16 @@ contains
       write(*,*) 'grid dims', xi_rho, eta_rho, 'do not match LLm,MMm', case_llm, case_mmm
       error stop 'infer_layout'
     endif
+    if (comm_rank() == 0) then
+      if (case_periodic_x) then
+        write(*,'(a,2(i0,a))') 'grid layout inferred from the grid file size (', xi_rho, ' x ', eta_rho, &
+             '): doubly periodic (LLm x MMm)'
+      else
+        write(*,'(a,2(i0,a))') 'grid layout inferred from the grid file size (', xi_rho, ' x ', eta_rho, &
+             '): closed (LLm+2 x MMm+2)'
+      endif
+      write(*,'(a)') '  (ew_periodic / ns_periodic in &periodic_settings state the periodicity instead)'
+    endif
     ! decomp already created as non-periodic default; re-init if periodic.
     if (case_periodic_x .or. case_periodic_y) then
       call free_state()
@@ -1219,6 +1283,84 @@ contains
       nxi = int(decomp%nx); neta = int(decomp%ny)
     endif
   end subroutine infer_layout
+
+  subroutine set_file_layout(ncid, what, path)
+    ! With &periodic_settings present: the file start of this tile's
+    ! window in a grid, initial or restart file. A closed direction needs
+    ! LLm+2 (MMm+2) rho points. A periodic direction takes either layout,
+    ! each file on its own: roms_gpu's LLm (MMm), no boundary points, or UCLA
+    ! ROMS's LLm+2 (MMm+2), whose first and last points are periodic copies
+    ! (roms_mpi.F90 mpi_setup); only the interior is read, and the u (v)
+    ! points 1..LLm (MMm), the same in both. Any other size stops the run.
+    integer,          intent(in) :: ncid
+    character(len=*), intent(in) :: what, path
+    integer :: nxr, ner, sx, sy
+    if (.not. (nc_has_dim(ncid, 'xi_rho') .and. nc_has_dim(ncid, 'eta_rho'))) then
+      if (comm_rank() == 0) write(*,'(3a)') '  ', what, &
+           ' file has no xi_rho / eta_rho dimension: read in the layout of the grid file'
+      return
+    endif
+    nxr = nc_dim_len(ncid, 'xi_rho'); ner = nc_dim_len(ncid, 'eta_rho')
+    sx = axis_layout(nxr, int(case_llm), case_periodic_x)
+    sy = axis_layout(ner, int(case_mmm), case_periodic_y)
+    if (comm_rank() == 0) then
+      write(*,'(3a,i0,a,i0,a,l1,a,l1,2a)') '  ', what, ' file layout: ', nxr, ' x ', ner, &
+           ', ew_periodic = ', case_periodic_x, ', ns_periodic = ', case_periodic_y, ': ', &
+           trim(layout_name(sx, sy))
+      if (sx < 0 .or. sy < 0) then
+        write(*,'(4a)') 'the ', what, ' file does not match ew_periodic / ns_periodic in &periodic_settings: ', trim(path)
+        if (sx < 0) call layout_hint('xi_rho', nxr, 'LLm', int(case_llm), 'ew_periodic', case_periodic_x)
+        if (sy < 0) call layout_hint('eta_rho', ner, 'MMm', int(case_mmm), 'ns_periodic', case_periodic_y)
+        flush(6)
+      endif
+    endif
+    if (sx < 0 .or. sy < 0) error stop 'set_file_layout: file size does not match the periodicity (see above)'
+    tile_fi0 = int(decomp%i0) + sx; tile_fu0 = int(decomp%i0)
+    tile_fj0 = int(decomp%j0) + sy; tile_fv0 = int(decomp%j0)
+  end subroutine set_file_layout
+
+  integer function axis_layout(nfile, nint, periodic) result(shift)
+    ! File start of the first interior rho point minus that of the window
+    ! (decomp%i0): 0 for a closed direction (LLm+2, the window starts at the
+    ! boundary point) and for roms_gpu's periodic LLm, 1 for UCLA ROMS's
+    ! periodic LLm+2 (skip the copy), -1 when the size fits neither.
+    integer, intent(in) :: nfile, nint
+    logical, intent(in) :: periodic
+    shift = -1
+    if (nfile == nint + 2) shift = merge(1, 0, periodic)
+    if (periodic .and. nfile == nint) shift = 0
+  end function axis_layout
+
+  function layout_name(sx, sy) result(name)
+    integer, intent(in) :: sx, sy
+    character(len=80) :: name
+    if (sx < 0 .or. sy < 0) then
+      name = 'does not match'
+    elseif (.not. (case_periodic_x .or. case_periodic_y)) then
+      name = 'closed (LLm+2 x MMm+2)'
+    elseif ((sx == 1 .or. .not. case_periodic_x) .and. (sy == 1 .or. .not. case_periodic_y)) then
+      name = 'UCLA ROMS layout (LLm+2 x MMm+2)'
+    elseif (sx == 0 .and. sy == 0) then
+      name = 'roms_gpu layout (no boundary points in a periodic direction)'
+    else
+      name = 'roms_gpu layout in one periodic direction, UCLA ROMS layout in the other'
+    endif
+  end function layout_name
+
+  subroutine layout_hint(dim, nfile, nname, nint, key, periodic)
+    character(len=*), intent(in) :: dim, nname, key
+    integer,          intent(in) :: nfile, nint
+    logical,          intent(in) :: periodic
+    if (periodic) then
+      write(*,'(3a,i0,3a,i0,3a,i0,a)') '  ', dim, ' = ', nfile, ': with ', key, ' = .true. expected ', nint, ' (', &
+           nname, ', roms_gpu layout) or ', nint + 2, ' (UCLA ROMS layout)'
+    else
+      write(*,'(3a,i0,3a,i0,2a)') '  ', dim, ' = ', nfile, ': with ', key, ' = .false. expected ', nint + 2, &
+           ' (', nname//'+2)'
+      if (nfile == nint) write(*,'(5a)') '  (', dim, ' = ', nname, &
+           ' is a periodic direction in the roms_gpu layout: set '//key//' = .true.)'
+    endif
+  end subroutine layout_hint
 
   subroutine zero_closed_wall_velocities()
     ! CPU get_init (get_init_mod.F90:695-730): on a closed, non-periodic side the
