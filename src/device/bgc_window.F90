@@ -209,8 +209,9 @@ contains
     real(rp), device, intent(in) :: umask_(is:ie, js:je), vmask_(is:ie, js:je), rmask_(is:ie, js:je)
     integer(ip) :: n, itr, c, i, j, k, kk, nb(8)
     logical :: dox, doy, wet, hl1, hr1, hl2, hr2, gl1, gr1, gl2, gr2
-    real(rp) :: fm, s0, sm2, sm1, sp1, sp2, vv, f1, f2
+    real(rp) :: fm, s0, vv, f1, f2
     real(rp) :: vmm, vm0, vm1, vm2, umm, um0, um1, um2
+    real(rp) :: ym2, ym1, yp1, yp2, xm2, xm1, xp1, xp2, vy0, vy1, cy0, cy1, dy, vx0, vx1, cx0, cx1, dx, vl
     n = (blockIdx%x - 1) * blockDim%y + threadIdx%y
     if (n > nxc) return
     itr = threadIdx%x
@@ -231,39 +232,47 @@ contains
     gl1 = (i - 1 > ilo); gr1 = (i + 1 <= ihi); gl2 = (i > ilo); gr2 = (i + 2 <= ihi)
     do k = k0, k1
       kk = k - k0 + 1
+      ! every operand of the level is loaded before any arithmetic, so the
+      ! loads are in flight together (one memory latency per level)
       fm = fmk(k)
       s0 = real(q(itr, c, k), rp)
-      if (dox) then
-        if (wet) then
-          sm2 = real(q(itr, nb(5), k), rp); sm1 = real(q(itr, nb(6), k), rp)
-          sp1 = real(q(itr, nb(7), k), rp); sp2 = real(q(itr, nb(8), k), rp)
+      if (wet) then
+        vl = vol(i, j, kk)
+        if (dox) then
+          ym2 = real(q(itr, nb(5), k), rp); ym1 = real(q(itr, nb(6), k), rp)
+          yp1 = real(q(itr, nb(7), k), rp); yp2 = real(q(itr, nb(8), k), rp)
+          vy0 = VY(i, j, k); vy1 = VY(i, j + 1, k)
+          cy0 = cyf(i, j, kk); cy1 = cyf(i, j + 1, kk); dy = dny(i, j, kk)
+        endif
+        if (doy) then
+          xm2 = real(q(itr, nb(1), k), rp); xm1 = real(q(itr, nb(2), k), rp)
+          xp1 = real(q(itr, nb(3), k), rp); xp2 = real(q(itr, nb(4), k), rp)
+          vx0 = VX(i, j, k); vx1 = VX(i + 1, j, k)
+          cx0 = cxf(i, j, kk); cx1 = cxf(i + 1, j, kk); dx = dnx(i, j, kk)
+        endif
+        if (dox) then
           ! face j (between j-1 and j)
-          vv = fm * VY(i, j, k)
-          f1 = swf(vv, cyf(i, j, kk), sm2, sm1, s0, sp1, vmm, vm0, vm1, hl1, hr1)
-          if (south == 2 .and. j == 1 .and. vv > 0.0_rp) f1 = vv * sm1
+          vv = fm * vy0
+          f1 = swf(vv, cy0, ym2, ym1, s0, yp1, vmm, vm0, vm1, hl1, hr1)
+          if (south == 2 .and. j == 1 .and. vv > 0.0_rp) f1 = vv * ym1
           ! face j+1
-          vv = fm * VY(i, j + 1, k)
-          f2 = swf(vv, cyf(i, j + 1, kk), sm1, s0, sp1, sp2, vm0, vm1, vm2, hl2, hr2)
-          if (north == 2 .and. j + 1 == ny + 1 .and. vv < 0.0_rp) f2 = vv * sp1
-          sxs(itr, c, kk) = 0.5_rp * (s0 + (vol(i, j, kk) * s0 - (f2 - f1)) / dny(i, j, kk))
-        else
-          sxs(itr, c, kk) = s0
+          vv = fm * vy1
+          f2 = swf(vv, cy1, ym1, s0, yp1, yp2, vm0, vm1, vm2, hl2, hr2)
+          if (north == 2 .and. j + 1 == ny + 1 .and. vv < 0.0_rp) f2 = vv * yp1
+          sxs(itr, c, kk) = 0.5_rp * (s0 + (vl * s0 - (f2 - f1)) / dy)
         endif
-      endif
-      if (doy) then
-        if (wet) then
-          sm2 = real(q(itr, nb(1), k), rp); sm1 = real(q(itr, nb(2), k), rp)
-          sp1 = real(q(itr, nb(3), k), rp); sp2 = real(q(itr, nb(4), k), rp)
-          vv = fm * VX(i, j, k)
-          f1 = swf(vv, cxf(i, j, kk), sm2, sm1, s0, sp1, umm, um0, um1, gl1, gr1)
-          if (west == 2 .and. i == 1 .and. vv > 0.0_rp) f1 = vv * sm1
-          vv = fm * VX(i + 1, j, k)
-          f2 = swf(vv, cxf(i + 1, j, kk), sm1, s0, sp1, sp2, um0, um1, um2, gl2, gr2)
-          if (east == 2 .and. i + 1 == nx + 1 .and. vv < 0.0_rp) f2 = vv * sp1
-          sys(itr, c, kk) = 0.5_rp * (s0 + (vol(i, j, kk) * s0 - (f2 - f1)) / dnx(i, j, kk))
-        else
-          sys(itr, c, kk) = s0
+        if (doy) then
+          vv = fm * vx0
+          f1 = swf(vv, cx0, xm2, xm1, s0, xp1, umm, um0, um1, gl1, gr1)
+          if (west == 2 .and. i == 1 .and. vv > 0.0_rp) f1 = vv * xm1
+          vv = fm * vx1
+          f2 = swf(vv, cx1, xm1, s0, xp1, xp2, um0, um1, um2, gl2, gr2)
+          if (east == 2 .and. i + 1 == nx + 1 .and. vv < 0.0_rp) f2 = vv * xp1
+          sys(itr, c, kk) = 0.5_rp * (s0 + (vl * s0 - (f2 - f1)) / dx)
         endif
+      else
+        if (dox) sxs(itr, c, kk) = s0
+        if (doy) sys(itr, c, kk) = s0
       endif
     enddo
   end subroutine inner_kernel
@@ -295,6 +304,7 @@ contains
     integer(ip) :: cc, itr, i, j, k, kk, nb(8)
     real(rp) :: fm, pmn, bg, x0, xm2, xm1, xp1, xp2, vv, fw, fe, fs, fn, q0, qxm, qxp, qym, qyp
     real(rp) :: umm, um0, um1, um2, vmm, vm0, vm1, vm2, dfw, dfe, dfs, dfn
+    real(rp) :: y0, ym2, ym1, yp1, yp2, vx0, vx1, vy0, vy1, cx0, cx1, cy0, cy1, h0, hw, he, hs, hn, co
     logical :: gl1, gr1, gl2, gr2, hl1, hr1, hl2, hr2
     cc = (blockIdx%x - 1) * blockDim%y + threadIdx%y
     if (cc > nwet) return
@@ -321,38 +331,47 @@ contains
     endif
     do k = k0, k1
       kk = k - k0 + 1
+      ! every operand of the level is loaded before any arithmetic, so the
+      ! loads are in flight together (one memory latency per level)
       fm = fmk(k)
-      ! x faces of sx (sweep_x over rows jstr..jend)
       x0 = sxs(itr, cc, kk)
       xm2 = sxs(itr, nb(1), kk); xm1 = sxs(itr, nb(2), kk); xp1 = sxs(itr, nb(3), kk); xp2 = sxs(itr, nb(4), kk)
-      vv = fm * VX(i, j, k)
-      fw = swf(vv, cxf(i, j, kk), xm2, xm1, x0, xp1, umm, um0, um1, gl1, gr1)
-      if (west == 2 .and. i == 1 .and. vv > 0.0_rp) fw = vv * xm1
-      vv = fm * VX(i + 1, j, k)
-      fe = swf(vv, cxf(i + 1, j, kk), xm1, x0, xp1, xp2, um0, um1, um2, gl2, gr2)
-      if (east == 2 .and. i + 1 == nx + 1 .and. vv < 0.0_rp) fe = vv * xp1
-      ! y faces of sy (sweep_y over columns istr..iend)
-      x0 = sys(itr, cc, kk)
-      xm2 = sys(itr, nb(5), kk); xm1 = sys(itr, nb(6), kk); xp1 = sys(itr, nb(7), kk); xp2 = sys(itr, nb(8), kk)
-      vv = fm * VY(i, j, k)
-      fs = swf(vv, cyf(i, j, kk), xm2, xm1, x0, xp1, vmm, vm0, vm1, hl1, hr1)
-      if (south == 2 .and. j == 1 .and. vv > 0.0_rp) fs = vv * xm1
-      vv = fm * VY(i, j + 1, k)
-      fn = swf(vv, cyf(i, j + 1, kk), xm1, x0, xp1, xp2, vm0, vm1, vm2, hl2, hr2)
-      if (north == 2 .and. j + 1 == ny + 1 .and. vv < 0.0_rp) fn = vv * xp1
+      y0 = sys(itr, cc, kk)
+      ym2 = sys(itr, nb(5), kk); ym1 = sys(itr, nb(6), kk); yp1 = sys(itr, nb(7), kk); yp2 = sys(itr, nb(8), kk)
+      vx0 = VX(i, j, k); vx1 = VX(i + 1, j, k); vy0 = VY(i, j, k); vy1 = VY(i, j + 1, k)
+      cx0 = cxf(i, j, kk); cx1 = cxf(i + 1, j, kk); cy0 = cyf(i, j, kk); cy1 = cyf(i, j + 1, kk)
       q0 = real(q(itr, cc, k), rp)
+      h0 = HZS(i, j, k)
       if (dodiff == 1) then
         qxm = real(q(itr, nb(2), k), rp); qxp = real(q(itr, nb(3), k), rp)
         qym = real(q(itr, nb(6), k), rp); qyp = real(q(itr, nb(7), k), rp)
-        fw = fw - dfw * (HZS(i, j, k) + HZS(i - 1, j, k)) * (q0 - qxm) * um0
-        fe = fe - dfe * (HZS(i + 1, j, k) + HZS(i, j, k)) * (qxp - q0) * um1
-        fs = fs - dfs * (HZS(i, j, k) + HZS(i, j - 1, k)) * (q0 - qym) * vm0
-        fn = fn - dfn * (HZS(i, j + 1, k) + HZS(i, j, k)) * (qyp - q0) * vm1
+        hw = HZS(i - 1, j, k); he = HZS(i + 1, j, k); hs = HZS(i, j - 1, k); hn = HZS(i, j + 1, k)
+      endif
+      if (isub /= 1) co = real(cout(itr, cc, k), rp)
+      ! x faces of sx (sweep_x over rows jstr..jend)
+      vv = fm * vx0
+      fw = swf(vv, cx0, xm2, xm1, x0, xp1, umm, um0, um1, gl1, gr1)
+      if (west == 2 .and. i == 1 .and. vv > 0.0_rp) fw = vv * xm1
+      vv = fm * vx1
+      fe = swf(vv, cx1, xm1, x0, xp1, xp2, um0, um1, um2, gl2, gr2)
+      if (east == 2 .and. i + 1 == nx + 1 .and. vv < 0.0_rp) fe = vv * xp1
+      ! y faces of sy (sweep_y over columns istr..iend)
+      vv = fm * vy0
+      fs = swf(vv, cy0, ym2, ym1, y0, yp1, vmm, vm0, vm1, hl1, hr1)
+      if (south == 2 .and. j == 1 .and. vv > 0.0_rp) fs = vv * ym1
+      vv = fm * vy1
+      fn = swf(vv, cy1, ym1, y0, yp1, yp2, vm0, vm1, vm2, hl2, hr2)
+      if (north == 2 .and. j + 1 == ny + 1 .and. vv < 0.0_rp) fn = vv * yp1
+      if (dodiff == 1) then
+        fw = fw - dfw * (h0 + hw) * (q0 - qxm) * um0
+        fe = fe - dfe * (he + h0) * (qxp - q0) * um1
+        fs = fs - dfs * (h0 + hs) * (q0 - qym) * vm0
+        fn = fn - dfn * (hn + h0) * (qyp - q0) * vm1
       endif
       if (isub == 1) then
-        cout(itr, cc, k) = real(HZS(i, j, k) * q0 - pmn * (fe - fw + fn - fs), pp)
+        cout(itr, cc, k) = real(h0 * q0 - pmn * (fe - fw + fn - fs), pp)
       else
-        cout(itr, cc, k) = real(real(cout(itr, cc, k), rp) - pmn * (fe - fw + fn - fs), pp)
+        cout(itr, cc, k) = real(co - pmn * (fe - fw + fn - fs), pp)
       endif
       if (dbud == 1) then
         if (west >= 1 .and. i == 1) ew(itr, j, k) = fw * rmask_(i, j)
