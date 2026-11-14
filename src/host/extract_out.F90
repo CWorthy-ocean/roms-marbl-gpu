@@ -24,8 +24,9 @@ module extract_out
   ! grid differs, every column is remapped (the CPU's flux-conserving PPM)
   ! from the parent layers at the point (Hz interpolated; at u/v points
   ! the mean of the two rho columns) to the child layers of the same total
-  ! depth. Fields: zeta, ubar, vbar at knew (time n+1); u, v and the tracers
-  ! at slot nstp (time n); the pressure fluxes up and vp of this step
+  ! depth. Fields: zeta, ubar, vbar at knew and u, v and the tracers at
+  ! slot nnew, all at time n+1 (the record's stamp), as the history file
+  ! (CPU fix c2867106); the pressure fluxes up and vp of this step
   ! (calc_pflx, pflx_mod) as the CPU after its fix 4b07d30e: the interior
   ! values (1:nx, 1:ny) of each tile, exchanged (zero beyond a physical
   ! edge), interpolated at the u points (up) and the v points (vp) of a
@@ -51,7 +52,8 @@ module extract_out
   use nc_io, only: nc_create, nc_def_dim, nc_def_var, nc_put_att_text, nc_enddef, nc_close, nc_open_write, &
                    nc_put_1d_rec
   use comm_mod, only: comm_rank, comm_reduce_sum
-  use passive_mod, only: ntp, n_marbl, n_generic, tp, passive_name, passive_marbl, ncdr, cdr0, n_oae, n_dor
+  use passive_mod, only: ntp, n_marbl, n_generic, tp, passive_name, passive_marbl, ncdr, cdr0, n_oae, n_dor, &
+                         passive_exchange_finish
   use marbl_host, only: marbl_tracer_units, marbl_tracer_lnames
   use cdr_io, only: remap_src_to_grid
   use arch_mod, only: sync_arch
@@ -89,6 +91,7 @@ module extract_out
   ! the CPU's upe/vpe: up/vp on the tile interior, exchanged
   real(rp), WORK_ATTR allocatable :: upe(:,:), vpe(:,:)
   logical :: want_pflx = .false.
+  logical :: want_tp = .false.                  ! some object asks for a tp tracer (passive, CDR, bgc)
   character(len=5), parameter :: side_name(4) = (/'north', 'south', 'east ', 'west '/)
   integer :: dim_t(4), dim_u(4), dim_v(4)       ! child boundary lengths (rho, u, v points)
   real(rp), allocatable :: Cs_w_chd(:)
@@ -240,6 +243,7 @@ contains
       if (obj(io)%up) side_up(obj(io)%side) = .true.
       if (obj(io)%vp) side_vp(obj(io)%side) = .true.
       if (obj(io)%up .or. obj(io)%vp) want_pflx = .true.
+      if (obj(io)%passive .or. obj(io)%cdr_oae .or. obj(io)%cdr_dor .or. obj(io)%bgc) want_tp = .true.
     enddo
     call ex_check(nf90_close(ncid), 'close')
     dim_t = (/LLm_chd, LLm_chd, MMm_chd, MMm_chd/)
@@ -540,10 +544,10 @@ contains
   end subroutine interp3
 
   subroutine interp_tp(itr, p0, np, off)
-    ! a passive tracer (compressed layout, slot nstp) at rho points
+    ! a passive tracer (compressed layout, slot nnew) at rho points
     integer, intent(in) :: itr, p0, np, off
     integer :: p, k, i, j, a, nz, ns, it, o, n
-    a = p0; nz = decomp%nz; ns = nstp; it = itr; o = off; n = np
+    a = p0; nz = decomp%nz; ns = nnew; it = itr; o = off; n = np
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*, *, 0, work_stream>>>
 #endif
@@ -559,9 +563,11 @@ contains
   end subroutine interp_tp
 
   subroutine queue_record()
-    ! every interpolation of the record, on the device
+    ! every interpolation of the record, on the device. After the step
+    ! (time n+1): the 2D fields at knew and the 3D fields (t, u, v) at
+    ! nnew, as in the history file (nstp still holds time n)
     integer :: io, np, p0, nz, n, kn, ns, is, js
-    nz = decomp%nz; kn = knew; ns = nstp; is = decomp%is; js = decomp%js
+    nz = decomp%nz; kn = knew; ns = nnew; is = decomp%is; js = decomp%js
     do io = 1, nobj
       np = obj(io)%np
       if (np == 0) cycle
@@ -634,9 +640,15 @@ contains
     real(8) :: c0, c1, c2, c3, c4
     real(rp), allocatable :: hzp(:,:), hzc(:,:), hzu(:,:), hzuc(:,:), hzv(:,:), hzvc(:,:), val(:,:), vc(:,:), &
                              ui(:,:), vi(:,:), wk(:,:), h(:)
-    nz = decomp%nz; kn = knew; ns = nstp
+    nz = decomp%nz; kn = knew; ns = nnew
     c0 = wall_time()
     if (want_pflx) call set_upe()
+    ! The tp tracers' end-of-step exchange of slot nnew (posted by
+    ! passive_t3dmix to overlap the next step) is completed here: the
+    ! interpolation reads the halo, as the CPU's reads t(nnew) after its
+    ! exchange. The next step then finds no exchange pending; the data
+    ! exchanged are the same, so the model state does not change.
+    if (want_tp) call passive_exchange_finish()
     call queue_record()
     if (nbtot > 0) hb(1:nbtot) = dbuf(1:nbtot)        ! one copy (after the queued kernels)
     c1 = wall_time()

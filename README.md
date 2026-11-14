@@ -374,6 +374,16 @@ v0.1.2-beta, bit for bit.
   `&marbl_biogeochemistry_settings` `marbl_balance` are read. Before, any
   of them stopped the run at the namelist read. `marbl_balance = .true.`
   is ignored with a note (see `NAMELIST_COMPAT`).
+- Extracted fields (`&extract_data_settings`, the child boundary files
+  `<extract_root_name>_bry`): u, v and the tracers are taken at the time of
+  the record's stamp (n+1), as zeta, ubar and vbar and the history file
+  are (ucla-roms #435). Before, they were one parent step older
+  than their stamp, as in UCLA ROMS before that fix. The model state and
+  the other outputs are unchanged, bit for bit. Where the child's vertical
+  grid equals the parent's, record k of u, v and the tracers now equals
+  the old record k+1; with vertical remapping only nearly, since the remap
+  now pairs the fields with Hz of the same time (the old record k+1 used
+  Hz one step later).
 - Periodic grids (a grid file of LLm x MMm points): history, average and
   restart files are written, and a restart from them is exact. Before,
   the first record stopped the run with "NetCDF: Start+count exceeds
