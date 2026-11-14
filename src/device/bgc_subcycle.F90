@@ -50,6 +50,7 @@ module bgc_subcycle_mod
   use rivers_mod, only: river_on
   use cdr_src_mod, only: cdr_on
   use cdr_lite_mod, only: cdrl_on, cdrl_psf, psf_cflx
+  use imex_igw, only: imex_on
   use bgc_window_mod, only: WLEV, bgcw_stats, bgcw_hcoef, bgcw_inner, bgcw_outer, bgcw_factor, &
        bgcw_vertical, bgcw_t3dbc, bgcw_reduce
   use comm_mod, only: comm_rank, comm_allreduce_max, comm_allreduce_min, comm_allreduce_sum, comm_abort
@@ -171,6 +172,11 @@ contains
          'bgc_physics_subcycle with CDR releases (cdr_source) is not on the GPU yet')
     if (cdrl_on) call raise('bgcsub_init', &
          'bgc_physics_subcycle with CDR_LITE tracers (nt_cdr_oae, nt_cdr_dor) is not on the GPU yet')
+    ! The IMEX internal-wave step (&imex_igw_settings) came to UCLA ROMS
+    ! after the subcycling reference (dev 5c8034bf), so the combination has
+    ! no CPU reference to port from or check against.
+    if (imex_on) call raise('bgcsub_init', &
+         'bgc_physics_subcycle with the IMEX internal-wave step (&imex_igw_settings) is not on the GPU yet')
     if (decomp%nz > COL_KMAX) call raise('bgcsub_init', 'bgc_physics_subcycle: nz exceeds COL_KMAX')
     if (nerr > 0) error stop 'bgc_subcycle: bgc_physics_subcycle settings rejected (see above)'
 

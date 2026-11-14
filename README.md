@@ -299,7 +299,8 @@ v0.1.2-beta, bit for bit.
   surface restoring, implicit vertical mixing with the window-integrated
   diffusivity, the window boundary conditions, then MARBL at MARBL steps.
   Not yet on the GPU, so the run stops: at start-up with river sources,
-  CDR releases, CDR_LITE tracers, `bgc_subcycle_pos = .true.` or
+  CDR releases, CDR_LITE tracers, the IMEX internal-wave step
+  (`&imex_igw_settings`), `bgc_subcycle_pos = .true.` or
   `bgc_subcycle_diag >= 2`; at the first window whose Courant numbers need
   more than one sub-pass on some level (UCLA ROMS splits such a level;
   shorten the window). `bgc_subcycle_diag = 1` prints UCLA ROMS's `BGCSUB`
