@@ -78,6 +78,31 @@ contains
     endif
   end function swf
 
+  DEVICE_ATTR
+  function qwin(l, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk) result(qv)
+    ! the vertical pass's q(l) = c(l)/v1(l) of one tracer column at face m:
+    ! levels m-1..m+2 from the register window qa..qd, others from the
+    ! content cio (flat offset it0 + tk (l-1)) and v1 (g0 + gk (l-1)), with
+    ! the same division and rounding as the window's
+    integer(ip), intent(in) :: l, m
+    real(rp), intent(in) :: qa, qb, qc, qd
+    real(pp), intent(in) :: cio(*)
+    real(rp), intent(in) :: wv1(*)
+    integer(8), intent(in) :: it0, tk, g0, gk
+    real(rp) :: qv
+    if (l == m) then
+      qv = qb
+    else if (l == m + 1) then
+      qv = qc
+    else if (l == m - 1) then
+      qv = qa
+    else if (l == m + 2) then
+      qv = qd
+    else
+      qv = real(real(real(cio(it0 + tk * int(l - 1, 8)), rp) / wv1(g0 + gk * int(l - 1, 8)), pp), rp)
+    endif
+  end function qwin
+
 #ifdef USE_CUDA
   ! ---------------------------------------------------------------- stats
   attributes(global) launch_bounds(128, 8) subroutine stats_kernel(nx, ny, nz, is, ie, js, je, ilo, ihi, jlo, jhi, &
@@ -345,15 +370,18 @@ contains
     ! vpass for one (tracer, interior wet column): content per area cio
     ! (from the horizontal pass) -> concentration, in place. The column's
     ! pseudo-thickness v1 = HZS - pm pn div V comes from factor (wv1, shared
-    ! by the tracers); the concentrations q = c/v1 are kept in qs (slot 3 of
-    ! tp, free at this point of the window; the shadow's own array); the
+    ! by the tracers); the concentrations q = c/v1 of levels m-1..m+2 ride
+    ! along the face loop in registers (qwin), and a walk that reaches
+    ! further recomputes q(l) = c(l)/v1(l) from cio, which stays intact until
+    ! the back substitution (the same division, so the same value); the
     ! 1-D swept fluxes of the window's vertical transport (vsweep, with dw
     ! formed where it is used); the surface source on the top cell (tracers:
     ! sfa(itr, c); shadow = 1: the rain volume rain(i, j)); the implicit
     ! solve with factor's factors (window-end Hz, window-integrated Akt),
     ! its forward elimination fused into the flux loop (each level's value
     ! is final once its upper face is done; the CPU's operations and order
-    ! per value). diag = 1: per column the content before (q = the
+    ! per value) and stored in qs (slot 3 of tp, free at this point of the
+    ! window; the shadow's own array). diag = 1: per column the content before (q = the
     ! window-start state) and after, the surface source, and the new
     ! negatives (tracers) or max |c - 1| (shadow, into dbef).
     integer(ip), value :: nwet, ntr, nz, is, ie, js, je, ncl, shadow, diag
@@ -368,66 +396,81 @@ contains
     real(rp), device, intent(inout) :: dbef(ntr, *), daft(ntr, *), dsrf(ntr, *), dnmn(ntr, *), dncn(ntr, *)
     integer(ip) :: c, itr, i, j, k, m, jj, n, m1
     real(rp) :: pmn, rm, w, rem, s, cl, fl, fprev, bef, aft, nmn, ncn, dev, q0, cc, fw, vj, qj, dwa, dwb, ck
+    real(rp) :: pmv, pnv, qa, qb, qc, qd, cb, c2, c3
+    integer(8) :: it0, tk, g0, gk
     c = (blockIdx%x - 1) * blockDim%y + threadIdx%y
     if (c > nwet) return
     itr = threadIdx%x
     i = wi(c); j = wj(c)
     n = nz
     rm = rmask_(i, j)
-    do k = 1, nz
-      qs(itr, c, k) = real(real(cio(itr, c, k), rp) / wv1(i, j, k), pp)
-    enddo
+    pmv = pm_(i, j); pnv = pn_(i, j)
+    ! flat offsets of (itr, c, 1) in cio and of (i, j, 1) in wv1, and their level strides (qwin)
+    tk = int(ntr, 8) * int(ncl + 1, 8)
+    it0 = int(itr, 8) + int(ntr, 8) * int(c, 8)
+    gk = int(ie - is + 1, 8) * int(je - js + 1, 8)
+    g0 = int(i - is + 1, 8) + int(ie - is + 1, 8) * int(j - js, 8)
+    ! the register window at face m = 1: q(0) (never used), q(1), q(2), q(3); cb = c(1), c2 = c(2), c3 = c(3)
+    qa = 0.0_rp
+    cb = real(cio(itr, c, 1), rp); qb = real(real(cb / wv1(i, j, 1), pp), rp)
+    c2 = 0.0_rp; qc = 0.0_rp; c3 = 0.0_rp; qd = 0.0_rp
+    if (n >= 2) then
+      c2 = real(cio(itr, c, 2), rp); qc = real(real(c2 / wv1(i, j, 2), pp), rp)
+    endif
+    if (n >= 3) then
+      c3 = real(cio(itr, c, 3), rp); qd = real(real(c3 / wv1(i, j, 3), pp), rp)
+    endif
     ! vsweep: fl(m) through the w-faces m = 1..n-1 (fl(0) = fl(n) = 0),
     ! applied as c(m) = c(m) - (fl(m) - fl(m-1)) once fl(m) is known; dw(m)
     ! = q(m+1) - q(m), dw(0) = dw(1), dw(n) = dw(n-1)
     fprev = 0.0_rp
     fw = 0.0_rp
     do m = 1, n - 1
-      w = WA(i, j, m) * pm_(i, j) * pn_(i, j)
+      w = WA(i, j, m) * pmv * pnv
       if (w > 0.0_rp) then
         rem = w; jj = m; s = 0.0_rp
         do while (jj >= 1)
-          vj = wv1(i, j, jj); qj = real(qs(itr, c, jj), rp)
+          vj = wv1(i, j, jj); qj = qwin(jj, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
           if (rem >= vj) then
             s = s + vj * qj; rem = rem - vj; jj = jj - 1
             if (rem <= 0.0_rp) exit
           else
             cl = rem / vj
             m1 = min(max(jj, 1_ip), n - 1)
-            dwa = real(qs(itr, c, m1 + 1), rp) - real(qs(itr, c, m1), rp)
+            dwa = qwin(m1 + 1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk) - qwin(m1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
             m1 = min(max(jj - 1, 1_ip), n - 1)
-            dwb = real(qs(itr, c, m1 + 1), rp) - real(qs(itr, c, m1), rp)
+            dwb = qwin(m1 + 1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk) - qwin(m1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
             s = s + rem * (qj + (1.0_rp - cl) * ((2.0_rp - cl) * dwa + (1.0_rp + cl) * dwb) * r6)
             rem = 0.0_rp
             exit
           endif
         enddo
-        if (rem > 0.0_rp) s = s + rem * real(qs(itr, c, 1), rp)
+        if (rem > 0.0_rp) s = s + rem * qwin(1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
         fl = s
       else if (w < 0.0_rp) then
         rem = -w; jj = m + 1; s = 0.0_rp
         do while (jj <= n)
-          vj = wv1(i, j, jj); qj = real(qs(itr, c, jj), rp)
+          vj = wv1(i, j, jj); qj = qwin(jj, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
           if (rem >= vj) then
             s = s + vj * qj; rem = rem - vj; jj = jj + 1
             if (rem <= 0.0_rp) exit
           else
             cl = rem / vj
             m1 = min(max(jj - 1, 1_ip), n - 1)
-            dwa = real(qs(itr, c, m1 + 1), rp) - real(qs(itr, c, m1), rp)
+            dwa = qwin(m1 + 1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk) - qwin(m1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
             m1 = min(max(jj, 1_ip), n - 1)
-            dwb = real(qs(itr, c, m1 + 1), rp) - real(qs(itr, c, m1), rp)
+            dwb = qwin(m1 + 1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk) - qwin(m1, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
             s = s + rem * (qj - (1.0_rp - cl) * ((2.0_rp - cl) * dwa + (1.0_rp + cl) * dwb) * r6)
             rem = 0.0_rp
             exit
           endif
         enddo
-        if (rem > 0.0_rp) s = s + rem * real(qs(itr, c, n), rp)
+        if (rem > 0.0_rp) s = s + rem * qwin(n, m, qa, qb, qc, qd, cio, wv1, it0, tk, g0, gk)
         fl = -s
       else
         fl = 0.0_rp
       endif
-      cc = real(cio(itr, c, m), rp) - (fl - fprev)
+      cc = cb - (fl - fprev)
       fprev = fl
       ! forward elimination of level m (implicit vertical mixing)
       if (m == 1) then
@@ -435,9 +478,14 @@ contains
       else
         fw = wpv(i, j, m) * (cc + wfc(i, j, m - 1) * fw)
       endif
-      cio(itr, c, m) = real(fw, pp)
+      qs(itr, c, m) = real(fw, pp)
+      ! slide the register window to face m + 1
+      qa = qb; qb = qc; qc = qd; cb = c2; c2 = c3
+      if (m + 3 <= n) then
+        c3 = real(cio(itr, c, m + 3), rp); qd = real(real(c3 / wv1(i, j, m + 3), pp), rp)
+      endif
     enddo
-    cc = real(cio(itr, c, n), rp) - (0.0_rp - fprev)
+    cc = cb - (0.0_rp - fprev)
     ! sources
     if (shadow == 0) then
       cc = cc + sfa(itr, c)
@@ -448,7 +496,7 @@ contains
     ck = (cc + wfc(i, j, nz - 1) * fw) / wpv(i, j, nz) * rm
     cio(itr, c, nz) = real(ck, pp)
     do k = nz - 1, 1, -1
-      ck = (real(cio(itr, c, k), rp) + wcf(i, j, k) * ck) * rm
+      ck = (real(qs(itr, c, k), rp) + wcf(i, j, k) * ck) * rm
       cio(itr, c, k) = real(ck, pp)
     enddo
     if (diag == 1) then
