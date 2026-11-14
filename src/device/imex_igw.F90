@@ -174,14 +174,16 @@ module imex_igw
   ! and the mixing split's velocity is formed only where a stress kernel reads it (imex_pgu, imex_pgv
   ! are zero at deep land); 2 the FP32 z exchange of each PCG iteration in one round, one cell wide,
   ! through the x exchange's real(8) ring (pf_zring4; with xring_on); 4 the deterministic sums' strided
-  ! partial sums on several multiprocessors above a tile size (imex_red red_kpart). Default 0, set in
+  ! partial sums on several multiprocessors above a tile size (imex_red red_kpart); 8 x's one-cell ring
+  ! kept current inside the fused solve, no x exchange at its end (with xring_on; ring_sides). Default 0,
+  ! set in
   ! imex_read_namelist (no initial value: see imex_gpu_timers)
   integer     :: imex_gpu_opt
-  integer, parameter :: OPT_BITS = 7                 ! the bits implemented
+  integer, parameter :: OPT_BITS = 15                ! the bits implemented
   ! imex_gpu_opt in effect: bit 1 (opt_skip; visc3d reads imex_opt_skip); pg_dz: the deep-land faces of
   ! pgu, pgv were zeroed when the skip first applied
   logical, public, protected :: imex_opt_skip
-  logical :: pg_dz, opt_zring
+  logical :: pg_dz, opt_zring, opt_xhalo
   ! fs_gpu_opt bit 512 (decided at the first fused solve, pf_sum): the fused PCG's reductions through the
   ! shared-memory window when all compute ranks (1, 2 or 4) share a node (comm_fs_sum; MPI_Allreduce
   ! otherwise). IMEX makes the window itself (comm_shm_init; the free surface makes it only at its first
@@ -389,7 +391,7 @@ contains
     talk = (comm_world_rank() == 0)
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
     imex_gpu_timers = 0                  ! the default (see the declaration)
-    imex_gpu_opt = 0; imex_opt_skip = .false.; pg_dz = .false.; opt_zring = .false.
+    imex_gpu_opt = 0; imex_opt_skip = .false.; pg_dz = .false.; opt_zring = .false.; opt_xhalo = .false.
     shm_set = .false.; shm_use = .false.
     rewind(unit)
     msg = ''
@@ -676,6 +678,7 @@ contains
     if (redu_on) call red_ensure(decomp%nx * decomp%ny)
     xring_on = stage_on .and. (comm_gpu_direct .or. .not. any([decomp%nbr_w, decomp%nbr_e, &
                decomp%nbr_s, decomp%nbr_n] >= 0))
+    opt_xhalo = xring_on .and. iand(imex_gpu_opt, 8) /= 0
     if (sweep_on) then
       allocate(op_sgu(is:ie, js:je), op_sgv(is:ie, js:je)); op_sgu = 0.0_rp; op_sgv = 0.0_rp
     endif
@@ -3091,6 +3094,22 @@ contains
   !======================================================================
   ! Whole-array helpers (halos included)
   !======================================================================
+  subroutine ring_sides(rw, re, rs, rn)
+    ! imex_gpu_opt 8 in effect (opt_xhalo, which needs xring_on): 1 on each side of the tile that has a
+    ! neighbour (an MPI rank or the periodic self-wrap), whose ring cells pf_ring1_8 fills; 0 elsewhere
+    ! (physical edges, and every side when the bit is off). x on those ring cells is updated by the solve
+    ! with the operands its owner uses (z exchanged exactly, p formed on the ring from it, the same alpha),
+    ! so it stays equal to the owner's value; corners and physical-edge ghosts are left as they are, as
+    ! pf_ring1_8 leaves them
+    integer(ip), intent(out) :: rw, re, rs, rn
+    rw = 0; re = 0; rs = 0; rn = 0
+    if (.not. opt_xhalo) return
+    if (decomp%nbr_w /= NBR_NONE) rw = 1
+    if (decomp%nbr_e /= NBR_NONE) re = 1
+    if (decomp%nbr_s /= NBR_NONE) rs = 1
+    if (decomp%nbr_n /= NBR_NONE) rn = 1
+  end subroutine ring_sides
+
   subroutine pf_zring4(a)
     ! imex_gpu_opt 2 (xring_on): the halo of the real(4) z one cell wide, without corners, in one round:
     ! the tile's four edge rows converted to real(8) (exact) into the x exchange's ring buffers, one

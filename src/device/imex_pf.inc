@@ -149,7 +149,8 @@
       if (mqs) then
         ps_mver(s) = coef_version; ps_mc2(s) = c2
       endif
-      if (xring_on) then
+      if (opt_xhalo) then                          ! imex_gpu_opt 8: the ring is current already
+      else if (xring_on) then
         call pf_ring1_8(x)
       else
         call halo_fill_3d(x, STAGGER_RHO)
@@ -458,12 +459,13 @@
     real(rp), WORK_ATTR intent(in) :: ru(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: rv(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), intent(out) :: pq
-    integer(ip) :: i, j, k, nx, ny, nz, md, inr
+    integer(ip) :: i, j, k, nx, ny, nz, md, inr, rw, re, rs_, rn
     real(rp) :: al, be, c2l, pr, sg, g, w, wm, dv, sv, qq, a, ca, rs(1), zcp, zck
     real(rp) :: fe, fw, fn, fs
     real(PFK) :: ps, qs
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     md = mode; al = alpha; be = beta; c2l = c2
+    call ring_sides(rw, re, rs_, rn)                 ! imex_gpu_opt 8: x's ring updated too
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*,0,work_stream>>>
 #endif
@@ -472,6 +474,14 @@
         if (ad_act(i, j) > 0.0_rp) then
           inr = 0
           if (i >= 1 .and. i <= nx .and. j >= 1 .and. j <= ny) inr = 1
+          if (j >= 1 .and. j <= ny) then
+            if (i == 0 .and. rw == 1) inr = 1
+            if (i == nx + 1 .and. re == 1) inr = 1
+          endif
+          if (i >= 1 .and. i <= nx) then
+            if (j == 0 .and. rs_ == 1) inr = 1
+            if (j == ny + 1 .and. rn == 1) inr = 1
+          endif
           sg = 0.0_rp; zcp = 0.0_rp
           do k = nz, 1, -1
             if (md == 0) then
@@ -822,12 +832,37 @@
     real(rp), WORK_ATTR intent(in) :: r0(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
     real(rp), WORK_ATTR intent(in) :: hv(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
     integer, intent(in) :: stage
-    integer(ip) :: i, j, k, nx, ny, nz, s, ipd, imq
+    integer(ip) :: i, j, k, nx, ny, nz, s, ipd, imq, m, mx, rw, re, rs, rn
     real(rp) :: al
     if (.not. (pend .or. mqs)) return
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     al = alpha; s = stage
     ipd = merge(1_ip, 0_ip, pend); imq = merge(1_ip, 0_ip, mqs)
+    call ring_sides(rw, re, rs, rn)
+    if (pend .and. rw + re + rs + rn > 0) then       ! imex_gpu_opt 8: the last x update on the ring
+      mx = max(nx, ny)
+      CUF_DO2
+      do k = 1, nz
+        do m = 1, mx
+          if (m <= ny) then
+            if (rw == 1) then
+              if (ad_act(0, m) > 0.0_rp) x(0, m, k) = x(0, m, k) + al * real(p(0, m, k), 8)
+            endif
+            if (re == 1) then
+              if (ad_act(nx + 1, m) > 0.0_rp) x(nx + 1, m, k) = x(nx + 1, m, k) + al * real(p(nx + 1, m, k), 8)
+            endif
+          endif
+          if (m <= nx) then
+            if (rs == 1) then
+              if (ad_act(m, 0) > 0.0_rp) x(m, 0, k) = x(m, 0, k) + al * real(p(m, 0, k), 8)
+            endif
+            if (rn == 1) then
+              if (ad_act(m, ny + 1) > 0.0_rp) x(m, ny + 1, k) = x(m, ny + 1, k) + al * real(p(m, ny + 1, k), 8)
+            endif
+          endif
+        enddo
+      enddo
+    endif
     CUF_DO3
     do k = 1, nz
       do j = 1, ny
