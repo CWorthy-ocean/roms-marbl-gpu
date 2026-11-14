@@ -246,7 +246,8 @@ v0.1.2-beta, bit for bit.
   testing keys `bgc_subcycle_pos`, `bgc_subcycle_diag`) and
   `&marbl_biogeochemistry_settings` `marbl_balance` are read. Before, any
   of them stopped the run at the namelist read. BGC tracer subcycling is
-  not on the GPU yet: `bgc_physics_subcycle = .true.` stops the run;
+  not on the GPU yet: `bgc_physics_subcycle = .true.` checks the keys and
+  the restart rule with UCLA ROMS's messages and then stops the run;
   `marbl_balance = .true.` is ignored with a note (see `NAMELIST_COMPAT`).
 - Periodic grids (a grid file of LLm x MMm points): history, average and
   restart files are written, and a restart from them is exact. Before,
@@ -290,6 +291,14 @@ v0.1.2-beta, bit for bit.
   steps in its first 24 steps too; on the closed basin with rivers and
   CDR that changes results at round-off (1e-13 in `DU_avg1`), on sargasso
   and the N2 nest not at all.
+- BGC tracer subcycling, port in progress (`src/device/bgc_subcycle.F90`):
+  so far a test stub. With `bgc_physics_subcycle = .true.` and the
+  environment variable `ROMS_GPU_BGCSUB_STUB=1` the stock passive-tracer
+  step is switched off, the corrector transports are summed over each
+  window, and the window end runs MARBL (at MARBL steps), the exchange and
+  the copy to the other time slots, but no transport, mixing or sources:
+  the BGC tracers are held frozen. For testing and timing the port only;
+  it is not BGC subcycling.
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
   depth-integrated internal-tide energy flux `up`/`vp` of the parent,
   written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS

@@ -20,7 +20,8 @@ module step_driver
   use visc3d_mod, only: visc3d
   use step3d_t_mod, only: step3d_t
   use t3dmix_mod, only: t3dmix
-  use passive_mod, only: ntp, passive_t3dmix, passive_exchange_mid
+  use passive_mod, only: ntp, passive_t3dmix, passive_exchange_mid, tp_subcycled
+  use bgc_subcycle_mod, only: bgc_physics_subcycle, bgcsub_accumulate, bgcsub_step
   use lmd_mod, only: lmd_vmix
   use frc_io, only: set_forces, frc_prefetch
   use fs_data, only: fs_bry_phase, fs_pot_phase
@@ -120,7 +121,7 @@ contains
     call step_mark('omega')
     call lmd_vmix(nstp)
     call step_mark('lmd_vmix')
-    if (ntp > 0) call passive_exchange_mid()   ! previous step's nnew: east-west done, post north-south
+    if (ntp > 0 .and. .not. tp_subcycled) call passive_exchange_mid()   ! previous step's nnew: east-west done, post north-south
     call prsgrd()
     call step_mark('prsgrd')
     call dump_col_probe('start', nrhs)
@@ -192,7 +193,7 @@ contains
     endif
     call visc3d()
     call step_mark('step3d_uv1+visc')
-    if (ntp > 0) call passive_exchange_mid()   ! slot 3 of the passives: east-west done, post north-south
+    if (ntp > 0 .and. .not. tp_subcycled) call passive_exchange_mid()   ! slot 3 of the passives: east-west done, post north-south
     call dump_uvt('after step3d_uv1', nnew)
     call dump_bt2d_probe('after step3d_uv1+visc')
     call dump_rvS('after step3d_uv1+visc')
@@ -233,6 +234,8 @@ contains
     call omega()
     call dump_we_b('after uv2 omega')
     call dump_swflx_b('after uv2 omega')
+    ! BGC subcycling: this step's corrector transports into the window sums
+    if (bgc_physics_subcycle) call bgcsub_accumulate()
     call step3d_t()
     ! Read the next forcing records ahead while the passive corrector
     ! kernels queued by step3d_t run on the device (before marbl_gpu_step,
@@ -241,7 +244,11 @@ contains
     ! upscaling: this step's open-boundary fluxes (slot nrhs, unchanged by
     ! MARBL), as the CPU's wrt_upscale at the end of its tracer loop
     call wrt_upscale()
-    call marbl_gpu_step()
+    if (bgc_physics_subcycle) then
+      call bgcsub_step()            ! window end: BGC tracers (and MARBL at MARBL steps)
+    else
+      call marbl_gpu_step()
+    endif
     call dump_max_t('after step3d_t')
     call dump_col_probe('after step3d_t', nnew)
     call dump_rim('after step3d_t')
@@ -251,11 +258,11 @@ contains
       n = nrhs
       nrhs = nstp
       call t3dmix()
-      if (ntp > 0) call passive_t3dmix()
+      if (ntp > 0 .and. .not. tp_subcycled) call passive_t3dmix()
       nrhs = n
     else
     call t3dmix()
-    if (ntp > 0) call passive_t3dmix()
+    if (ntp > 0 .and. .not. tp_subcycled) call passive_t3dmix()
     endif
     call dump_col_probe('after t3dmix', nnew)
     call rho_eos(nnew, 3)

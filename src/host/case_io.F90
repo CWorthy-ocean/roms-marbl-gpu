@@ -38,6 +38,7 @@ module case_io
   use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name, &
        passive_hold, set_cdr_lite, passive_finish_list, ncdr, tnu2_tp, n_marbl, cdr0, passive_mirror
   use marbl_gpu, only: marbl_gpu_init_diagnostics
+  use bgc_subcycle_mod, only: bgcsub_init
   use marbl_gpu, only: marbl_on, read_marbl_namelist, marbl_gpu_setup_tracers, marbl_gpu_init_forcing, &
                        marbl_gpu_load_state
   use fs_data, only: fs_alloc_rates, udu, udv, gru, grv, qd, xx, mg_se0, mg_scu, mg_scv, fs_nsc, fs_pot_phase
@@ -788,6 +789,9 @@ contains
     call set_HUV()
     call omega()
     call rho_eos(nstp)
+    ! BGC subcycling (no-op unless bgc_physics_subcycle): checks, window
+    ! sums, the BGC state copied to every slot
+    call bgcsub_init()
     ! the CPU's initial MARBL diagnostics (its first wrt_bgc)
     if (marbl_on) call marbl_gpu_init_diagnostics()
     call set_output_root(case_output_root, case_title)

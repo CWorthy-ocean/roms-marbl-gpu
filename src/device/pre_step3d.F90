@@ -18,7 +18,7 @@ module pre_step3d_mod
   use advect, only: horiz_c4_fluxes, vert_c4_fluxes, dump_horiz_flux_probe, &
                     fuse_tracers, pre_tracers_horiz_fused, pre_tracers_vert_fused
   use uv_rhs
-  use passive_mod, only: ntp, tp, passive_predictor, passive_t3dbc
+  use passive_mod, only: ntp, tp, passive_predictor, passive_t3dbc, tp_subcycled
   use obc, only: u3dbc, v3dbc, t3dbc
   use rivers_mod, only: river_on, rivers_ts, rivers_uv, RIV_PRE
   use imex_igw, only: imex_on, imex_solve_stage, imex_stage_pred, imex_predictor_transport, imex_obc_faces
@@ -145,7 +145,8 @@ contains
       ! no exchange here: the group after t3dbc below exchanges t(nnew) and
       ! nothing reads its halo before that (t3dbc reads slot nstp)
     enddo
-    if (ntp > 0) call passive_predictor(dtau, cf_stp, cf_bak, n_stp, n_new, indx)
+    ! (tp_subcycled: the passives are updated at BGC window ends instead)
+    if (ntp > 0 .and. .not. tp_subcycled) call passive_predictor(dtau, cf_stp, cf_bak, n_stp, n_new, indx)
 
     probe_u = .false.
     if (.not. probe_on) then
@@ -412,7 +413,7 @@ contains
     call dump_pre_u('obc', indx, dtau, cf_stp, cf_bak, .false.)
     call t3dbc(itemp)
     call t3dbc(isalt)
-    if (ntp > 0) call passive_t3dbc()
+    if (ntp > 0 .and. .not. tp_subcycled) call passive_t3dbc()
     call hg_begin()
     call hg_add(F_U, nnew)
     call hg_add(F_V, nnew)
@@ -421,7 +422,7 @@ contains
     call hg_end()
     ! slot 3 of the passives: post the exchange; advanced after visc3d and
     ! completed by passive_corrector (nothing touches the slot in between)
-    if (ntp > 0) then
+    if (ntp > 0 .and. .not. tp_subcycled) then
       if (tp_overlap_on(1)) then
         call halo_tp_start(tp, ntp, nnew)
       else
