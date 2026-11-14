@@ -85,8 +85,11 @@ first, on the smallest case that exercises it.
   `bgc_real_marbl` test domain, 39 x 19 x 10, where each run takes seconds):
   k = 2, k = 4, k = 4 implicit, k = 2 with MARBL every 4 steps, an exact
   restart, the three rejected window lengths, a restart period that is not a
-  multiple of the window and a start inside a window, and 2x2 against 1x1
-  with `--tiles2x2`. `setup --nml <GPU namelist of the case> --exe <binary>
+  multiple of the window and a start inside a window, the IMEX internal-wave
+  step (`xoff`, `xk4`, `xk2m4`, `xk4i` and a restart at step 8 inside an
+  operator rebuild period, 'modal' boundary), and 2x2 against 1x1 with
+  `--tiles2x2` (with and without IMEX; the IMEX solve is not bitwise
+  tiling-independent, so that pair is held to 1e-12). `setup --nml <GPU namelist of the case> --exe <binary>
   --dir <dir>` writes the run directories, `run --dir <dir>` runs them inside
   a GPU job, `check --dir <dir> [--ref <dir of the base binary or an earlier
   commit>]` prints one PASS/FAIL line per gate (G-RUN, G-PHYS, G-BUD, G-RST,

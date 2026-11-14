@@ -154,14 +154,14 @@
 # halo of a tile), CDR releases in all four modes (parameterized tracer
 # fluxes, volume releases, depth profiles, 3D forcing), the CDR_LITE and
 # CFLX_CORR surface fluxes, any number of passive tracers, with or
-# without MARBL, split or implicit free surface.
+# without MARBL, split or implicit free surface, and with the IMEX
+# internal-wave step (&imex_igw_settings; 'modal' or 'fixed' open
+# boundary), as UCLA ROMS dev 809aa24a runs the combination.
 # Refused at start-up (each with its own message): bgc_subcycle_pos =
 # .true. and bgc_subcycle_diag >= 2 (the positivity limiter and its test;
-# not on the GPU yet); the IMEX internal-wave step (&imex_igw_settings
-# present; enabling the combination is planned as a follow-up); UPSCALING
-# output and ub_tune (refused by UCLA ROMS too); the GPU-only
-# &passive_tracers init_mode = 'mirror_salt' test tracer; builds without
-# -DPASSIVE_FP64.
+# not on the GPU yet); UPSCALING output and ub_tune (refused by UCLA ROMS
+# too); the GPU-only &passive_tracers init_mode = 'mirror_salt' test
+# tracer; builds without -DPASSIVE_FP64.
 #
 # IMEX internal-wave step (&imex_igw_settings present: on; absent: the
 # stock step), as in ucla-roms #433 and #434 (IMEX_IGW with its 'modal'
