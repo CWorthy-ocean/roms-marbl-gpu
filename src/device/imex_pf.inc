@@ -50,6 +50,7 @@
     broke = .false.; pend = .false.
     iters = 0; resid = 0.0_rp; tole = tol; bnorm = 0.0_rp; alpha = 0.0_rp; beta = 0.0_rp
     if (c2 <= 0.0_rp) return
+    call itw2(9, 0)
     if (warm .and. .not. reuse) &                 ! W M x0 into pf_mq(:,:,:,3) (FP64 operand and result)
       call PF_OP(0, 0.0_rp, 0.0_rp, c2l, x, pf_mq, z, pa, pb, x, q, rczk, czt, czb, cu, cv, hz, wr, ru, rv, pq)
     if (.not. warm) call zero3(x)
@@ -70,6 +71,7 @@
     endif
     loc = [real(s1, 8), real(s2, 8)]
     call comm_allreduce_sum(2, loc, glob)
+    call itw2(9, 1)
     rho = glob(1); rho0 = glob(1)
     if (warm) then
       bnorm = glob(2)
@@ -91,7 +93,10 @@
     resid = 1.0_rp
     cur = 1                                        ! p of the last sweep 1: pa (1) or pb (2)
     do it = 1, imex_maxit
+      call itw2(10, 0)
       call PF_ZEXCH(z)                             ! one cell, no corners: all the operator reads
+      call itw2(10, 1)
+      call itw2(11, 0)
       mode = 2
       if (it == 1) mode = 1                        ! p = z
       if (cur == 1) then                           ! p_old in pa, p_new into pb
@@ -99,20 +104,27 @@
       else
         call PF_OP(mode, alpha, beta, c2l, x, pf_mq, z, pb, pa, x, q, rczk, czt, czb, cu, cv, hz, wr, ru, rv, pq)
       endif
+      call itw2(11, 1)
       cur = 3 - cur
       pend = .false.                               ! (x += alpha p_old done in the sweep)
       loc(1) = real(pq, 8)
+      call itw2(12, 0)
       call comm_allreduce_sum(1, loc(1:1), glob(1:1))
+      call itw2(12, 1)
       pq = glob(1)
       if (.not. ieee_is_finite(pq) .or. pq <= 0.0_rp) then
         call breakdown('<p,Ap>', pq, it)
         exit
       endif
       alpha = rho / pq
+      call itw2(13, 0)
       call PF_UP(alpha, q, dinv, s, z, s1)
+      call itw2(13, 1)
       pend = .true.                                ! x += alpha p pending
       loc(1) = real(s1, 8)
+      call itw2(12, 0)
       call comm_allreduce_sum(1, loc(1:1), glob(1:1))
+      call itw2(12, 1)
       iters = it
       if (.not. ieee_is_finite(glob(1)) .or. glob(1) < 0.0_8) then
         call breakdown('<r,M^-1 r>', glob(1), it)
@@ -124,6 +136,7 @@
       rho = glob(1)
     enddo
     if (fs_on) then                                ! imex_gpu_stage: the last x update, the stored
+      call itw2(14, 0)
       al = alpha                                   ! W M x, one-cell x exchange
       mqs = (pcg_start == 3 .and. imex_warm == 1)
       if (cur == 1) then
@@ -141,6 +154,7 @@
       else
         call halo_fill_3d(x, STAGGER_RHO)
       endif
+      call itw2(14, 1)
       return
     endif
     if (pend) then                                 ! the last x += alpha p

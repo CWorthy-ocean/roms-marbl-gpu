@@ -36,6 +36,8 @@ module step_driver
   use imex_igw, only: imex_on, imex_begin_step, imex_solve_stage, imex_stage_corr, &
                       imex_shift_levels, imex_tsmix_active
   use implicit_fs_gpu, only: fs_on, fs_step, fs_srcdiag, fs_src_diag
+  use imex_red, only: itw, it_step, it_print
+  use comm_mod, only: comm_world_rank
   implicit none
   private
 
@@ -83,7 +85,12 @@ contains
          iic - ntstart < fast_probe_to)
     call begin_predictor_indices()
     call step_timer_init()
+    ! imex_gpu_timers windows (imex_red: itw(id, 0/1) at entry/exit, names in it_name; every call
+    ! returns at once when the key is 0, and without IMEX)
+    call it_step()
     if (imex_on) call imex_begin_step()   ! IMEX_IGW: this step's weights; n-1 stores on the first
+    call itw(24, 0)
+    call itw(27, 0)
 
     ! --- predictor (nrhs = n, nnew = 3) ---
     frc_slot = 0
@@ -96,6 +103,8 @@ contains
     call set_bry_all()
     call step_mark('set_bry')
     call set_tides(pot_phase=fs_pot_phase)
+    call itw(27, 1)
+    call itw(29, 0)
     call dump_bry_north('after tide', frc_modtime())
     call step_mark('set_tides')
     call halo_fill_2d_s(zeta, STAGGER_RHO, knew)
@@ -122,11 +131,17 @@ contains
     call lmd_vmix(nstp)
     call step_mark('lmd_vmix')
     if (ntp > 0 .and. .not. tp_subcycled) call passive_exchange_mid()   ! previous step's nnew: east-west done, post north-south
+    call itw(29, 1)
+    call itw(23, 0)
     call prsgrd()
+    call itw(23, 1)
     call step_mark('prsgrd')
     call dump_col_probe('start', nrhs)
+    call itw(20, 0)
     call pre_step3d()
+    call itw(20, 1)
     call step_mark('pre_step3d')
+    call itw(28, 0)
     call dump_col_probe('after pre_step3d', nnew)
     call dump_uvt('after pre_step3d', nnew)
     call dump_vic('after pre_step3d')
@@ -174,24 +189,33 @@ contains
     call dump_vic('before uv1')
     call dump_p1_fun('before_uv1')
     call dump_rim('before_uv1')
+    call itw(28, 1)
+    call itw(23, 0)
     call prsgrd()
+    call itw(23, 1)
     call step_mark('corrector rhs')
     if (calc_pflx) then
       ! the CPU's calc_pressure_flux (prsgrd, corrector stage, DIAGNOSTICS)
       call calc_pressure_flux()
       call step_mark('calc_pflx')
     endif
+    call itw(25, 0)
     call step3d_uv1()
+    call itw(25, 1)
     if (imex_on) then
       ! IMEX_IGW: elliptic correction of u, v(nnew) (Hz-weighted); rufrc
       ! keeps the explicit rhs; then the halos of the corrected faces
       call imex_solve_stage(imex_stage_corr)
+      call itw(18, 0)
       call hg_begin()
       call hg_add(F_U, nnew)
       call hg_add(F_V, nnew)
       call hg_end()
+      call itw(18, 1)
     endif
+    call itw(19, 0)
     call visc3d()
+    call itw(19, 1)
     call step_mark('step3d_uv1+visc')
     if (ntp > 0 .and. .not. tp_subcycled) call passive_exchange_mid()   ! slot 3 of the passives: east-west done, post north-south
     call dump_uvt('after step3d_uv1', nnew)
@@ -205,7 +229,9 @@ contains
       ! implicit free surface (implicit_fs.F90, FS_SPEC.md): one step
       ! replaces the fast loop; kstp then points at the new level
       call cycle_fast_index()
+      call itw(22, 0)
       call fs_step()
+      call itw(22, 1)
       kstp = knew
     else
     do n = 1, nfast
@@ -225,8 +251,11 @@ contains
     call step_mark('step2d')
     call dump_ic_jet_2d('after step2d')
 
+    call itw(21, 0)
     call step3d_uv2()
+    call itw(21, 1)
     call step_mark('step3d_uv2')
+    call itw(26, 0)
     call dump_huv_probe('after step3d_uv2')
     call dump_p1_fun('after step3d_uv2')
     call dump_uvt('after step3d_uv2', nnew)
@@ -266,6 +295,7 @@ contains
     endif
     call dump_col_probe('after t3dmix', nnew)
     call rho_eos(nnew, 3)
+    call itw(26, 1)
     call step_mark('step3d_t')
     ! Step diagnostics are device reductions, every ninfo steps.
     info_step = (mod(iic - ntstart, ninfo_steps) == 0)
@@ -284,6 +314,8 @@ contains
       write(*,'(a,es14.6)') 'step: max hbls = ', hblmax
     endif
     if (imex_on) call imex_shift_levels()   ! IMEX_IGW: level n becomes n-1
+    call itw(24, 1)
+    if (iic == ntstart + ntimes - 1) call it_print(int(comm_world_rank()))
     call step_mark('baroclinic step')
     call rt_dev_collect()        ! the device is drained here
   end subroutine run_baroclinic_step

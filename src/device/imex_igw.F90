@@ -76,7 +76,7 @@ module imex_igw
   use comm_mod, only: comm_world_rank, comm_allreduce_sum, comm_allreduce_max, comm_allreduce_min, &
                       comm_gpu_direct, comm_ring_dev8
   use arch_mod, only: sync_arch
-  use imex_red, only: red_ensure, red_sum, red_part
+  use imex_red, only: red_ensure, red_sum, red_part, it_set, itw, itw2, it_reb
   use rivers_mod, only: river_on, rivers_pred_flx
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
@@ -160,6 +160,12 @@ module imex_igw
   ! face transports F formed in the cell kernel; sweep 2 skips land
   ! columns. 0: the session-2 kernels. Default 1 since session 3.
   integer     :: imex_gpu_sweep = 1
+  ! GPU only: timing windows (imex_red): 0 off (default; no synchronisation), 1 the IMEX hooks and
+  ! the phases of the step, 2 also the pieces inside the stage solve; IMEX_WIN lines at the last step.
+  ! Results are the same at 0, 1 and 2. The default is set in imex_read_namelist (no initial value
+  ! here: declaration initial values in this module have crashed nvfortran 25.9, GPU_IMEX_MODAL_PORT.md
+  ! sec. 9.6)
+  integer     :: imex_gpu_timers
   ! CPU 73a63afb (FS_SPEC 3.8, 9b-H): imex_rst_state 1 (default) the IMEX state in the EXACT_RESTART
   ! files (one time-less copy, with the second record of each pair), 0 none (small files, the old
   ! inexact restart); imex_redu (CPU: rank-count-independent integer-digit sums) read, only 0 on
@@ -208,7 +214,7 @@ module imex_igw
        imex_redu, imex_rst_state, imex_mix_split, &
        imex_obc_mode, imex_obc_nmodes, imex_obc_q0, imex_obc_tref, &
        imex_obc_mprint, imex_obc_cmin, &
-       imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep
+       imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep, imex_gpu_timers
 
   ! Weights (set_derived_weights): regular step and first step of a run
   real(rp) :: wpg_pred(2), wflx_pred(3), wpg_corr(3), wrhs_corr(4)
@@ -359,6 +365,7 @@ contains
     character(len=1024) :: found
     talk = (comm_world_rank() == 0)
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
+    imex_gpu_timers = 0                  ! the default (see the declaration)
     rewind(unit)
     msg = ''
     read(unit, nml=imex_igw_settings, iostat=ios, iomsg=msg)
@@ -386,6 +393,7 @@ contains
     endif
     imex_on = .true.
     call check_settings()
+    call it_set(imex_gpu_timers)
     call set_derived_weights()
     if (talk) call print_settings()
   end subroutine imex_read_namelist
@@ -514,6 +522,7 @@ contains
     stage_on = (imex_gpu_stage == 1) .and. pf_on .and. imex_warm == 1 &
                .and. imex_theta_p > 0.0_rp .and. imex_theta_c > 0.0_rp
     if (imex_gpu_sweep < 0 .or. imex_gpu_sweep > 1) call bad('imex_gpu_sweep must be 0 or 1')
+    if (imex_gpu_timers < 0 .or. imex_gpu_timers > 2) call bad('imex_gpu_timers must be 0, 1 or 2')
     sweep_on = (imex_gpu_sweep == 1) .and. pf_on
     ! 'modal' on the GPU (obm_decide): the face term lives in the restructured sweep (PF_OPS), the face
     ! values in the fused stage (solve_stage_fast); imex_pcg_start 0 (apply_m, CPU's unfused operator)
@@ -570,8 +579,9 @@ contains
          '  imex_solver_prec =', pf_prec
     if (imex_solver_prec /= pf_prec) write(*,'(3x,a)') 'imex_solver_prec = 4 needs imex_pcg_fused = 1 in effect:' &
          // ' imex_solver_prec = 8'
-    write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_gpu_redu =', imex_gpu_redu, &
-         '  imex_gpu_stage =', merge(1, 0, stage_on), '  imex_gpu_sweep =', merge(1, 0, sweep_on)
+    write(*,'(3x,a,i2,a,i2,a,i2,a,i2)') 'imex_gpu_redu =', imex_gpu_redu, &
+         '  imex_gpu_stage =', merge(1, 0, stage_on), '  imex_gpu_sweep =', merge(1, 0, sweep_on), &
+         '  imex_gpu_timers =', imex_gpu_timers
     write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_redu =', imex_redu, '  imex_rst_state =', imex_rst_state, &
          '  imex_mix_split =', imex_mix_split
     write(*,'(3x,a,a,a)') "imex_obc_mode = '", trim(imex_obc_mode), "' (resolved at the first step: 'auto'" &
@@ -668,6 +678,7 @@ contains
     if (.not. imex_on) return
     if (.not. allocated(pgu)) call imex_alloc()
     if (.not. obm_decided) call obm_decide()        ! 'modal' or 'fixed' (may turn the restart inexact)
+    if (bref_due()) call it_reb()
     ! (exact restart with the IMEX state read, rst_read: an ordinary step; u^n-1 is the
     ! restart's earlier record, in slot 3-nstp; pg_nm1 and the solver state come from the file)
     first_step = ((iic == ntstart) .and. .not. rst_read) .or. is_first_time_step()
@@ -720,7 +731,9 @@ contains
     integer(ip) :: tmp
     if (.not. imex_on) return
     tmp = ipg_nm1; ipg_nm1 = ipg_n; ipg_n = tmp
+    call itw(17, 0)
     call copy_level_n()
+    call itw(17, 1)
     call imex_diag_line()
   end subroutine imex_shift_levels
 
@@ -767,6 +780,7 @@ contains
     real(rp) :: w1, w2, w3, sc_u, sr_u, sh_u, hf
     if (.not. imex_on) return
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    call itw(1, 0)
     if (nrhs == 3) then            ! corrector: level *, combine (*, n, n-1)
       sc = 3; s1 = ipg_n; s2 = ipg_nm1
       w1 = wpg_corr(1); w2 = wpg_corr(2); w3 = wpg_corr(3)
@@ -820,6 +834,7 @@ contains
         enddo
       enddo
     enddo
+    call itw(1, 1)
   end subroutine imex_pg_store_combine
 
   !======================================================================
@@ -838,6 +853,7 @@ contains
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     n_new = nnew; n_stp = nstp
+    call itw(15, 0)
     w1 = wflx_pred(1); w2 = wflx_pred(2); w3 = wflx_pred(3)
     first = merge(1_ip, 0_ip, is_first_time_step())
     i_v0 = 1; i_v1 = nx; j_u0 = 1; j_u1 = ny
@@ -980,6 +996,7 @@ contains
     call hg_add(F_FLXV)
     call hg_end()
     call omega()
+    call itw(15, 1)
   end subroutine imex_predictor_transport
 
   !======================================================================
@@ -999,9 +1016,13 @@ contains
     if (.not. imex_solver_enabled) return
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    call itw(1 + stage, 0)
+    call itw2(4, 0)
     call imex_step_setup()
+    call itw2(4, 1)
     if (stage_on) then
       call solve_stage_fast(stage, dtau, cfbak)
+      call itw(1 + stage, 1)
       return
     endif
     CUF_DO3
@@ -1140,6 +1161,7 @@ contains
     integer :: is_, iters
     integer(ip) :: i, j, k, nx, ny, nz
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    call itw2(5, 0)
     if (stage == imex_stage_pred) then
       is_ = 1
       dts = dt; cb = 0.0_rp
@@ -1155,7 +1177,10 @@ contains
       call hg_add(F_U, nnew)
       call hg_add(F_V, nnew)
       call hg_end()
+      call itw2(5, 1)
+      call itw2(6, 0)
       call rhs_transport(wflx_pred, nnew, nstp, .false., 0.0_rp, 0_ip)
+      call itw2(6, 1)
     else
       is_ = 2
       dts = dt; cb = 0.0_rp
@@ -1165,20 +1190,27 @@ contains
       call hg_add(F_U, nnew)
       call hg_add(F_V, nnew)
       call hg_end()
+      call itw2(5, 1)
+      call itw2(6, 0)
       call rhs_transport(wrhs_corr(2:4), 3_ip, nstp, .true., wrhs_corr(1), nnew)
+      call itw2(6, 1)
     endif
     c2 = (theta * dts)**2
     fs_on = .true.; fs_dtl = dts; fs_cb = cb
+    call itw2(7, 0)
     call solve_fused(is_, c2, tol, iters, resid)
+    call itw2(7, 1)
     fs_on = .false.
     if (is_ == 1) fs_dpw = .false.
     if (imex_verbose >= 1 .and. talk) write(*,'(1x,a,i6,i2,a,i5,a,es24.16)') 'IMEX_SOLVE', iic, is_, &
          ' its', iters, ' resid', resid
+    call itw2(8, 0)
     if (is_ == 1) then
       call correct_fast(stage, theta * dts, hs1)
     else
       call correct_fast(stage, theta * dts, hs2)
     endif
+    call itw2(8, 1)
     st_n(is_) = st_n(is_) + 1
     st_it(is_) = st_it(is_) + iters
     st_itmax(is_) = max(st_itmax(is_), iters)
@@ -3085,7 +3117,9 @@ contains
     ! is applied here, fused with the face write
     integer, intent(in) :: stage
     if (.not. imex_on) return
+    call itw(16, 0)
     if (imex_obc_modal) call obm_correct_faces(stage)
+    call itw(16, 1)
   end subroutine imex_obc_faces
 
   logical function imex_stage_on()
