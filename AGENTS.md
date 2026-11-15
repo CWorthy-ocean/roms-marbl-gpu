@@ -193,6 +193,12 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   CUDA graphs (`ROMS_GPU_GRAPH=1`) damp zeta; keep them off for validation.
 - nvfortran pitfalls (`value` arguments in device code, the inliner, stack
   size) are in `MARBL_GPU_PORT.md`, "Toolchain lessons".
+  Two more from `imex_igw.F90` (nvfortran 25.9): module device functions
+  called from its CUF kernels stopped NVVM with "invalid forward reference
+  to function ... with wrong type" (defined before or after the kernel),
+  so the `imex_corr_adv` kernels write the arithmetic out; and editing one
+  format string there made `fort2` abort with a malloc assertion in the
+  full `make gpu`, while the file alone compiled. Build every commit.
 - If a run differs from its own bit-identical repeats, rerun it on other nodes
   before you debug: a faulty GPU node has given silently wrong results. Wrap
   job runs in `timeout`.
