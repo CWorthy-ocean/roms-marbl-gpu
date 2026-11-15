@@ -72,6 +72,10 @@ module frc_io
     ! dest(li0:li0+n1-1, lj0:lj0+n2-1); lay = LAY_COARSE, a 2x-coarse field
     ! (whole file in buf).
     integer :: lay = 0, li0 = 1, lj0 = 1
+    ! halo_fill: the window does not reach the halo (an interior shape, rho
+    ! or v gnx in xi, rho or u gny in eta), so fill_any fills it from the
+    ! neighbours, as UCLA ROMS's exchange_xxx after each forcing read
+    logical :: halo_fill = .false.
     integer :: fn1 = 0, fn2 = 0   ! file shape (xi, eta), the same in every file
     logical :: ready = .false.
     ! climatology: cycle_length attribute of the time axis (<= 0: none);
@@ -658,7 +662,8 @@ contains
     !     r: (gxc+2) x (gyc+2), u: (gxc+1) x (gyc+2), v: (gxc+2) x (gyc+1)
     ! On a periodic grid each direction is taken on its own, and a periodic
     ! one also accepts the roms_gpu layout of its u (v) faces, gnx (gny).
-    ! Any other shape stops the run.
+    ! The interior shapes are GPU-only (UCLA ROMS reads LLm+2); fill_any
+    ! fills their halo between tiles. Any other shape stops the run.
     type(series2d),   intent(inout) :: s
     character(len=*), intent(in)    :: gtype, path
     integer,          intent(in)    :: nxi, neta
@@ -667,6 +672,7 @@ contains
     gxc = gx / 2; gyc = gy / 2
     s%fn1 = nxi; s%fn2 = neta
     s%lay = LAY_GRID
+    s%halo_fill = .false.
     s%fi0 = int(decomp%i0); s%fj0 = int(decomp%j0)
     lx = -1; ly = -1
     if (decomp%periodic_x .or. decomp%periodic_y) then
@@ -710,6 +716,9 @@ contains
     endif
     s%n1 = nxi - gx + int(decomp%nx)
     s%n2 = neta - gy + int(decomp%ny)
+    ! A window from local point 1 in a rho direction (xi for r and v, eta
+    ! for r and u) leaves the halo between tiles unset.
+    s%halo_fill = (gtype /= 'u' .and. s%li0 == 1) .or. (gtype /= 'v' .and. s%lj0 == 1)
   end subroutine classify_layout
 
   integer function axis_li0(n, g, face, periodic) result(l0)
@@ -1374,8 +1383,9 @@ contains
     ! window read holds the file's own boundary points (UCLA ROMS layout)
     ! or no halo at all (roms_gpu layout), and interp_coarse fills the
     ! halo from the coarse field. Pointwise time interpolation commutes
-    ! with the copy.
-    if (decomp%periodic_x .or. decomp%periodic_y) call halo_fill_2d(dest, STAGGER_RHO)
+    ! with the copy. A field read in an interior shape (s%halo_fill) gets
+    ! the halo between tiles the same way, as the CPU's exchange gives it.
+    if (decomp%periodic_x .or. decomp%periodic_y .or. s%halo_fill) call halo_fill_2d(dest, STAGGER_RHO)
   end subroutine fill_any
 
   subroutine interp_coarse(b, n1, n2, c1, c2, dest, gtype, kn)
@@ -1639,7 +1649,8 @@ contains
     endif
     ! On a periodic grid the halo is the periodic copy, as fill_any leaves
     ! it: the CPU applies the rule to the exchanged records, halo included.
-    if (decomp%periodic_x .or. decomp%periodic_y) then
+    ! The same between tiles for a field read in an interior shape.
+    if (decomp%periodic_x .or. decomp%periodic_y .or. s_ddco2%halo_fill) then
       call halo_fill_2d(ddco2, STAGGER_RHO)
       call halo_fill_2d(ddalk, STAGGER_RHO)
     endif

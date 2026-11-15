@@ -16,6 +16,7 @@ module tide_io
   use frc_io, only: case_frcfiles, case_nfrc, frc_file_ncid
   use nc_io
   use arch_mod, only: sync_arch
+  use halo_mod, only: halo_fill_2d
 #ifdef USE_CUDA
   use cudadevice, only: __dmul_rn
 #endif
@@ -121,17 +122,21 @@ contains
         call nc_var_shape(ncid, 'ssh_Re', n1, n2, n3, nrec)
         call load2(ncid, 'ssh_Re', n1, n2, it, ztide_r(:,:,it), 'r')
         call load2(ncid, 'ssh_Im', n1, n2, it, ztide_i(:,:,it), 'r')
+        call interior_halo(n1, n2, 'r', ztide_r(:,:,it), ztide_i(:,:,it))
         call nc_var_shape(ncid, 'u_Re', n1, n2, n3, nrec)
         call load2(ncid, 'u_Re', n1, n2, it, utide_r(:,:,it), 'u')
         call load2(ncid, 'u_Im', n1, n2, it, utide_i(:,:,it), 'u')
+        call interior_halo(n1, n2, 'u', utide_r(:,:,it), utide_i(:,:,it))
         call nc_var_shape(ncid, 'v_Re', n1, n2, n3, nrec)
         call load2(ncid, 'v_Re', n1, n2, it, vtide_r(:,:,it), 'v')
         call load2(ncid, 'v_Im', n1, n2, it, vtide_i(:,:,it), 'v')
+        call interior_halo(n1, n2, 'v', vtide_r(:,:,it), vtide_i(:,:,it))
       endif
       if (pot_tides) then
         call nc_var_shape(ncid, 'pot_Re', n1, n2, n3, nrec)
         call load2(ncid, 'pot_Re', n1, n2, it, ptide_r(:,:,it), 'r')
         call load2(ncid, 'pot_Im', n1, n2, it, ptide_i(:,:,it), 'r')
+        call interior_halo(n1, n2, 'r', ptide_r(:,:,it), ptide_i(:,:,it))
       endif
     enddo
     call nc_close(ncid)
@@ -281,6 +286,20 @@ contains
          zeta_north(i) - z0, vbar_north(i) - v0, zeta_north(i), vbar_north(i)
     flush(6)
   end subroutine dump_tide_north
+
+  subroutine interior_halo(n1, n2, gtype, ar, ai)
+    ! A field read in an interior shape (rho or v gnx in xi, rho or u gny
+    ! in eta) has no halo between tiles: fill it from the neighbours, as
+    ! frc_io fill_any does for the forcing fields (UCLA ROMS reads LLm+2).
+    integer,          intent(in) :: n1, n2
+    character(len=1), intent(in) :: gtype
+    real(rp), WORK_ATTR intent(inout) :: ar(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(inout) :: ai(decomp%is:decomp%ie, decomp%js:decomp%je)
+    if ((gtype /= 'u' .and. n1 == decomp%gnx) .or. (gtype /= 'v' .and. n2 == decomp%gny)) then
+      call halo_fill_2d(ar, STAGGER_RHO)
+      call halo_fill_2d(ai, STAGGER_RHO)
+    endif
+  end subroutine interior_halo
 
   subroutine load2(ncid, vname, n1, n2, rec, dest, gtype)
     integer,          intent(in)    :: ncid, n1, n2, rec
