@@ -33,7 +33,7 @@ module imex_igw
   !
   ! Supported namelist values: the defaults, plus imex_solver_enabled,
   ! imex_allow_explicit (with the weights it allows), the weights, the
-  ! tolerances, imex_maxit, imex_verbose 0/1/2, imex_mix_split 0/1,
+  ! tolerances, imex_maxit, imex_verbose 0/1/2, imex_mix_split 0/1, imex_corr_adv 0/1 (1 on the fused path),
   ! imex_n2_ref, imex_n2_taper, imex_bref_hours, imex_warm 0/1,
   ! imex_setup_lag 0/1, imex_rst_state 0/1, imex_obc_mode 'fixed'/'modal'/'auto'
   ! with imex_obc_nmodes, imex_obc_q0, imex_obc_tref, imex_obc_cmin,
@@ -66,7 +66,7 @@ module imex_igw
                        rmask, umask, vmask, rho1, ru, rv, DU_avg1, DU_avg2, DU_avg_bak, &
                        DV_avg1, DV_avg2, DV_avg_bak, h, &
                        t_west, u_west, t_east, u_east, t_south, v_south, t_north, v_north
-  use gpu_state, only: colact, dry_lim, G_MOM, G_PGF
+  use gpu_state, only: colact, dry_lim, G_MOM, G_PGF, G_EOS, open_edge_codes
   use time_state, only: nstp, nnew, nrhs, iic, ntstart, ntimes, dt, is_first_time_step, ninfo_steps
   use formulas, only: g, rho0, AM3_crv, qp2, eos_r00, eos_r01, eos_r02, eos_r03, eos_r04, eos_r05, eos_r10, &
                       eos_r11, eos_r12, eos_r13, eos_r14, eos_rS0, eos_rS1, eos_rS2, eos_r20, eos_K00, eos_K01, &
@@ -195,6 +195,17 @@ module imex_igw
   ! correction). With the additive form the explicit Laplacian of a sponge band made the IMEX step
   ! unstable at C_igw > ~2.
   integer, public, protected :: imex_mix_split = 1
+  ! CPU 746cb6f7, 6e675129 (branch imex-advective-buoyancy; IMEX_ADVECTIVE_BUOYANCY.md): the corrector rhs with
+  ! the step's advective buoyancy change, 0 off (default), 1 on (code-only key, as on the CPU). The corrector's
+  ! implicit-level pressure is that of b* + db, and r0 = dt R(F) - dps holds only the wave-linearized part of
+  ! the step's change, so with advection b* + db holds the predictor's non-wave change NW = b* - b^n - dps
+  ! (about half a step of advection) instead of the step's. 1 adds X = n2c dt [A(b*; F) - A(b_ref; PF)] - NW
+  ! (advb_rhs): A the tracer corrector's advection (UP3 horizontal with its edge and open-edge rules, U3
+  ! vertical, advective form), F set_HUV1's transport, PF its projection; X = 0 where the vertical Courant
+  ! number exceeds 1. On the GPU only on the fused path (imex_fast_on; check_settings). The default is set in
+  ! imex_read_namelist (no initial value here, see imex_gpu_timers)
+  integer     :: imex_corr_adv
+  logical     :: advb_on
   ! The CPU's 'modal' open boundary (keys and defaults as the CPU's): 'auto' selects 'modal' with an
   ! open edge and 3-D boundary data (obm_decide). imex_obc_mode, imex_obc_tref: template keys;
   ! imex_obc_nmodes, imex_obc_q0 (0 off, else 0.2-1), imex_obc_cmin, imex_obc_mprint (OBCM/OBCF
@@ -228,7 +239,7 @@ module imex_igw
        imex_verbose, imex_solver_enabled, imex_allow_explicit, imex_selftest, &
        imex_n2_ref, imex_n2_taper, imex_warm, &
        imex_bref_hours, imex_setup_lag, imex_pcg_start, imex_pcg_fused, imex_solver_prec, imex_stage_fused, &
-       imex_redu, imex_rst_state, imex_mix_split, &
+       imex_redu, imex_rst_state, imex_mix_split, imex_corr_adv, &
        imex_obc_mode, imex_obc_nmodes, imex_obc_q0, imex_obc_tref, &
        imex_obc_mprint, imex_obc_cmin, &
        imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep, imex_gpu_timers
@@ -274,6 +285,15 @@ module imex_igw
   ! imex_gpu_stage = 1: the predictor's and the corrector's solutions, kept
   ! in place between steps (the warm starts; hs1 = dps, hs1 + hs2 = dpw)
   real(rp), WORK_ATTR allocatable :: hs1(:,:,:), hs2(:,:,:)
+  ! imex_corr_adv = 1 (advb_save, advb_rhs; allocated at the first use): rho1 at level n (copied at the
+  ! predictor solve), b* with halos, the corrector's memory term hs1 - X (PF_START_RHS); the UP3 fluxes of
+  ! b* and of b_ref at the u-faces (fxs, fxr) and v-faces (fes, fer); the column sums of FlxU, FlxV at the
+  ! faces (the projection PF); at imex_verbose >= 2 the column partials of the IMEX_ADVB line
+  real(rp), WORK_ATTR allocatable :: advb_rn(:,:,:), advb_bs(:,:,:), advb_mem(:,:,:)
+  real(rp), WORK_ATTR allocatable :: advb_fxs(:,:,:), advb_fxr(:,:,:), advb_fes(:,:,:), advb_fer(:,:,:)
+  real(rp), WORK_ATTR allocatable :: advb_sfu(:,:), advb_sfv(:,:), advb_dg(:,:,:)
+  ! the CPU's UP3 constant (advection: c6) and the vertical Courant number above which X = 0 (advb_czmax)
+  real(rp), parameter :: advb_c6 = 0.1666666666666666_rp, advb_czmax = 1.0_rp
   integer :: nh(2) = 0, n_maxit_hits = 0
   ! In effect (check_settings): the setup lag, the start-up mode, the fused
   ! solve and its storage kind, the IMEX_PCHK check (fused, verbose >= 1)
@@ -383,6 +403,8 @@ contains
     talk = (comm_world_rank() == 0)
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
     imex_gpu_timers = 0                  ! the default (see the declaration)
+    imex_corr_adv = 0                    ! the default (see the declaration)
+    advb_on = .false.
     imex_fast_on = .false.; pg_dz = .false.
     shm_set = .false.; shm_use = .false.
     rewind(unit)
@@ -497,6 +519,7 @@ contains
     if (imex_n2_ref < 0.0_rp .or. imex_n2_taper < 0.0_rp) call bad('imex_n2_ref and imex_n2_taper must be >= 0')
     if (imex_verbose < 0 .or. imex_verbose > 2) call bad('imex_verbose must be 0, 1 or 2')
     if (imex_mix_split < 0 .or. imex_mix_split > 1) call bad('imex_mix_split must be 0 or 1')
+    if (imex_corr_adv < 0 .or. imex_corr_adv > 1) call bad('imex_corr_adv must be 0 or 1')
     if (imex_warm < 0 .or. imex_warm > 1) call bad('imex_warm must be 0 or 1')
     if (imex_bref_hours <= 0.0_rp) call bad('imex_bref_hours must be positive')
     if (imex_setup_lag < 0 .or. imex_setup_lag > 1) call bad('imex_setup_lag must be 0 or 1')
@@ -551,6 +574,12 @@ contains
          // ' needs imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm 1, theta_p, theta_c > 0, imex_gpu_stage 1' &
          // ' and imex_gpu_sweep 1')
     imex_fast_on = stage_on .and. sweep_on .and. redu_on
+    ! imex_corr_adv: its memory term enters the fused stage's start-up (PF_START_RHS); the unfused stage
+    ! (imex_gpu_stage 0 and the paths that fall back to it) is not ported
+    if (imex_corr_adv == 1 .and. .not. imex_fast_on) call bad('imex_corr_adv = 1 on the GPU needs the fused' &
+         // ' stage: imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm 1, theta_p, theta_c > 0, imex_gpu_stage,' &
+         // ' imex_gpu_sweep and imex_gpu_redu 1')
+    advb_on = (imex_corr_adv == 1)
     if (nerr > 0) error stop 'imex_igw: unsupported &imex_igw_settings (see above)'
   contains
     subroutine bad(what)
@@ -604,6 +633,7 @@ contains
          '  imex_gpu_timers =', imex_gpu_timers
     write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_redu =', imex_redu, '  imex_rst_state =', imex_rst_state, &
          '  imex_mix_split =', imex_mix_split
+    if (advb_on) write(*,'(3x,a)') 'imex_corr_adv = 1: corrector rhs with the step''s advective buoyancy change'
     write(*,'(3x,a,a,a)') "imex_obc_mode = '", trim(imex_obc_mode), "' (resolved at the first step: 'auto'" &
          // " selects 'modal' with an open edge and 3-D boundary data)"
     if (imex_gpu_stage == 1 .and. .not. stage_on) write(*,'(3x,a)') 'imex_gpu_stage = 1 needs the fused solve,' &
@@ -1131,6 +1161,15 @@ contains
     call itw2(4, 0)
     call imex_step_setup()
     call itw2(4, 1)
+    if (advb_on) then                      ! CPU 746cb6f7: the step's advective buoyancy change in the corrector rhs
+      call itw2(30, 0)
+      if (stage == imex_stage_pred) then
+        call advb_save()                   ! rho1 at level n
+      else
+        call advb_rhs(dt)                  ! advb_mem = dps - X, the corrector's memory term
+      endif
+      call itw2(30, 1)
+    endif
     if (stage_on) then
       call solve_stage_fast(stage, dtau, cfbak)
       call itw(1 + stage, 1)
@@ -1470,6 +1509,355 @@ contains
       enddo
     enddo
   end subroutine stage_increment
+
+  !======================================================================
+  ! imex_corr_adv = 1: the step's advective buoyancy change in the corrector rhs (CPU 746cb6f7, 6e675129:
+  ! imex_advb_save, imex_advb_rhs; IMEX_ADVECTIVE_BUOYANCY.md). The same expressions, operand order and
+  ! update order as the CPU's; the CPU's row-by-row passes are three kernels here (u-faces, v-faces,
+  ! cells), and columns with act = 0 (deep land among them) are skipped: X is 0 there and PF_START_RHS
+  ! does not read the memory term
+  !======================================================================
+  subroutine advb_save()
+    ! CPU imex_advb_save (predictor solve): advb_rn := rho1 at level n (rho_eos(nrhs) of the predictor; the
+    ! corrector's rho_eos after set_HUV1 overwrites it with b*), for b* - b^n in advb_rhs. Interior.
+    integer(ip) :: i, j, k, nx, ny, nz, is, ie, js, je
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    if (.not. allocated(advb_rn)) then
+      is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+      allocate(advb_rn(is:ie, js:je, nz), advb_bs(is:ie, js:je, nz), advb_mem(is:ie, js:je, nz))
+      allocate(advb_fxs(is:ie, js:je, nz), advb_fxr(is:ie, js:je, nz), advb_fes(is:ie, js:je, nz))
+      allocate(advb_fer(is:ie, js:je, nz), advb_sfu(is:ie, js:je), advb_sfv(is:ie, js:je))
+      allocate(advb_dg(is:ie, js:je, 6))
+      call zero3(advb_rn); call zero3(advb_bs); call zero3(advb_mem)
+      call zero3(advb_fxs); call zero3(advb_fxr); call zero3(advb_fes); call zero3(advb_fer)
+      CUF_DO2
+      do j = js, je
+        do i = is, ie
+          advb_sfu(i, j) = 0.0_rp; advb_sfv(i, j) = 0.0_rp
+          do k = 1, 6
+            advb_dg(i, j, k) = 0.0_rp
+          enddo
+        enddo
+      enddo
+    endif
+    CUF_DO2
+    do j = 1, ny
+      do i = 1, nx
+        if (act(i, j) > 0.0_rp) then
+          do k = 1, nz
+            advb_rn(i, j, k) = rho1(i, j, k)
+          enddo
+        endif
+      enddo
+    enddo
+  end subroutine advb_save
+
+  subroutine advb_rhs(dts)
+    ! CPU imex_advb_rhs (corrector solve, before its rhs): advb_mem := dps - X, the memory term that
+    ! replaces dps (hs1) in the corrector rhs (PF_START_RHS), with (eta units, eta = db/N2)
+    !   X  = sqrt(s) act [ n2c dts (A(b*; F, W) - A(b_ref; PF, W_PF)) - NW ],   NW = n2c (b* - b^n) - dps.
+    ! b = -g rho1/rho0 (as b_ref); b* from rho1 (rho_eos(nrhs) after set_HUV1), b^n from advb_save.
+    ! A(q; F, W) = -pm pn/Hz sum_faces F (q_face - q_cell): the UP3 face value of the tracer corrector
+    !   (masked differences, the edge extrapolation at physical edges, the land-curvature rule, the inflow
+    !   term at open edges; CPU uflux, vfx) and the thickness-aware U3 interface value (CPU u3col); a
+    !   constant q has A = 0. (Written out in the kernels: as module device functions called from these
+    !   CUF kernels, nvfortran 25.9 stopped with 'invalid forward reference to function ... with wrong
+    !   type' in NVVM.)
+    ! F = FlxU, FlxV (set_HUV1; land and river faces left out through umask, vmask), W = We + Wi (omega
+    !   after set_HUV1); X = 0 where dts pm pn |W|/min(Hz) at either interface of a cell exceeds advb_czmax
+    !   (the explicit U3 estimate overshoots there; CPU 6e675129). PF = F with its column mean removed per
+    !   face as rhs_transport does (closed faces 0), W_PF its column recursion (0 at the bottom and top).
+    ! sqrt(s) = 1/ad_n2k (imex_n2_taper). imex_verbose >= 2: the IMEX_ADVB lines (rms of NW, X, dps and
+    ! max |X| over the act > 0 cells; where max |X| is, global i, j, k, from the rank that holds it).
+    real(rp), intent(in) :: dts
+    integer(ip) :: i, j, k, nx, ny, nz, i0, i1, j0, j1, lim, west, east, south, north, lw, le, ow, oe, dg
+    integer(ip) :: km, kk, m
+    real(rp) :: ga, dtl, sf, f, fr, mk, as, ar, rt, nw, x, qs, qr, ws, wsm, wr, wrm, fzs, fzsm, fzr, fzrm
+    real(rp) :: cz, czm, fsr, fsl, frr, frl, fsn, fss, frn, frs, hkm, hkp2, s1, s2, s3, s4, xm, ax
+    real(rp) :: mm1, m0, mp1, qm2, qm1, q0, qp1, qp2, ff, d0, dm, dp, cl, cr, fx
+    real(rp) :: hk0, hkp, rh0, rhm, rhp, cpk, cmk, dl0, dlm, dlp, tl, tpl, tmn
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    ga = -g / rho0
+    dtl = dts
+    dg = merge(1_ip, 0_ip, imex_verbose >= 2)
+    call open_edge_codes(west, east, south, north)
+    ! b* on the tile's cells and the ghost row/column at physical edges (rho_eos's range, which fills it
+    ! from the boundary tracers; deep land as rho_eos skips it), then the halos
+    i0 = 1; i1 = nx; j0 = 1; j1 = ny
+    if (decomp%edge_w) i0 = 0
+    if (decomp%edge_e) i1 = nx + 1
+    if (decomp%edge_s) j0 = 0
+    if (decomp%edge_n) j1 = ny + 1
+    lim = dry_lim(G_EOS)
+    CUF_DO2
+    do j = j0, j1
+      do i = i0, i1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
+        do k = 1, nz
+          advb_bs(i, j, k) = ga * rho1(i, j, k)
+        enddo
+      enddo
+    enddo
+    call halo_fill_3d(advb_bs, STAGGER_RHO)
+    ! u-faces of the cells with act > 0: the column sum of FlxU (PF), the fluxes of b* with F = FlxU umask
+    ! and of b_ref with PF (CPU urow, uflux)
+    CUF_DO2
+    do j = 1, ny
+      do i = 1, nx + 1
+        if (act(i - 1, j) > 0.0_rp .or. act(i, j) > 0.0_rp) then
+          lw = 0; le = 0; ow = 0; oe = 0
+          if (west >= 1 .and. i == 1) lw = 1
+          if (east >= 1 .and. i == nx + 1) le = 1
+          if (west == 2 .and. i == 1) ow = 1
+          if (east == 2 .and. i == nx + 1) oe = 1
+          sf = 0.0_rp
+          do k = 1, nz
+            sf = sf + FlxU(i, j, k)
+          enddo
+          advb_sfu(i, j) = sf
+          do k = 1, nz
+            mk = umask(i, j)
+            f = FlxU(i, j, k) * mk
+            fr = 0.0_rp
+            if (cx(i, j) > 0.0_rp) fr = FlxU(i, j, k) - 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * sf * rshu(i, j)
+            mm1 = umask(i - 1, j); m0 = umask(i, j); mp1 = umask(i + 1, j)
+            do m = 1, 2                          ! b* with F, b_ref with PF (CPU uflux)
+              if (m == 1) then
+                qm2 = advb_bs(i - 2, j, k); qm1 = advb_bs(i - 1, j, k); q0 = advb_bs(i, j, k)
+                qp1 = advb_bs(i + 1, j, k); ff = f
+              else
+                qm2 = ad_bb(i - 2, j, k); qm1 = ad_bb(i - 1, j, k); q0 = ad_bb(i, j, k)
+                qp1 = ad_bb(i + 1, j, k); ff = fr
+              endif
+              d0 = (q0 - qm1) * m0
+              if (lw == 1) then
+                dm = d0
+              else
+                dm = (qm1 - qm2) * mm1
+              endif
+              if (le == 1) then
+                dp = d0
+              else
+                dp = (qp1 - q0) * mp1
+              endif
+              cl = d0 - dm
+              cr = dp - d0
+              cl = cl * mm1 * m0
+              cr = cr * m0 * mp1
+              fx = 0.5_rp * (q0 + qm1) * ff - advb_c6 * (cl * max(ff, 0.0_rp) + cr * min(ff, 0.0_rp))
+              if (ow == 1) fx = fx + 0.5_rp * (qm1 - q0) * max(ff, 0.0_rp)
+              if (oe == 1) fx = fx + 0.5_rp * (q0 - qm1) * min(ff, 0.0_rp)
+              if (m == 1) then
+                advb_fxs(i, j, k) = fx
+              else
+                advb_fxr(i, j, k) = fx
+              endif
+            enddo
+          enddo
+        endif
+      enddo
+    enddo
+    ! v-faces (CPU vrow, vfx)
+    CUF_DO2
+    do j = 1, ny + 1
+      do i = 1, nx
+        if (act(i, j - 1) > 0.0_rp .or. act(i, j) > 0.0_rp) then
+          lw = 0; le = 0; ow = 0; oe = 0
+          if (south >= 1 .and. j == 1) lw = 1
+          if (north >= 1 .and. j == ny + 1) le = 1
+          if (south == 2 .and. j == 1) ow = 1
+          if (north == 2 .and. j == ny + 1) oe = 1
+          sf = 0.0_rp
+          do k = 1, nz
+            sf = sf + FlxV(i, j, k)
+          enddo
+          advb_sfv(i, j) = sf
+          do k = 1, nz
+            mk = vmask(i, j)
+            f = FlxV(i, j, k) * mk
+            fr = 0.0_rp
+            if (cy(i, j) > 0.0_rp) fr = FlxV(i, j, k) - 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * sf * rshv(i, j)
+            mm1 = vmask(i, j - 1); m0 = vmask(i, j); mp1 = vmask(i, j + 1)
+            do m = 1, 2                          ! (CPU vfx)
+              if (m == 1) then
+                qm2 = advb_bs(i, j - 2, k); qm1 = advb_bs(i, j - 1, k); q0 = advb_bs(i, j, k)
+                qp1 = advb_bs(i, j + 1, k); ff = f
+              else
+                qm2 = ad_bb(i, j - 2, k); qm1 = ad_bb(i, j - 1, k); q0 = ad_bb(i, j, k)
+                qp1 = ad_bb(i, j + 1, k); ff = fr
+              endif
+              d0 = (q0 - qm1) * m0
+              if (lw == 1) then
+                dm = d0
+              else
+                dm = (qm1 - qm2) * mm1
+              endif
+              if (le == 1) then
+                dp = d0
+              else
+                dp = (qp1 - q0) * mp1
+              endif
+              cl = d0 - dm
+              cr = dp - d0
+              cl = cl * mm1 * m0
+              cr = cr * m0 * mp1
+              fx = 0.5_rp * (q0 + qm1) * ff - advb_c6 * (cl * max(ff, 0.0_rp) + cr * min(ff, 0.0_rp))
+              if (ow == 1) fx = fx + 0.5_rp * (qm1 - q0) * max(ff, 0.0_rp)
+              if (oe == 1) fx = fx + 0.5_rp * (q0 - qm1) * min(ff, 0.0_rp)
+              if (m == 1) then
+                advb_fes(i, j, k) = fx
+              else
+                advb_fer(i, j, k) = fx
+              endif
+            enddo
+          enddo
+        endif
+      enddo
+    enddo
+    ! cells: W_PF by the column recursion, the U3 interface fluxes, A(b*) - A(b_ref), X and the memory term
+    ! (CPU: the column loop of imex_advb_rhs; the transports at the faces formed again with the face
+    ! kernels' expressions)
+    CUF_DO2
+    do j = 1, ny
+      do i = 1, nx
+        s1 = 0.0_rp; s2 = 0.0_rp; s3 = 0.0_rp; s4 = 0.0_rp; xm = 0.0_rp; km = 0
+        if (act(i, j) > 0.0_rp) then
+          wsm = 0.0_rp; wrm = 0.0_rp; fzsm = 0.0_rp; fzrm = 0.0_rp; czm = 0.0_rp
+          do k = 1, nz
+            fsr = FlxU(i + 1, j, k) * umask(i + 1, j)
+            fsl = FlxU(i, j, k) * umask(i, j)
+            fsn = FlxV(i, j + 1, k) * vmask(i, j + 1)
+            fss = FlxV(i, j, k) * vmask(i, j)
+            frr = 0.0_rp; frl = 0.0_rp; frn = 0.0_rp; frs = 0.0_rp
+            if (cx(i + 1, j) > 0.0_rp) frr = FlxU(i + 1, j, k) - 0.5_rp * (Hz(i + 1, j, k) + Hz(i, j, k)) &
+                 * advb_sfu(i + 1, j) * rshu(i + 1, j)
+            if (cx(i, j) > 0.0_rp) frl = FlxU(i, j, k) - 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) &
+                 * advb_sfu(i, j) * rshu(i, j)
+            if (cy(i, j + 1) > 0.0_rp) frn = FlxV(i, j + 1, k) - 0.5_rp * (Hz(i, j + 1, k) + Hz(i, j, k)) &
+                 * advb_sfv(i, j + 1) * rshv(i, j + 1)
+            if (cy(i, j) > 0.0_rp) frs = FlxV(i, j, k) - 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) &
+                 * advb_sfv(i, j) * rshv(i, j)
+            ws = 0.0_rp; wr = 0.0_rp; fzs = 0.0_rp; fzr = 0.0_rp; cz = 0.0_rp
+            if (k < nz) then
+              wr = wrm - (frr - frl + frn - frs)
+              ws = We(i, j, k) + Wi(i, j, k)
+              cz = dtl * pm(i, j) * pn(i, j) * abs(ws) / min(Hz(i, j, k), Hz(i, j, k + 1))
+              ! the thickness-aware U3 interface value (CPU u3col; dl(0) = dl(nz) = 0, hkm = Hz(k) at k = 1,
+              ! hkp2 = Hz(k+1) at k = nz-1)
+              hk0 = Hz(i, j, k); hkp = Hz(i, j, k + 1)
+              hkm = hk0
+              if (k >= 2) hkm = Hz(i, j, k - 1)
+              hkp2 = hkp
+              if (k <= nz - 2) hkp2 = Hz(i, j, k + 2)
+              rh0 = 1.0_rp / max(hk0 + hkp, 1.0e-30_rp)
+              rhm = 0.0_rp
+              if (k >= 2) rhm = 1.0_rp / max(hkm + hk0, 1.0e-30_rp)
+              rhp = 0.0_rp
+              if (k <= nz - 2) rhp = 1.0_rp / max(hkp + hkp2, 1.0e-30_rp)
+              cpk = hk0 * hkp / max(hkm + hk0 + hkp, 1.0e-30_rp)
+              cmk = hk0 * hkp / max(hk0 + hkp + hkp2, 1.0e-30_rp)
+              kk = max(k - 1, 1_ip)
+              do m = 1, 2                        ! b* with W, b_ref with W_PF
+                if (m == 1) then
+                  qm1 = advb_bs(i, j, kk); q0 = advb_bs(i, j, k); qp1 = advb_bs(i, j, k + 1)
+                  qp2 = advb_bs(i, j, min(k + 2, nz)); ff = ws
+                else
+                  qm1 = ad_bb(i, j, kk); q0 = ad_bb(i, j, k); qp1 = ad_bb(i, j, k + 1)
+                  qp2 = ad_bb(i, j, min(k + 2, nz)); ff = wr
+                endif
+                dl0 = (qp1 - q0) * rh0
+                dlm = 0.0_rp
+                if (k >= 2) dlm = (q0 - qm1) * rhm
+                dlp = 0.0_rp
+                if (k <= nz - 2) dlp = (qp2 - qp1) * rhp
+                tl = (hkp * q0 + hk0 * qp1) * rh0
+                tpl = tl - cpk * (dl0 - dlm)
+                tmn = tl - cmk * (dlp - dl0)
+                fx = tpl * max(ff, 0.0_rp) + tmn * min(ff, 0.0_rp)
+                if (m == 1) then
+                  fzs = fx
+                else
+                  fzr = fx
+                endif
+              enddo
+            endif
+            qs = advb_bs(i, j, k); qr = ad_bb(i, j, k)
+            as = advb_fxs(i + 1, j, k) - qs * fsr - advb_fxs(i, j, k) + qs * fsl &
+               + advb_fes(i, j + 1, k) - qs * fsn - advb_fes(i, j, k) + qs * fss &
+               + fzs - qs * ws - fzsm + qs * wsm
+            ar = advb_fxr(i + 1, j, k) - qr * frr - advb_fxr(i, j, k) + qr * frl &
+               + advb_fer(i, j + 1, k) - qr * frn - advb_fer(i, j, k) + qr * frs &
+               + fzr - qr * wr - fzrm + qr * wrm
+            rt = -pm(i, j) * pn(i, j) / Hz(i, j, k) * (as - ar)
+            nw = ad_n2c(i, j, k) * ga * (rho1(i, j, k) - advb_rn(i, j, k)) - hs1(i, j, k)
+            x = act(i, j) / ad_n2k(i, j, k) * (ad_n2c(i, j, k) * dtl * rt - nw)
+            if (max(czm, cz) > advb_czmax) x = 0.0_rp
+            advb_mem(i, j, k) = hs1(i, j, k) - x
+            if (dg == 1) then
+              s1 = s1 + nw * nw; s2 = s2 + x * x; s3 = s3 + hs1(i, j, k)**2; s4 = s4 + 1.0_rp
+              ax = abs(x)
+              if (ax > xm) then
+                xm = ax; km = k
+              endif
+            endif
+            wsm = ws; wrm = wr; fzsm = fzs; fzrm = fzr; czm = cz
+          enddo
+        endif
+        if (dg == 1) then
+          advb_dg(i, j, 1) = s1; advb_dg(i, j, 2) = s2; advb_dg(i, j, 3) = s3; advb_dg(i, j, 4) = s4
+          advb_dg(i, j, 5) = xm; advb_dg(i, j, 6) = real(km, rp)
+        endif
+      enddo
+    enddo
+    if (dg == 1) call advb_line()
+  end subroutine advb_rhs
+
+  subroutine advb_line()
+    ! imex_verbose >= 2 (CPU imex_advb_rhs): IMEX_ADVB step, rms NW, rms X, rms dps, max|X| (rank 0), and
+    ! where max |X| is (global i, j, k: the first act > 0 cell in the CPU's j, i, k order with the rank's
+    ! max) from every rank whose max is the global one. The sums are in another order than the CPU's
+    ! (rounding level); the max is exact
+    integer(ip) :: i, j, nx, ny
+    real(rp) :: s1, s2, s3, s4, xm
+    real(8) :: loc(4), glob(4), xl(1), xg(1)
+    integer :: key, ig, jg, kg
+    nx = decomp%nx; ny = decomp%ny
+    s1 = 0.0_rp; s2 = 0.0_rp; s3 = 0.0_rp; s4 = 0.0_rp; xm = 0.0_rp
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, ny
+      do i = 1, nx
+        s1 = s1 + advb_dg(i, j, 1)
+        s2 = s2 + advb_dg(i, j, 2)
+        s3 = s3 + advb_dg(i, j, 3)
+        s4 = s4 + advb_dg(i, j, 4)
+        xm = max(xm, advb_dg(i, j, 5))
+      enddo
+    enddo
+    loc = [real(s1, 8), real(s2, 8), real(s3, 8), real(s4, 8)]
+    call comm_allreduce_sum(4, loc, glob)
+    xl(1) = real(xm, 8)
+    call comm_allreduce_max(1, xl, xg)
+    glob(4) = max(glob(4), 1.0_8)
+    if (talk) write(*,'(1x,A,I8,4ES12.4)') 'IMEX_ADVB step, rms NW, rms X, rms dps, max|X|:', iic, &
+         sqrt(glob(1) / glob(4)), sqrt(glob(2) / glob(4)), sqrt(glob(3) / glob(4)), xg(1)
+    if (xl(1) == xg(1) .and. xg(1) > 0.0_8) then
+      key = huge(1)
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = 1, ny
+        do i = 1, nx
+          key = min(key, merge(int((j - 1) * nx + i - 1), huge(1), advb_dg(i, j, 5) == xm))
+        enddo
+      enddo
+      j = key / nx + 1; i = mod(key, int(nx)) + 1
+      call sync_arch()
+      ig = int(decomp%i0 + i - 1); jg = int(decomp%j0 + j - 1); kg = nint(advb_dg(i, j, 6))
+      write(*,'(1x,A,I8,A,3I5)') 'IMEX_ADVB step', iic, ' max|X| at (i,j,k)', ig, jg, kg
+    endif
+  end subroutine advb_line
 
   !======================================================================
   ! Per-step setup: geometry, b_ref, coefficients
