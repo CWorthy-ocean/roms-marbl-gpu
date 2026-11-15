@@ -785,9 +785,9 @@ contains
     if (.not. shm_set) then
       shm_set = .true.
       shm_use = comm_shm_wanted()
-      if (shm_use) call comm_shm_init(ok)
-      if (talk) write(*,'(1x,a,l2)') 'IMEX_IGW: fs_gpu_opt 512: PCG reductions through shared memory (when the' &
-           // ' compute ranks share one node):', shm_use
+      ok = .false.
+      if (shm_use) call comm_shm_init(ok)   ! ok: the window is in use (else comm_fs_sum is MPI_Allreduce)
+      if (talk) write(*,'(1x,a,l2)') 'IMEX_IGW: fs_gpu_opt 512: PCG reductions through shared memory:', ok
     endif
     if (shm_use) then
       call comm_fs_sum(n, loc, glob)
