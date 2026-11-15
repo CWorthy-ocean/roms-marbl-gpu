@@ -725,7 +725,8 @@
     ! imex_gpu_stage = 1: PF_START with the stage rhs formed in the same
     ! column pass: r0 = 0 + act dts n2c D(F) (stage_increment; F = wk_fu,
     ! wk_fv of rhs_transport) - cfbak (hs1 + hs2) (predictor; the original's
-    ! dpw = dps + dp_corr) or - hs1 (corrector; dps), stored in r0; then
+    ! dpw = dps + dp_corr) or - hs1 (corrector; dps; with imex_corr_adv - advb_mem,
+    ! the CPU's dps - X), stored in r0; then
     ! rt, z and the sums as PF_START. The same expressions in the same
     ! order as stage_increment, imex_solve_stage and PF_START.
     real(rp), WORK_ATTR intent(inout) :: r0(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
@@ -745,6 +746,7 @@
     dtl = fs_dtl; cf = fs_cb; zr = fs_zero
     pr = merge(1_ip, 0_ip, stage == imex_stage_pred)
     if (pr == 1 .and. fs_dpw) pr = 2               ! dpw rescaled at this step's b_ref rebuild
+    if (pr == 0 .and. advb_on) pr = 3              ! imex_corr_adv: the memory term dps - X (advb_rhs)
     if (redu_on) then
 #ifdef USE_CUDA
       !$cuf kernel do(2) <<<*,*,0,work_stream>>>
@@ -765,6 +767,8 @@
               rr = rr - cf * (hs1(i, j, k) + hs2(i, j, k))
             else if (pr == 2) then
               rr = rr - cf * dpw(i, j, k)
+            else if (pr == 3) then
+              rr = rr - advb_mem(i, j, k)
             else
               rr = rr - hs1(i, j, k)
             endif
@@ -804,6 +808,8 @@
             rr = rr - cf * (hs1(i, j, k) + hs2(i, j, k))
           else if (pr == 2) then
             rr = rr - cf * dpw(i, j, k)
+          else if (pr == 3) then
+            rr = rr - advb_mem(i, j, k)
           else
             rr = rr - hs1(i, j, k)
           endif

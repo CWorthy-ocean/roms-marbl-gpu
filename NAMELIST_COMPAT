@@ -212,7 +212,13 @@
 # imex_obc_nmodes, imex_obc_q0 (0 off, or 0.2-1: sqrt(1 - f^2/omega0^2)
 # where f/omega0 > 0.6 at the edges where the internal tide enters),
 # imex_obc_cmin, imex_obc_mprint (OBCM/OBCF lines). The values the GPU refuses stop
-# the run at start-up. GPU tuning settings (roms_gpu only; a namelist that
+# the run at start-up. imex_corr_adv (code-only on the CPU as well, not in
+# its namelist template; ucla-roms PR for imex_corr_adv, branch
+# imex-advective-buoyancy, 746cb6f7 and 6e675129): 0 off, the default; 1 adds
+# the step's advective buoyancy change to the corrector rhs (IMEX_ADVB lines
+# at imex_verbose 2). On the GPU 1 needs the fused path (imex_pcg_start 2 or
+# 3, imex_pcg_fused 1, imex_warm 1, imex_gpu_stage, imex_gpu_sweep and
+# imex_gpu_redu on: the defaults); otherwise the run stops at start-up. GPU tuning settings (roms_gpu only; a namelist that
 # sets one stops UCLA ROMS): imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep
 # (on: deterministic sums, the fused stage, the restructured operator sweep),
 # and imex_gpu_timers (timing runs: 0 off, the default; 1 and 2 print IMEX_WIN

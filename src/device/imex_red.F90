@@ -49,7 +49,7 @@ module imex_red
        's.setup', 's.bc_exch', 's.rhs', 's.solve', 's.correct', 'p.start', 'p.zexch', 'p.ops', 'p.allreduce', &
        'p.up', 'p.finish', 'pred_transport', 'obc_faces', 'shift', 'corr_exch', 'visc3d', 'pre_step3d', &
        'step3d_uv2', 'fs_step', 'prsgrd', 'step', 'step3d_uv1', 'tracers_end', 'forces_pred', 'forces_corr', &
-       'geom_pred', 'x30']
+       'geom_pred', 's.advb']
 
 contains
 

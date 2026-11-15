@@ -227,6 +227,34 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- New IMEX key `imex_corr_adv` in `&imex_igw_settings` (default 0, off:
+  results unchanged bit for bit): the port of UCLA ROMS's key of the same
+  name (ucla-roms PR for `imex_corr_adv`, branch imex-advective-buoyancy,
+  746cb6f7 and 6e675129), code-only on both codes. With 1 the corrector
+  solve's rhs also gets the step's advective buoyancy change, X = n2c dt
+  [A(b*; F) - A(b_ref; PF)] - NW, with A the tracer corrector's own
+  advection (UP3 horizontal with its edge, land-curvature and open-edge
+  rules, U3 vertical), F the transport of `set_HUV1`, PF its projection,
+  and NW the predictor's non-wave change; X is 0 where the vertical
+  Courant number exceeds 1. Without it, an internal wave carried by a
+  current sees a pressure that lags its position, which limits the
+  advective Courant number of IMEX runs (on the CPU the key raises the
+  longest stable step by 5-20 % on the test domains). `imex_verbose = 2`
+  prints the CPU's `IMEX_ADVB` lines. On the GPU the key needs the default
+  fused IMEX path; other paths stop at start-up. Checked against UCLA ROMS
+  6e675129 (strict build, FP64 solver storage, tolerances 1e-12, 10 steps,
+  records every step): identical IMEX and free-surface iteration
+  sequences; sargasso 'modal' within 2.95 times the CPU's regular-to-
+  strict difference (2.91 with the key off); the California Current nest
+  ('modal', q0 0.789) within 6.5 times at a boundary-layer depth column
+  near its south-west open corner (11.3 there with the key off) and 4.8 in
+  salt in the San Francisco Bay estuary (4.0 with the key off), within 3.2
+  elsewhere (3.9 with the key off); the key's effect on each field (key on
+  minus key off) matches the CPU's to two digits; the `IMEX_ADVB` values
+  equal the CPU's in all printed digits, at the same cells. Exact restart
+  with the key on. Median step (A B B A after a warm-up run, Derecho
+  A100): sargasso 2x2 25.42 to 26.21 ms (+3.1 %), Pacific basin 8x1 on 2
+  nodes 141.2 to 147.8 ms (+4.7 %).
 - Forcing reader (`ROMS_GPU_FRC_READER=1`; `tools/submit_gpu.sh` adds the
   rank by default, `READER=0` leaves it out, and `tools/gpu_layout.py
   --reader` prints the layout with it): one more rank on every
