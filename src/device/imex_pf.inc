@@ -149,7 +149,7 @@
       if (mqs) then
         ps_mver(s) = coef_version; ps_mc2(s) = c2
       endif
-      if (opt_xhalo) then                          ! imex_gpu_opt 8: the ring is current already
+      if (xring_on .and. imex_fast_on) then        ! the ring is current already (ring_sides)
       else if (xring_on) then
         call pf_ring1_8(x)
       else
@@ -465,7 +465,7 @@
     real(PFK) :: ps, qs
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     md = mode; al = alpha; be = beta; c2l = c2
-    call ring_sides(rw, re, rs_, rn)                 ! imex_gpu_opt 8: x's ring updated too
+    call ring_sides(rw, re, rs_, rn)                 ! x's ring updated too (with xring_on)
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*,0,work_stream>>>
 #endif
@@ -839,7 +839,7 @@
     al = alpha; s = stage
     ipd = merge(1_ip, 0_ip, pend); imq = merge(1_ip, 0_ip, mqs)
     call ring_sides(rw, re, rs, rn)
-    if (pend .and. rw + re + rs + rn > 0) then       ! imex_gpu_opt 8: the last x update on the ring
+    if (pend .and. rw + re + rs + rn > 0) then       ! the last x update on the ring (ring_sides)
       mx = max(nx, ny)
       CUF_DO2
       do k = 1, nz
@@ -906,7 +906,7 @@
     integer(ip) :: i, j, k, nx, ny, nz
 #endif
 #if PFK == 4
-    if (opt_zring .and. xring_on) then             ! imex_gpu_opt 2: one round, one cell
+    if (xring_on .and. imex_fast_on) then          ! one round, one cell (pf_zring4)
       call pf_zring4(z)
       return
     endif

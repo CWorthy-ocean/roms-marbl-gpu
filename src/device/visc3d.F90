@@ -13,7 +13,7 @@ module visc3d_mod
   use uv_rhs, only: dump_vn3
   use arch_mod, only: sync_arch
   use geom, only: dump_rv3d
-  use imex_igw, only: imex_on, imex_mix_split, imex_solver_enabled, imex_opt_skip
+  use imex_igw, only: imex_on, imex_mix_split, imex_solver_enabled, imex_fast_on
   implicit none
   private
   public :: visc3d
@@ -21,7 +21,7 @@ module visc3d_mod
   ! imex_mix_split = 1: the velocity the Laplacian acts on (u, v points), the depth means of the
   ! step's increment and the face-thickness sums (split_vel)
   real(rp), WORK_ATTR allocatable :: uk3(:,:,:), vk3(:,:,:), dub(:,:), dvb(:,:)
-  ! imex_gpu_opt 1 (imex_opt_skip): split_vel only where a stress kernel reads uk3, vk3: within one
+  ! IMEX fused path (imex_fast_on): split_vel only where a stress kernel reads uk3, vk3: within one
   ! cell of mixact3 /= 0 (spact; everywhere when mix_lim = 0), and, with the dry skip on, not on deep
   ! land (spactd = spact colact); the stress kernels read one cell away and skip mixact3 = 0 and deep
   ! land themselves. Static maps, built at the first call
@@ -289,7 +289,7 @@ contains
       uk3 = 0.0_rp; vk3 = 0.0_rp; dub = 0.0_rp; dvb = 0.0_rp
     endif
     osk = 0; lsp = 0
-    if (imex_opt_skip) then
+    if (imex_fast_on) then
       if (.not. allocated(spact)) call split_map()
       osk = 1; lsp = dry_lim(G_MOM)
     endif
@@ -404,7 +404,7 @@ contains
   end subroutine split_vel
 
   subroutine split_map()
-    ! imex_gpu_opt 1: spact, spactd (see their declaration); host loop over the tile's arrays
+    ! spact, spactd (see their declaration); host loop over the tile's arrays
     integer(ip) :: i, j, ii, jj, is, ie, js, je
     integer(ip), allocatable :: h3(:,:), hc(:,:), hs(:,:), hd(:,:)
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je

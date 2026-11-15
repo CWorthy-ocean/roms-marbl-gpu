@@ -78,7 +78,7 @@ module imex_igw
                       comm_gpu_direct, comm_ring_dev8, comm_shm_init, comm_shm_wanted, comm_fs_sum, &
                       comm_fs_sum_stats
   use arch_mod, only: sync_arch
-  use imex_red, only: red_ensure, red_sum, red_part, it_set, itw, itw2, it_reb, red_set_split
+  use imex_red, only: red_ensure, red_sum, red_part, it_set, itw, itw2, it_reb
   use rivers_mod, only: river_on, rivers_pred_flx
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
@@ -168,22 +168,14 @@ module imex_igw
   ! here: declaration initial values in this module have crashed nvfortran 25.9, GPU_IMEX_MODAL_PORT.md
   ! sec. 9.6)
   integer     :: imex_gpu_timers
-  ! GPU only, working key of the optimization stages (GPU_IMEX_OPT_REVIEW.md sec. 2.3): bit mask of
-  ! levers on the default fused path (imex_gpu_stage, imex_gpu_sweep, imex_gpu_redu 1); 0 = the path
-  ! of roms-marbl-gpu dev 551565f. Bits: 1 the IMEX kernels skip deep land (the stock dry-column rule)
-  ! and the mixing split's velocity is formed only where a stress kernel reads it (imex_pgu, imex_pgv
-  ! are zero at deep land); 2 the FP32 z exchange of each PCG iteration in one round, one cell wide,
-  ! through the x exchange's real(8) ring (pf_zring4; with xring_on); 4 the deterministic sums' strided
-  ! partial sums on several multiprocessors above a tile size (imex_red red_kpart); 8 x's one-cell ring
-  ! kept current inside the fused solve, no x exchange at its end (with xring_on; ring_sides). Default 0,
-  ! set in
-  ! imex_read_namelist (no initial value: see imex_gpu_timers)
-  integer     :: imex_gpu_opt
-  integer, parameter :: OPT_BITS = 15                ! the bits implemented
-  ! imex_gpu_opt in effect: bit 1 (opt_skip; visc3d reads imex_opt_skip); pg_dz: the deep-land faces of
-  ! pgu, pgv were zeroed when the skip first applied
-  logical, public, protected :: imex_opt_skip
-  logical :: pg_dz, opt_zring, opt_xhalo
+  ! The default fused path in effect (imex_gpu_stage, imex_gpu_sweep and imex_gpu_redu 1): imex_fast_on
+  ! (check_settings; visc3d reads it). On it the IMEX kernels skip deep land as the stock kernels do (the
+  ! dry-column rule; pgu, pgv are zeroed at deep-land faces once, when the skip first applies: pg_dz), the
+  ! mixing split's velocity is formed only where a stress kernel reads it (visc3d), and with the one-cell
+  ! x exchange (xring_on) the FP32 z of each PCG iteration goes through the x ring in one round
+  ! (pf_zring4) and x's ring is kept current inside the solve (ring_sides)
+  logical, public, protected :: imex_fast_on
+  logical :: pg_dz
   ! fs_gpu_opt bit 512 (decided at the first fused solve, pf_sum): the fused PCG's reductions through the
   ! shared-memory window when all compute ranks (1, 2 or 4) share a node (comm_fs_sum; MPI_Allreduce
   ! otherwise). IMEX makes the window itself (comm_shm_init; the free surface makes it only at its first
@@ -239,7 +231,7 @@ module imex_igw
        imex_redu, imex_rst_state, imex_mix_split, &
        imex_obc_mode, imex_obc_nmodes, imex_obc_q0, imex_obc_tref, &
        imex_obc_mprint, imex_obc_cmin, &
-       imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep, imex_gpu_timers, imex_gpu_opt
+       imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep, imex_gpu_timers
 
   ! Weights (set_derived_weights): regular step and first step of a run
   real(rp) :: wpg_pred(2), wflx_pred(3), wpg_corr(3), wrhs_corr(4)
@@ -391,7 +383,7 @@ contains
     talk = (comm_world_rank() == 0)
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
     imex_gpu_timers = 0                  ! the default (see the declaration)
-    imex_gpu_opt = 0; imex_opt_skip = .false.; pg_dz = .false.; opt_zring = .false.; opt_xhalo = .false.
+    imex_fast_on = .false.; pg_dz = .false.
     shm_set = .false.; shm_use = .false.
     rewind(unit)
     msg = ''
@@ -550,7 +542,6 @@ contains
                .and. imex_theta_p > 0.0_rp .and. imex_theta_c > 0.0_rp
     if (imex_gpu_sweep < 0 .or. imex_gpu_sweep > 1) call bad('imex_gpu_sweep must be 0 or 1')
     if (imex_gpu_timers < 0 .or. imex_gpu_timers > 2) call bad('imex_gpu_timers must be 0, 1 or 2')
-    if (imex_gpu_opt < 0 .or. iand(imex_gpu_opt, not(OPT_BITS)) /= 0) call bad('imex_gpu_opt: unknown bits')
     sweep_on = (imex_gpu_sweep == 1) .and. pf_on
     ! 'modal' on the GPU (obm_decide): the face term lives in the restructured sweep (PF_OPS), the face
     ! values in the fused stage (solve_stage_fast); imex_pcg_start 0 (apply_m, CPU's unfused operator)
@@ -559,11 +550,7 @@ contains
     if (trim(imex_obc_mode) == 'modal' .and. .not. obm_gpu_ok) call bad("imex_obc_mode = 'modal' on the GPU" &
          // ' needs imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm 1, theta_p, theta_c > 0, imex_gpu_stage 1' &
          // ' and imex_gpu_sweep 1')
-    if (imex_gpu_opt /= 0 .and. .not. (stage_on .and. sweep_on .and. redu_on)) call bad('imex_gpu_opt /= 0 needs' &
-         // ' the default fused path (imex_gpu_stage, imex_gpu_sweep, imex_gpu_redu 1 in effect)')
-    imex_opt_skip = iand(imex_gpu_opt, 1) /= 0
-    opt_zring = iand(imex_gpu_opt, 2) /= 0
-    call red_set_split(iand(imex_gpu_opt, 4) /= 0)
+    imex_fast_on = stage_on .and. sweep_on .and. redu_on
     if (nerr > 0) error stop 'imex_igw: unsupported &imex_igw_settings (see above)'
   contains
     subroutine bad(what)
@@ -612,9 +599,9 @@ contains
          '  imex_solver_prec =', pf_prec
     if (imex_solver_prec /= pf_prec) write(*,'(3x,a)') 'imex_solver_prec = 4 needs imex_pcg_fused = 1 in effect:' &
          // ' imex_solver_prec = 8'
-    write(*,'(3x,a,i2,a,i2,a,i2,a,i2,a,i6)') 'imex_gpu_redu =', imex_gpu_redu, &
+    write(*,'(3x,a,i2,a,i2,a,i2,a,i2)') 'imex_gpu_redu =', imex_gpu_redu, &
          '  imex_gpu_stage =', merge(1, 0, stage_on), '  imex_gpu_sweep =', merge(1, 0, sweep_on), &
-         '  imex_gpu_timers =', imex_gpu_timers, '  imex_gpu_opt =', imex_gpu_opt
+         '  imex_gpu_timers =', imex_gpu_timers
     write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_redu =', imex_redu, '  imex_rst_state =', imex_rst_state, &
          '  imex_mix_split =', imex_mix_split
     write(*,'(3x,a,a,a)') "imex_obc_mode = '", trim(imex_obc_mode), "' (resolved at the first step: 'auto'" &
@@ -678,7 +665,6 @@ contains
     if (redu_on) call red_ensure(decomp%nx * decomp%ny)
     xring_on = stage_on .and. (comm_gpu_direct .or. .not. any([decomp%nbr_w, decomp%nbr_e, &
                decomp%nbr_s, decomp%nbr_n] >= 0))
-    opt_xhalo = xring_on .and. iand(imex_gpu_opt, 8) /= 0
     if (sweep_on) then
       allocate(op_sgu(is:ie, js:je), op_sgv(is:ie, js:je)); op_sgu = 0.0_rp; op_sgv = 0.0_rp
     endif
@@ -732,8 +718,8 @@ contains
     integer(ip) :: i, j, k, is, ie, js, je, nz, n, lmd
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je; nz = decomp%nz
     n = nstp
-    if (imex_opt_skip) then
-      ! imex_gpu_opt 1: one thread per column, deep land skipped (its u, v are constant)
+    if (imex_fast_on) then
+      ! one thread per column, deep land skipped (its u, v are constant)
       lmd = dry_lim(G_MOM)
 #ifdef USE_CUDA
       !$cuf kernel do(2) <<<*,*>>>
@@ -876,10 +862,10 @@ contains
       sc = ipg_n; s1 = ipg_nm1; s2 = ipg_nm1
       w1 = wpg_pred(1); w2 = wpg_pred(2); w3 = 0.0_rp
     endif
-    ! imex_gpu_opt 1: deep-land faces skipped (G_PGF, as prsgrd); their stores are zeroed once, when the
+    ! fused path: deep-land faces skipped (G_PGF, as prsgrd); their stores are zeroed once, when the
     ! skip first applies, so that the restart files hold zeros there whatever the run's history
     lmd = 0
-    if (imex_opt_skip) lmd = dry_lim(G_PGF)
+    if (imex_fast_on) lmd = dry_lim(G_PGF)
     if (lmd > 0 .and. .not. pg_dz) then
 #ifdef USE_CUDA
       !$cuf kernel do(2) <<<*,*>>>
@@ -976,7 +962,7 @@ contains
     n_new = nnew; n_stp = nstp
     call itw(15, 0)
     lmd = 0
-    if (imex_opt_skip) lmd = dry_lim(G_MOM)   ! imex_gpu_opt 1: deep land skipped
+    if (imex_fast_on) lmd = dry_lim(G_MOM)    ! fused path: deep land skipped
     w1 = wflx_pred(1); w2 = wflx_pred(2); w3 = wflx_pred(3)
     first = merge(1_ip, 0_ip, is_first_time_step())
     i_v0 = 1; i_v1 = nx; j_u0 = 1; j_u1 = ny
@@ -1505,7 +1491,7 @@ contains
     endif
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     lmd = 0
-    if (imex_opt_skip) lmd = dry_lim(G_MOM)   ! imex_gpu_opt 1: deep land skipped (constant Hz)
+    if (imex_fast_on) lmd = dry_lim(G_MOM)    ! fused path: deep land skipped (constant Hz)
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
@@ -3095,15 +3081,15 @@ contains
   ! Whole-array helpers (halos included)
   !======================================================================
   subroutine ring_sides(rw, re, rs, rn)
-    ! imex_gpu_opt 8 in effect (opt_xhalo, which needs xring_on): 1 on each side of the tile that has a
+    ! With the one-cell x exchange (xring_on) on the fused path: 1 on each side of the tile that has a
     ! neighbour (an MPI rank or the periodic self-wrap), whose ring cells pf_ring1_8 fills; 0 elsewhere
-    ! (physical edges, and every side when the bit is off). x on those ring cells is updated by the solve
+    ! (physical edges; every side without xring_on). x on those ring cells is updated by the solve
     ! with the operands its owner uses (z exchanged exactly, p formed on the ring from it, the same alpha),
     ! so it stays equal to the owner's value; corners and physical-edge ghosts are left as they are, as
     ! pf_ring1_8 leaves them
     integer(ip), intent(out) :: rw, re, rs, rn
     rw = 0; re = 0; rs = 0; rn = 0
-    if (.not. opt_xhalo) return
+    if (.not. (xring_on .and. imex_fast_on)) return
     if (decomp%nbr_w /= NBR_NONE) rw = 1
     if (decomp%nbr_e /= NBR_NONE) re = 1
     if (decomp%nbr_s /= NBR_NONE) rs = 1
@@ -3111,7 +3097,7 @@ contains
   end subroutine ring_sides
 
   subroutine pf_zring4(a)
-    ! imex_gpu_opt 2 (xring_on): the halo of the real(4) z one cell wide, without corners, in one round:
+    ! xring_on: the halo of the real(4) z one cell wide, without corners, in one round:
     ! the tile's four edge rows converted to real(8) (exact) into the x exchange's ring buffers, one
     ! comm_ring_dev8 call, converted back (exact). The values the operator reads (one cell, no corners)
     ! are those of pf_zexch4's exchange through wk_z; physical-edge ghosts and corners are left as they

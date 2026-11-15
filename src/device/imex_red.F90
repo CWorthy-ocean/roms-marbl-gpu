@@ -16,15 +16,14 @@ module imex_red
 #endif
   implicit none
   private
-  public :: red_ensure, red_sum, red_set_split
+  public :: red_ensure, red_sum
   public :: it_set, itw, itw2, it_step, it_reb, it_print
   integer, parameter :: RED_NT = 512, RED_MAXS = 4
-  ! imex_gpu_opt 4 (red_set_split): above RED_SPLIT_MIN columns the RED_NT strided sums run in RED_NT/RED_PW
+  ! Above RED_SPLIT_MIN columns the RED_NT strided sums run in RED_NT/RED_PW
   ! blocks of RED_PW threads (red_kpart, one partial per thread into red_tmp), the tree in a second
   ! one-block kernel (red_ktree): the same additions in the same order as red_kernel, on several
   ! multiprocessors instead of one
   integer, parameter :: RED_PW = 32, RED_SPLIT_MIN = 65536
-  logical :: red_split = .false.
 #ifdef USE_CUDA
   real(rp), device, allocatable, public :: red_part(:,:)
   real(rp), device, allocatable :: red_dres(:)
@@ -98,7 +97,7 @@ contains
   end subroutine red_kernel
 
   attributes(global) subroutine red_kpart(n, m, part, tmp)
-    ! imex_gpu_opt 4: red_kernel's strided sums, thread t of the grid = thread t of red_kernel
+    ! red_kernel's strided sums, thread t of the grid = thread t of red_kernel
     integer, value :: n, m
     real(rp), device, intent(in) :: part(n, RED_MAXS)
     real(rp), device :: tmp(RED_NT, RED_MAXS)
@@ -115,7 +114,7 @@ contains
   end subroutine red_kpart
 
   attributes(global) subroutine red_ktree(m, tmp, res)
-    ! imex_gpu_opt 4: red_kernel's shared-memory tree over the RED_NT sums of red_kpart
+    ! red_kernel's shared-memory tree over the RED_NT sums of red_kpart
     integer, value :: m
     real(rp), device, intent(in) :: tmp(RED_NT, RED_MAXS)
     real(rp), device :: res(RED_MAXS)
@@ -137,12 +136,6 @@ contains
   end subroutine red_ktree
 #endif
 
-  subroutine red_set_split(on)
-    ! imex_gpu_opt 4 (imex_igw check_settings)
-    logical, intent(in) :: on
-    red_split = on
-  end subroutine red_set_split
-
   subroutine red_sum(m, out)
     ! out(1:m) = the sums of red_part(:, 1:m) (after the kernels that wrote
     ! them on work_stream or the legacy default stream)
@@ -150,7 +143,7 @@ contains
     real(rp), intent(out) :: out(m)
 #ifdef USE_CUDA
     integer :: ierr
-    if (red_split .and. red_n >= RED_SPLIT_MIN) then
+    if (red_n >= RED_SPLIT_MIN) then
       call red_kpart<<<RED_NT / RED_PW, RED_PW, 0, work_stream>>>(red_n, m, red_part, red_tmp)
       call red_ktree<<<1, RED_NT, 0, work_stream>>>(m, red_tmp, red_dres)
     else
