@@ -227,10 +227,21 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
-- New IMEX key `imex_corr_adv` in `&imex_igw_settings` (default 0, off:
-  results unchanged bit for bit): the port of UCLA ROMS's key of the same
-  name (ucla-roms PR for `imex_corr_adv`, branch imex-advective-buoyancy,
-  746cb6f7 and 6e675129), code-only on both codes. With 1 the corrector
+- `imex_corr_adv` is now 1 by default, as in UCLA ROMS (ucla-roms branch
+  imex-corr-adv-default, 0595719e), so every IMEX run that does not set
+  the key gives different results; `imex_corr_adv = 0` gives the earlier
+  results bit for bit. On the CPU the key raised the longest stable step
+  by 20 % on the Sargasso Sea (from a developed state), 8-10 % on the
+  Hawaii nest and 5-10 % on the Gulf of Mexico nest, and it reduced the
+  change of the solution from dt to dt/2. On the GPU it costs 3-6 % per
+  step (bullet below). The key still needs the default fused IMEX path: a
+  namelist that asks for another path (for example `imex_gpu_stage = 0`)
+  now stops at start-up with a message to set `imex_corr_adv = 0`.
+- New IMEX key `imex_corr_adv` in `&imex_igw_settings` (added with
+  default 0, results unchanged bit for bit; 1 since the bullet above):
+  the port of UCLA ROMS's key of the same name (ucla-roms PR for
+  `imex_corr_adv`, branch imex-advective-buoyancy, 746cb6f7 and
+  6e675129), code-only on both codes. With 1 the corrector
   solve's rhs also gets the step's advective buoyancy change, X = n2c dt
   [A(b*; F) - A(b_ref; PF)] - NW, with A the tracer corrector's own
   advection (UP3 horizontal with its edge, land-curvature and open-edge

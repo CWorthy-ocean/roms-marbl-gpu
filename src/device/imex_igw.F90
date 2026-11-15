@@ -33,7 +33,8 @@ module imex_igw
   !
   ! Supported namelist values: the defaults, plus imex_solver_enabled,
   ! imex_allow_explicit (with the weights it allows), the weights, the
-  ! tolerances, imex_maxit, imex_verbose 0/1/2, imex_mix_split 0/1, imex_corr_adv 0/1 (1 on the fused path),
+  ! tolerances, imex_maxit, imex_verbose 0/1/2, imex_mix_split 0/1, imex_corr_adv 0/1 (1, the default, on the
+  ! fused path only),
   ! imex_n2_ref, imex_n2_taper, imex_bref_hours, imex_warm 0/1,
   ! imex_setup_lag 0/1, imex_rst_state 0/1, imex_obc_mode 'fixed'/'modal'/'auto'
   ! with imex_obc_nmodes, imex_obc_q0, imex_obc_tref, imex_obc_cmin,
@@ -196,13 +197,15 @@ module imex_igw
   ! unstable at C_igw > ~2.
   integer, public, protected :: imex_mix_split = 1
   ! CPU 746cb6f7, 6e675129 (branch imex-advective-buoyancy; IMEX_ADVECTIVE_BUOYANCY.md): the corrector rhs with
-  ! the step's advective buoyancy change, 0 off (default), 1 on (code-only key, as on the CPU). The corrector's
+  ! the step's advective buoyancy change, 1 on (the default since 2026-11, as on the CPU; it was 0), 0 off
+  ! (code-only key, as on the CPU). The corrector's
   ! implicit-level pressure is that of b* + db, and r0 = dt R(F) - dps holds only the wave-linearized part of
   ! the step's change, so with advection b* + db holds the predictor's non-wave change NW = b* - b^n - dps
   ! (about half a step of advection) instead of the step's. 1 adds X = n2c dt [A(b*; F) - A(b_ref; PF)] - NW
   ! (advb_rhs): A the tracer corrector's advection (UP3 horizontal with its edge and open-edge rules, U3
   ! vertical, advective form), F set_HUV1's transport, PF its projection; X = 0 where the vertical Courant
-  ! number exceeds 1. On the GPU only on the fused path (imex_fast_on; check_settings). The default is set in
+  ! number exceeds 1. On the GPU only on the fused path (imex_fast_on; check_settings: the unfused paths stop
+  ! and ask for imex_corr_adv = 0). The default is set in
   ! imex_read_namelist (no initial value here, see imex_gpu_timers)
   integer     :: imex_corr_adv
   logical     :: advb_on
@@ -403,7 +406,7 @@ contains
     talk = (comm_world_rank() == 0)
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
     imex_gpu_timers = 0                  ! the default (see the declaration)
-    imex_corr_adv = 0                    ! the default (see the declaration)
+    imex_corr_adv = 1                    ! the default (see the declaration)
     advb_on = .false.
     imex_fast_on = .false.; pg_dz = .false.
     shm_set = .false.; shm_use = .false.
@@ -575,10 +578,11 @@ contains
          // ' and imex_gpu_sweep 1')
     imex_fast_on = stage_on .and. sweep_on .and. redu_on
     ! imex_corr_adv: its memory term enters the fused stage's start-up (PF_START_RHS); the unfused stage
-    ! (imex_gpu_stage 0 and the paths that fall back to it) is not ported
-    if (imex_corr_adv == 1 .and. .not. imex_fast_on) call bad('imex_corr_adv = 1 on the GPU needs the fused' &
-         // ' stage: imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm 1, theta_p, theta_c > 0, imex_gpu_stage,' &
-         // ' imex_gpu_sweep and imex_gpu_redu 1')
+    ! (imex_gpu_stage 0 and the paths that fall back to it) is not ported. 1 is the default, so a run that
+    ! asks for an unfused path stops here and is told to set the key to 0 (no silent switch-off)
+    if (imex_corr_adv == 1 .and. .not. imex_fast_on) call bad('imex_corr_adv = 1 (the default) on the GPU' &
+         // ' needs the fused stage: imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm 1, theta_p, theta_c > 0,' &
+         // ' imex_gpu_stage, imex_gpu_sweep and imex_gpu_redu 1; set imex_corr_adv = 0 for the unfused path')
     advb_on = (imex_corr_adv == 1)
     if (nerr > 0) error stop 'imex_igw: unsupported &imex_igw_settings (see above)'
   contains
