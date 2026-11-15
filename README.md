@@ -505,6 +505,17 @@ v0.1.2-beta, bit for bit.
     1440 s against 12.5 (split, 900 s; 0.83) and 11.0 (implicit, 900 s).
     'modal' adds 0.3 % per step to 'fixed' on Pac and 5.7-6.8 % on the
     California Current nest (2x2, 1 node).
+- Tides (`&tidal_frc_settings`) cost less per step. The per-constituent
+  cos/sin of each call go to the device by one asynchronous copy instead
+  of through managed arrays that the host wrote and the first tide kernel
+  then faulted back (on the California Current nest that kernel took
+  0.26-0.29 ms; it now takes 0.01 ms). The second call of a step keeps
+  the tidal potential of the first, evaluated at the same time.
+  California Current nest with
+  IMEX (2x2, 1 node, 15 constituents, potential only): 17.72 to 16.68 ms
+  per step (-5.9 %); Pac (8x1, 2 nodes, boundary and potential tides):
+  156.4 to 155.9 ms (-0.3 %, within the run-to-run spread). Results are
+  unchanged, bit for bit.
 
 ## Numerics
 

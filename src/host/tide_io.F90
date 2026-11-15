@@ -18,6 +18,7 @@ module tide_io
   use arch_mod, only: sync_arch
   use halo_mod, only: halo_fill_2d
 #ifdef USE_CUDA
+  use cudafor, only: cudaMemcpyAsync, cudaMemcpyHostToDevice, cuda_stream_kind
   use cudadevice, only: __dmul_rn
 #endif
   implicit none
@@ -34,8 +35,22 @@ module tide_io
   real(rp), WORK_ATTR allocatable :: utide_r(:,:,:), utide_i(:,:,:)
   real(rp), WORK_ATTR allocatable :: vtide_r(:,:,:), vtide_i(:,:,:)
   real(rp), WORK_ATTR allocatable :: ptide_r(:,:,:), ptide_i(:,:,:)
-  real(rp), WORK_ATTR allocatable :: tide_c(:), tide_s(:)   ! per-step cos/sin per constituent (boundary)
-  real(rp), WORK_ATTR allocatable :: tide_cp(:), tide_sp(:) ! the same for the potential (always n+1/2)
+  ! Per-call cos/sin per constituent: tide_h(1:n) cos, (n+1:2n) sin at the
+  ! boundary time, (2n+1:3n), (3n+1:4n) at the potential's time. Computed on
+  ! the host, copied once per call into the device array tide_cs (an
+  ! asynchronous copy from host memory: no device synchronisation, and no
+  ! managed page that the host writes and the kernels then fault back).
+  real(rp), allocatable :: tide_h(:)
+#ifdef USE_CUDA
+  real(rp), device, allocatable :: tide_cs(:)
+#else
+  real(rp), allocatable :: tide_cs(:)
+#endif
+  ! The potential's coefficients of the last ptide sum; pot_done: ptide holds
+  ! that sum. Both calls of a step evaluate the potential at the same time,
+  ! so the second finds the same coefficients and keeps ptide.
+  integer(8), allocatable :: pot_last(:)   ! bit patterns
+  logical :: pot_done = .false.
 
   public :: read_tide_namelist
   public :: init_tides
@@ -103,7 +118,9 @@ contains
     if (ntides < 1) ntides = nrec
     ntides = min(ntides, max(nrec, 1))
     allocate(ftide(ntides))
-    allocate(tide_c(ntides), tide_s(ntides), tide_cp(ntides), tide_sp(ntides))
+    allocate(tide_h(4 * ntides), tide_cs(4 * ntides), pot_last(2 * ntides))
+    tide_h = 0.0_rp; tide_cs = 0.0_rp; pot_last = 0
+    pot_done = .false.
     call nc_get_1d(ncid, 'omega', ftide)
     if (bry_tides) then
       allocate(ztide_r(is:ie,js:je,ntides), ztide_i(is:ie,js:je,ntides))
@@ -152,8 +169,9 @@ contains
   end subroutine init_tides
 
   subroutine set_tides(bry_phase, pot_phase)
-    ! One small device kernel per constituent and target (c, s are
-    ! kernel arguments), in the same order as the host loops it replaces.
+    ! One device kernel per target (boundary rows, boundary columns, the
+    ! potential) sums the constituents in the order of the host loops they
+    ! replaced (same rounded products).
     ! bry_phase (units of dt, default 0.5): the boundary harmonics are at
     ! time + bry_phase*dt; pot_phase (default 0.5): the potential is at
     ! time + pot_phase*dt (n+1/2, where prsgrd uses it; the implicit free
@@ -162,14 +180,18 @@ contains
     ! since ab490df8), which runs from n to n+1 with the harmonics (2D
     ! boundary conditions) held fixed; with the implicit free surface the
     ! second call passes 1.0, its boundary data being at n+alpha_f (CPU
-    ! 6a2d56da; see the call in step_driver). The coefficients are
-    ! host-written managed arrays; the corrector call overwrites the
-    ! predictor's only after set_depth's device sync, so the predictor's
-    ! kernels have used them by then.
+    ! 6a2d56da; see the call in step_driver). The cos/sin coefficients go
+    ! to the device by a copy in stream order (the kernels' stream), so the
+    ! corrector call's copy lands after the predictor's kernels have read
+    ! theirs. The second call of a step finds the potential's coefficients
+    ! unchanged (same time) and keeps ptide.
     real(rp), intent(in), optional :: bry_phase, pot_phase
     integer(ip) :: it, i, j, nx, ny, ip, is, ie, js, je, n
     real(rp) :: omT, omTp, c, s, z0, v0, zw, ze, uw, ue, vw, ve, bphase, pphase
-    logical :: want_dump
+    logical :: want_dump, do_pot
+#ifdef USE_CUDA
+    integer :: ierr
+#endif
     if (.not. tides_ready) return
     bphase = 0.5_rp
     if (present(bry_phase)) bphase = bry_phase
@@ -186,17 +208,31 @@ contains
       v0 = vbar_north(ip)
     endif
     ! Host cos/sin per constituent (device cos/sin would differ in the last
-    ! bit); one kernel per target sums the constituents in the same order
-    ! as the per-constituent kernels it replaces (same rounded products).
-    do it = 1, ntides
+    ! bit).
+    n = ntides
+    do it = 1, n
       omT = ftide(it) * (time + bphase * dt)
       omTp = ftide(it) * (time + pphase * dt)   ! n+1/2; implicit FS fs_pot_time 'af': n+alpha_f
-      tide_c(it) = cos(omT)
-      tide_s(it) = sin(omT)
-      tide_cp(it) = cos(omTp)
-      tide_sp(it) = sin(omTp)
+      tide_h(it) = cos(omT)
+      tide_h(n + it) = sin(omT)
+      tide_h(2 * n + it) = cos(omTp)
+      tide_h(3 * n + it) = sin(omTp)
     enddo
-    n = ntides
+    ! ptide is a function of these coefficients alone (ptide_r, ptide_i are
+    ! fixed after init_tides): the same bits give the same ptide.
+    do_pot = pot_tides
+    if (pot_tides .and. pot_done) do_pot = any(transfer(tide_h(2 * n + 1:4 * n), pot_last) /= pot_last)
+    if (.not. bry_tides .and. .not. do_pot) then
+      if (want_dump) call sync_arch()
+      call dump_tide_north(z0, v0)
+      return
+    endif
+#ifdef USE_CUDA
+    ierr = cudaMemcpyAsync(tide_cs, tide_h, 4 * n, cudaMemcpyHostToDevice, 0_cuda_stream_kind)
+    if (ierr /= 0) error stop 'set_tides: cudaMemcpyAsync'
+#else
+    tide_cs = tide_h
+#endif
     if (bry_tides) then
 #ifdef USE_CUDA
       !$cuf kernel do(1) <<<*,*>>>
@@ -206,7 +242,7 @@ contains
         uw = ubar_west(j); ue = ubar_east(j)
         vw = vbar_west(j); ve = vbar_east(j)
         do it = 1, n
-          c = tide_c(it); s = tide_s(it)
+          c = tide_cs(it); s = tide_cs(n + it)
           zw = zw + TMUL(ztide_r(0, j, it), c) - TMUL(ztide_i(0, j, it), s)
           ze = ze + TMUL(ztide_r(nx + 1, j, it), c) - TMUL(ztide_i(nx + 1, j, it), s)
           uw = uw + TMUL(utide_r(1, j, it), c) - TMUL(utide_i(1, j, it), s)
@@ -226,7 +262,7 @@ contains
         uw = ubar_south(i); ue = ubar_north(i)
         vw = vbar_south(i); ve = vbar_north(i)
         do it = 1, n
-          c = tide_c(it); s = tide_s(it)
+          c = tide_cs(it); s = tide_cs(n + it)
           zw = zw + TMUL(ztide_r(i, 0, it), c) - TMUL(ztide_i(i, 0, it), s)
           ze = ze + TMUL(ztide_r(i, ny + 1, it), c) - TMUL(ztide_i(i, ny + 1, it), s)
           uw = uw + TMUL(utide_r(i, 0, it), c) - TMUL(utide_i(i, 0, it), s)
@@ -239,7 +275,7 @@ contains
         vbar_south(i) = vw; vbar_north(i) = ve
       enddo
     endif
-    if (pot_tides) then
+    if (do_pot) then
 #ifdef USE_CUDA
       !$cuf kernel do(2) <<<*,*>>>
 #endif
@@ -248,11 +284,13 @@ contains
           ! CPU tides.F90 writes ptide unmasked; prsgrd uses it on land.
           zw = 0.0_rp
           do it = 1, n
-            zw = zw + TMUL(ptide_r(i, j, it), tide_cp(it)) - TMUL(ptide_i(i, j, it), tide_sp(it))
+            zw = zw + TMUL(ptide_r(i, j, it), tide_cs(2 * n + it)) - TMUL(ptide_i(i, j, it), tide_cs(3 * n + it))
           enddo
           ptide(i, j) = zw
         enddo
       enddo
+      pot_last = transfer(tide_h(2 * n + 1:4 * n), pot_last)
+      pot_done = .true.
     endif
     if (want_dump) call sync_arch()
     call dump_tide_north(z0, v0)
