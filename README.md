@@ -351,6 +351,18 @@ v0.1.2-beta, bit for bit.
   at the seam after one step, tidal potential 0.37 m in zeta). Tidal
   fields read in that shape get the same fill. Forcing in the LLm+2 or
   2x-coarse shape is unchanged, bit for bit.
+- Rivers next to a tile seam: the split step no longer depends on the
+  tiling. On a seam the fast loop forms the free surface on the first
+  halo ring itself, from the transports one face beyond it, and sets the
+  river transport on the river faces there. A river face whose river cell
+  lies two cells beyond the seam (outside the tile's river scan) was not
+  listed, so the ring took the transport from the extrapolated ubar
+  instead. These faces now take the neighbour's river code at start-up.
+  Before, moving a tile cut next to a river cell changed the results at
+  round-off (Pac 8x1 with `tile_land_weight` 0.10 against 0.35: up to
+  2e-10 relative after 6 steps, around a Kuril island with river cells
+  next to the cut at xi 527); now they are bit-identical. Runs without
+  rivers, and seams with no such face, are unchanged, bit for bit.
 - `rho0` (`&rho0_settings`) is read at run time, as UCLA ROMS reads it:
   one binary runs any reference density. Before, it was a build constant
   (`-DROMS_RHO0`, default 1000), and a namelist with another value
