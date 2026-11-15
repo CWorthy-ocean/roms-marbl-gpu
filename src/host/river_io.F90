@@ -91,7 +91,8 @@ contains
     real(rp), allocatable :: ffrac(:), csg(:,:)
     integer, allocatable :: fglob(:), cell_of(:,:)
     integer(ip) :: iu_s2d0, iu_s2d1, jv_s2d0, jv_s2d1, iu_pre0, jv_pre0
-    integer :: nbad, maxidx, nwf
+    integer :: nbad, maxidx, nwf, nrg
+    real(rp), allocatable :: uh(:,:), vh(:,:)
     character(len=16) :: what
     real(rp) :: cyc
     logical :: lcyc
@@ -188,6 +189,7 @@ contains
     ! --- the faces (CPU calc_river_flux over the cells 0:nx+1, 0:ny+1)
     call sync_masks_to_host(rm, nx, ny)
     nfmax = 4 * count(rfrc > 0.0_rp) + 1
+    nfmax = nfmax + 2 * (nx + 2) + 2 * (ny + 2)
     if (win_faces) nfmax = nfmax + 2 * (nx + 1) + 2 * (ny + 1)
     allocate(fi(nfmax), fj(nfmax), ft(nfmax), fr(nfmax), fs(nfmax), ffrac(nfmax), fglob(nfmax))
     nf = 0; nbad = 0
@@ -218,8 +220,11 @@ contains
       enddo
     enddo
     if (nbad > 0) error stop 'init_rivers: invalid river locations (see above)'
-    nwf = 0
+    nwf = 0; nrg = 0
+    call exchange_codes()
+    call add_ring_faces()
     if (win_faces) call add_win_faces()
+    deallocate(uh, vh)
 
     ! --- local rivers (the order of first appearance)
     allocate(loc_of(nriver_f), glob(max(nf, 1)))
@@ -318,14 +323,82 @@ contains
     enddo
     call rivers_set_map(rmap(1:ntp))
     deallocate(rmap)
-    write(*,'(a,i0,a,i0,a,i0,a,i0,a,i0,a,a,a,i0,a)') 'rivers: rank ', comm_rank(), '  faces ', nf, &
+    write(*,'(a,i0,a,i0,a,i0,a,i0,a,i0,a,a,a,i0,a,i0)') 'rivers: rank ', comm_rank(), '  faces ', nf, &
          '  cells ', nc, '  rivers ', nloc, '  fast-loop faces next to an edge ', nrf_s2d, &
-         '  (', trim(what), ', ', ncat, ' records)'
+         '  (', trim(what), ', ', ncat, ' records)  seam-ring faces from the neighbours ', nrg
     if (win_faces) write(*,'(a,i0,a,i0,a,i0,a)') 'rivers: rank ', comm_rank(), '  BGC window faces ', nrf_win, &
          ' (', nwf, ' of them in the outer halo, from the neighbours)'
     deallocate(ridx, rfrc, rm, loc_of, cell_of)
 
   contains
+
+    subroutine exchange_codes()
+      ! The codes riv_uflx/riv_vflx (10*iriver + frac) of every scanned face
+      ! in uh/vh, exchanged as the CPU's river markers (exchanged once), so
+      ! that the halo faces hold the owners' codes bit for bit.
+      real(rp), WORK_ATTR allocatable :: ucode(:,:), vcode(:,:)
+      integer :: mm
+      allocate(uh(decomp%is:decomp%ie, decomp%js:decomp%je), vh(decomp%is:decomp%ie, decomp%js:decomp%je))
+      uh = 0.0_rp; vh = 0.0_rp
+      do mm = 1, nf
+        if (ft(mm) == 1) then
+          uh(fi(mm), fj(mm)) = ffrac(mm) + 10 * fglob(mm)
+        else
+          vh(fi(mm), fj(mm)) = ffrac(mm) + 10 * fglob(mm)
+        endif
+      enddo
+      allocate(ucode(decomp%is:decomp%ie, decomp%js:decomp%je), vcode(decomp%is:decomp%ie, decomp%js:decomp%je))
+      call sync_arch()
+      ucode = uh; vcode = vh
+      call halo_fill_2d(ucode, int(STAGGER_RHO, ip))
+      call halo_fill_2d(vcode, int(STAGGER_RHO, ip))
+      call sync_arch()
+      uh = ucode; vh = vcode
+      deallocate(ucode, vcode)
+    end subroutine exchange_codes
+
+    subroutine add_ring_faces()
+      ! On an MPI seam step2d_pre forms zeta_new on the first halo ring and
+      ! DUon/DVom one face further (u faces 0 / nx+2, v faces 0 / ny+2),
+      ! where rivers_duon sets the river transport. The scan above finds
+      ! such a face only when its river cell is in 0:nx+1 x 0:ny+1, not when
+      ! the river cell is beyond the ring (-1, nx+2): those faces take the
+      ! neighbours' codes (RIV_RNG only: no river mask, no other stage, no
+      ! cell; rivers_huv's ranges exclude them), so the ring's zeta_new is
+      ! the owner's bit for bit, whatever the tiling.
+      logical, allocatable :: hu(:,:), hv(:,:)
+      integer :: mm, ii, jj, nf0
+      allocate(hu(decomp%is:decomp%ie, decomp%js:decomp%je), hv(decomp%is:decomp%ie, decomp%js:decomp%je))
+      hu = .false.; hv = .false.
+      do mm = 1, nf
+        if (ft(mm) == 1) then
+          hu(fi(mm), fj(mm)) = .true.
+        else
+          hv(fi(mm), fj(mm)) = .true.
+        endif
+      enddo
+      nf0 = nf
+      do jj = 0, ny + 1
+        if (.not. decomp%edge_w) then
+          if (.not. hu(0, jj) .and. abs(uh(0, jj)) > 1.0e-3_rp) call add_halo_face(1, 0, jj, uh(0, jj), RIV_RNG)
+        endif
+        if (.not. decomp%edge_e) then
+          if (.not. hu(nx + 2, jj) .and. abs(uh(nx + 2, jj)) > 1.0e-3_rp) &
+            call add_halo_face(1, nx + 2, jj, uh(nx + 2, jj), RIV_RNG)
+        endif
+      enddo
+      do ii = 0, nx + 1
+        if (.not. decomp%edge_s) then
+          if (.not. hv(ii, 0) .and. abs(vh(ii, 0)) > 1.0e-3_rp) call add_halo_face(2, ii, 0, vh(ii, 0), RIV_RNG)
+        endif
+        if (.not. decomp%edge_n) then
+          if (.not. hv(ii, ny + 2) .and. abs(vh(ii, ny + 2)) > 1.0e-3_rp) &
+            call add_halo_face(2, ii, ny + 2, vh(ii, ny + 2), RIV_RNG)
+        endif
+      enddo
+      nrg = nf - nf0
+      deallocate(hu, hv)
+    end subroutine add_ring_faces
 
     subroutine add_win_faces()
       ! BGC subcycling (UCLA ROMS bgcsub_window_tile): the window overrides
@@ -334,16 +407,12 @@ contains
       ! halo, or the boundary row at a physical edge). The scan above
       ! reaches the faces of the cells 0:nx+1 x 0:ny+1, so the u faces of
       ! the rows -1 and ny+2 and the v faces of the columns -1 and nx+2 are
-      ! missing: as the CPU (river markers exchanged once), the codes
-      ! riv_uflx/riv_vflx (10*iriver + frac) of every scanned face are
-      ! exchanged, and the halo faces take the neighbours' codes, so that
+      ! missing: they take the neighbours' codes (exchange_codes), so that
       ! iriver and frac are the owner's bit for bit. Every rank then forms
       ! the window's river transport of its halo faces itself, from the
       ! same river data (the CPU exchanges the sums instead: the same
       ! values). Scanned faces in the window's ranges get RIV_WIN, the
       ! halo faces RIV_WIN alone.
-      real(rp), WORK_ATTR allocatable :: ucode(:,:), vcode(:,:)
-      real(rp), allocatable :: uh(:,:), vh(:,:)
       integer(ip) :: ilo, ihi, jlo, jhi
       integer :: mm, ii, jj, nf0
       call window_ranges(ilo, ihi, jlo, jhi)
@@ -355,44 +424,26 @@ contains
           if (ii >= ilo .and. ii <= ihi .and. jj >= 1 .and. jj <= ny + 1) fs(mm) = ior(fs(mm), int(RIV_WIN, ip))
         endif
       enddo
-      allocate(ucode(decomp%is:decomp%ie, decomp%js:decomp%je), vcode(decomp%is:decomp%ie, decomp%js:decomp%je))
-      allocate(uh(decomp%is:decomp%ie, decomp%js:decomp%je), vh(decomp%is:decomp%ie, decomp%js:decomp%je))
-      uh = 0.0_rp; vh = 0.0_rp
-      do mm = 1, nf
-        if (ft(mm) == 1) then
-          uh(fi(mm), fj(mm)) = ffrac(mm) + 10 * fglob(mm)
-        else
-          vh(fi(mm), fj(mm)) = ffrac(mm) + 10 * fglob(mm)
-        endif
-      enddo
-      call sync_arch()
-      ucode = uh; vcode = vh
-      call halo_fill_2d(ucode, int(STAGGER_RHO, ip))
-      call halo_fill_2d(vcode, int(STAGGER_RHO, ip))
-      call sync_arch()
-      uh = ucode; vh = vcode
-      deallocate(ucode, vcode)
       nf0 = nf
       do jj = int(jlo), int(jhi)
         if (jj >= 0 .and. jj <= ny + 1) cycle
         do ii = 1, nx + 1
-          if (abs(uh(ii, jj)) > 1.0e-3_rp) call add_halo_face(1, ii, jj, uh(ii, jj))
+          if (abs(uh(ii, jj)) > 1.0e-3_rp) call add_halo_face(1, ii, jj, uh(ii, jj), RIV_WIN)
         enddo
       enddo
       do jj = 1, ny + 1
         do ii = int(ilo), int(ihi)
           if (ii >= 0 .and. ii <= nx + 1) cycle
-          if (abs(vh(ii, jj)) > 1.0e-3_rp) call add_halo_face(2, ii, jj, vh(ii, jj))
+          if (abs(vh(ii, jj)) > 1.0e-3_rp) call add_halo_face(2, ii, jj, vh(ii, jj), RIV_WIN)
         enddo
       enddo
       nwf = nf - nf0
-      deallocate(uh, vh)
     end subroutine add_win_faces
 
-    subroutine add_halo_face(typ, ii, jj, flx)
-      ! A face of the window's halo with the owner's code flx (RIV_WIN only:
-      ! no river mask, no other stage, no cell)
-      integer,  intent(in) :: typ, ii, jj
+    subroutine add_halo_face(typ, ii, jj, flx, bits)
+      ! A halo face with the owner's code flx and the stage bits given
+      ! (RIV_WIN or RIV_RNG alone: no river mask, no other stage, no cell)
+      integer,  intent(in) :: typ, ii, jj, bits
       real(rp), intent(in) :: flx
       integer :: iriver
       iriver = nint(flx / 10)
@@ -402,7 +453,7 @@ contains
         error stop 'init_rivers: halo river face'
       endif
       nf = nf + 1
-      fi(nf) = ii; fj(nf) = jj; ft(nf) = typ; fs(nf) = int(RIV_WIN, ip)
+      fi(nf) = ii; fj(nf) = jj; ft(nf) = typ; fs(nf) = int(bits, ip)
       fglob(nf) = iriver
       ffrac(nf) = flx - 10 * iriver
     end subroutine add_halo_face
