@@ -31,6 +31,15 @@
 # init_mode, write_passive), and in
 # &param_settings the keys n, nsub_x, nsub_e and ntrc_bio.
 #
+# Default change (after v0.1.3-beta): &tile_settings tile_land_weight, the
+# cost of a land cell against a wet cell in the default 'wet' tile balance,
+# now defaults by run: 0.10 with MARBL (nt_bgc > 0, as before), 0.35
+# without MARBL (was 0.10), including runs with only generic or CDR_LITE
+# passive tracers. A value >= 0 in the namelist is used as given; a start-up
+# line ('tiles: land weight ... from ...') names the weight and its source.
+# A multi-tile 'wet' run without MARBL and without the key gets new tile
+# cuts; tile_land_weight = 0.10 keeps the old ones.
+#
 # Periodic grids: the optional GPU-only group &periodic_settings with the
 # logicals ew_periodic, ns_periodic (UCLA ROMS sets the same with its cpp
 # keys EW_PERIODIC and NS_PERIODIC, param.F90 ew_periodic / ns_periodic,

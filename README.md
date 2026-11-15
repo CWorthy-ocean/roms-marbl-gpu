@@ -249,6 +249,24 @@ v0.1.2-beta, bit for bit.
   passes. It now counts the readers out as the model does, from the node
   index (`PALS_NODEID` or `SLURM_NODEID`). Other layouts bind as before;
   results are unchanged, bit for bit (binding only).
+- The 'wet' tile balance weights land by run: without MARBL a land cell
+  counts 0.35 of a wet cell (was 0.10), with MARBL it stays 0.10
+  (`&tile_settings tile_land_weight`; a value in the namelist is used as
+  given, and a start-up line names the weight and where it came from).
+  Kernels that also run over land weigh more without MARBL; MARBL's work
+  is per wet column. Median step on Derecho A100s, 0.10 to 0.35: Pac
+  physics-only split 106.0 to 102.6 ms (2 nodes, 8x1) and 72.5 to 69.7
+  ms (4 nodes, 16x1); Pac with IMEX 156.7 to 153.4 and 110.0 to 107.2
+  ms; the N2 nest with IMEX 18.9 to 17.9 ms (1 node, 2x2). MiniPac with
+  MARBL would have been 0.4 % slower at 0.35, Pac with MARBL 3 % slower
+  at 0.25, hence 0.10 there. Memory per GPU falls with 0.35 (Pac 8x1
+  IMEX 29.6 to 26.3 GB on the fullest GPU). A multi-tile 'wet' run
+  without MARBL that does not set the key gets new tile cuts. With the
+  implicit free surface or IMEX its results change at round-off; with
+  the split free surface they can too (Pac: 2e-10 relative after 6
+  steps, around a new tile edge that crosses islands).
+  `tile_land_weight = 0.10` keeps the old cuts. MARBL runs are
+  unchanged, bit for bit.
 
 - Averaged MARBL output as UCLA ROMS writes it from 0.13.0 (ucla-roms
   #400). `_bgc_avg` with `wrt_bgc_his = .false.`: the start-up state is

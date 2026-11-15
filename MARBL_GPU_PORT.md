@@ -788,7 +788,8 @@ tile areas, so the all-wet tile paced every phase.
   per wet cell, fitted on Pac within ~2 GB) is below 92% of the smallest
   device memory (`tile_max_mem_gb`, `tile_mem_cell_kb`, `tile_mem_wet_kb`;
   `tile_max_cells_ratio` is now off by default). Default land weight 0.10
-  (measured best).
+  (measured best; since 2026-11-14 the default for MARBL runs only, 0.35
+  without MARBL).
 - **Fast loop: one exchange per substep** instead of two: zeta_new is formed
   on the first halo ring of MPI seams (DUon/DVom one face further there)
   with the neighbour's arithmetic, so the mid-substep zeta exchange is gone

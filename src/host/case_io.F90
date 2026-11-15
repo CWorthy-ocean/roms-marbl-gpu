@@ -71,11 +71,13 @@ module case_io
   integer(ip), public :: case_npx = 1
   integer(ip), public :: case_npy = 1
   ! Tile balance: 'wet' (default) places the tile cuts from the land mask
-  ! so every tile carries about the same cost (wet columns plus
-  ! case_tile_land_weight per land cell), 'uniform' uses equal widths,
-  ! 'explicit' takes case_tile_xcut / case_tile_ycut from the namelist.
+  ! so every tile carries about the same cost (wet columns plus the land
+  ! weight per land cell), 'uniform' uses equal widths, 'explicit' takes
+  ! case_tile_xcut / case_tile_ycut from the namelist. The land weight is
+  ! &tile_settings tile_land_weight when set (>= 0), otherwise the rule in
+  ! tile_land_weight_rule (tile_cuts).
   character(len=16), public :: case_tile_balance = 'wet'
-  real(rp), public :: case_tile_land_weight = 0.10_rp   ! measured best on Pac with dry skip (2026-10-08)
+  real(rp), public :: case_tile_land_weight = -1.0_rp   ! < 0: not set in the namelist (read_tile_settings)
   ! Largest tile area allowed, as a multiple of the mean (memory scales with
   ! cells, not wet cells): the land weight is raised until the cuts comply.
   real(rp), public :: case_tile_max_cells = 0.0_rp   ! area cap (x mean), 0 = off
@@ -289,7 +291,8 @@ contains
   end subroutine read_periodic_settings
 
   subroutine read_tile_settings(unit)
-    ! Optional &tile_settings group (absent = 'wet' balance, land weight 0.25).
+    ! Optional &tile_settings group (absent = 'wet' balance, land weight from
+    ! tile_land_weight_rule). tile_land_weight < 0 or absent: the rule.
     integer, intent(in) :: unit
     integer :: ios
     character(len=512) :: msg
@@ -298,6 +301,7 @@ contains
     integer(ip) :: tile_xcut(64), tile_ycut(64)
     namelist /tile_settings/ tile_balance, tile_land_weight, tile_xcut, tile_ycut, tile_max_cells_ratio, &
          tile_max_mem_gb, tile_mem_cell_kb, tile_mem_wet_kb
+    case_tile_land_weight = -1.0_rp
     tile_balance = case_tile_balance; tile_land_weight = case_tile_land_weight
     tile_max_cells_ratio = case_tile_max_cells
     tile_max_mem_gb = case_tile_max_mem_gb
@@ -435,7 +439,8 @@ contains
     integer(ip) :: gnx, gny, i, j, k, l, ncells, nwet
     integer :: ncid
     real(rp), allocatable :: mask(:,:), cost(:,:)
-    real(rp) :: wland, tcost, cmax, cmean
+    real(rp) :: wland, w0, tcost, cmax, cmean
+    character(len=64) :: wsrc
     real(rp) :: ratio, memlim, mcell, mwet, memmax, mem
     integer :: cellmax, mx, my
     character(len=16) :: mode
@@ -456,7 +461,8 @@ contains
       mode = 'uniform'
     endif
     call nc_close(ncid)
-    wland = case_tile_land_weight
+    call tile_land_weight_rule(wland, wsrc)
+    w0 = wland
     select case (trim(mode))
     case ('explicit')
       xcut(0) = 0; xcut(npx) = gnx; ycut(0) = 0; ycut(npy) = gny
@@ -477,6 +483,7 @@ contains
       ! area within that multiple of the mean): raise the land weight
       ! until both hold.
       call tile_mem_model(memlim, mcell, mwet)
+      if (comm_rank() == 0) write(*,'(a,f6.3,a,a)') 'tiles: land weight ', w0, ' from ', trim(wsrc)
       do
         do j = 1, gny
           do i = 1, gnx
@@ -513,7 +520,7 @@ contains
       if (comm_rank() == 0) then
         write(*,'(a,f7.2,a,f7.2,a,f7.2,a,f7.2,a)') 'tiles: memory model ', mcell, ' kB per cell + ', mwet, &
              ' kB per wet cell; largest tile ', memmax, ' GB (limit ', memlim, ' GB)'
-        if (wland /= case_tile_land_weight) &
+        if (wland /= w0) &
              write(*,'(a,f6.3,a,f6.3,a)') 'tiles: land weight raised to ', wland, &
              ' to fit the memory / area limits (largest tile area ', ratio, ' x mean)'
         if (memlim > 0.0_rp .and. memmax > memlim) &
@@ -545,6 +552,30 @@ contains
     endif
     deallocate(mask, cost)
   end subroutine tile_cuts
+
+  subroutine tile_land_weight_rule(w, src)
+    ! Land weight of the 'wet' balance: the namelist's tile_land_weight when
+    ! set, otherwise 0.10 with MARBL and 0.35 without (measured on A100s,
+    ! 2026-11-14). MARBL's work is per wet column, so its runs
+    ! balance wet columns (MiniPac 2x2 +0.4 % per step at 0.35, Pac 8x1 +3 %
+    ! at 0.25 on 2026-10-08); without MARBL, kernels that also run over land
+    ! weigh more (Pac 8x1 / 16x1 -3 to -4 % split, -2 to -3 % IMEX, N2 -5 %
+    ! at 0.35). Passive tracers without MARBL (generic, CDR_LITE) take 0.35:
+    ! their transport is the same kind of work as T and S. Their storage
+    ! (wet columns only) enters the memory guard below like MARBL's.
+    real(rp), intent(out) :: w
+    character(len=*), intent(out) :: src
+    if (case_tile_land_weight >= 0.0_rp) then
+      w = case_tile_land_weight
+      src = 'the namelist (&tile_settings tile_land_weight)'
+    elseif (marbl_on) then
+      w = 0.10_rp
+      src = 'the default for MARBL runs'
+    else
+      w = 0.35_rp
+      src = 'the default for runs without MARBL'
+    endif
+  end subroutine tile_land_weight_rule
 
   subroutine tile_mem_model(memlim, mcell, mwet)
     ! Memory limit (GB) and model (kB per tile cell, kB per wet cell) of the
