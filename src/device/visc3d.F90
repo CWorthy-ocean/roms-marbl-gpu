@@ -13,7 +13,7 @@ module visc3d_mod
   use uv_rhs, only: dump_vn3
   use arch_mod, only: sync_arch
   use geom, only: dump_rv3d
-  use imex_igw, only: imex_on, imex_mix_split, imex_solver_enabled
+  use imex_igw, only: imex_on, imex_mix_split, imex_solver_enabled, imex_fast_on
   implicit none
   private
   public :: visc3d
@@ -21,6 +21,15 @@ module visc3d_mod
   ! imex_mix_split = 1: the velocity the Laplacian acts on (u, v points), the depth means of the
   ! step's increment and the face-thickness sums (split_vel)
   real(rp), WORK_ATTR allocatable :: uk3(:,:,:), vk3(:,:,:), dub(:,:), dvb(:,:)
+  ! IMEX fused path (imex_fast_on): split_vel only where a stress kernel reads uk3, vk3: within one
+  ! cell of mixact3 /= 0 (spact; everywhere when mix_lim = 0), and, with the dry skip on, not on deep
+  ! land (spactd = spact colact); the stress kernels read one cell away and skip mixact3 = 0 and deep
+  ! land themselves. Static maps, built at the first call
+#ifdef USE_CUDA
+  integer(ip), device, allocatable :: spact(:,:), spactd(:,:)
+#else
+  integer(ip), allocatable :: spact(:,:), spactd(:,:)
+#endif
 
 contains
 
@@ -267,7 +276,7 @@ contains
     ! Points 0..nx+1, 0..ny+1 (the stencil of the flux kernels); the CPU skips u point 0 at a west
     ! edge (v point 0 at a south edge), whose fluxes are not used.
     real(rp), parameter :: gamma2 = 1.0_rp   ! as obc.F90 (free slip, the only value on the GPU)
-    integer(ip) :: i, j, k, nx, ny, nz, n_new, n_stp, j0, i0
+    integer(ip) :: i, j, k, nx, ny, nz, n_new, n_stp, j0, i0, lsp, osk
     real(rp) :: cff, su, sh
     logical :: ow, oe, os, on, ew, ee, es, en
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
@@ -279,11 +288,23 @@ contains
       allocate(dub(decomp%is:decomp%ie, decomp%js:decomp%je), dvb(decomp%is:decomp%ie, decomp%js:decomp%je))
       uk3 = 0.0_rp; vk3 = 0.0_rp; dub = 0.0_rp; dvb = 0.0_rp
     endif
+    osk = 0; lsp = 0
+    if (imex_fast_on) then
+      if (.not. allocated(spact)) call split_map()
+      osk = 1; lsp = dry_lim(G_MOM)
+    endif
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 0, ny + 1
       do i = 0, nx + 1
+        if (osk > 0) then
+          if (lsp > 0) then
+            if (spactd(i, j) == 0) cycle
+          else
+            if (spact(i, j) == 0) cycle
+          endif
+        endif
         su = 0.0_rp; sh = 0.0_rp
         do k = 1, nz
           cff = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k))
@@ -306,6 +327,13 @@ contains
     do k = 1, nz
       do j = 0, ny + 1
         do i = 0, nx + 1
+          if (osk > 0) then
+            if (lsp > 0) then
+              if (spactd(i, j) == 0) cycle
+            else
+              if (spact(i, j) == 0) cycle
+            endif
+          endif
           uk3(i, j, k) = (u(i, j, k, n_new) / (0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k))) - dub(i, j)) * umask(i, j)
           vk3(i, j, k) = (v(i, j, k, n_new) / (0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k))) - dvb(i, j)) * vmask(i, j)
         enddo
@@ -374,6 +402,30 @@ contains
       enddo
     endif
   end subroutine split_vel
+
+  subroutine split_map()
+    ! spact, spactd (see their declaration); host loop over the tile's arrays
+    integer(ip) :: i, j, ii, jj, is, ie, js, je
+    integer(ip), allocatable :: h3(:,:), hc(:,:), hs(:,:), hd(:,:)
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    allocate(h3(is:ie, js:je), hc(is:ie, js:je), hs(is:ie, js:je), hd(is:ie, js:je))
+    h3 = mixact3; hc = colact
+    do j = js, je
+      do i = is, ie
+        hs(i, j) = 0
+        if (mix_lim == 0) hs(i, j) = 1
+        do jj = max(j - 1, js), min(j + 1, je)
+          do ii = max(i - 1, is), min(i + 1, ie)
+            if (h3(ii, jj) /= 0) hs(i, j) = 1
+          enddo
+        enddo
+        hd(i, j) = hs(i, j) * hc(i, j)
+      enddo
+    enddo
+    allocate(spact(is:ie, js:je), spactd(is:ie, js:je))
+    spact = hs; spactd = hd
+    deallocate(h3, hc, hs, hd)
+  end subroutine split_map
 
   subroutine dump_visc(k)
     ! visc3d V increment at P1 neighbors. wrk2d/wrk2b are VFx/VFe.

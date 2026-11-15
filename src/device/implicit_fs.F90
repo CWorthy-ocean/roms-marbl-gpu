@@ -51,7 +51,7 @@ module implicit_fs_gpu
   use halo_mod, only: halo_fill_zuv_n
   use geom, only: set_depth
   use comm_mod, only: comm_allreduce_sum, comm_allreduce_max, comm_world_rank, comm_abort, comm_shm_init, comm_fs_sum, &
-       comm_fs_sum_stats
+       comm_fs_sum_stats, comm_shm_want
   use rivers_mod, only: river_on, rf_flx, rivers_fs_map
   use cdr_src_mod, only: cdr_vol_on, cdr_fs_src
   use run_timers, only: wall_time
@@ -82,6 +82,9 @@ contains
     talk = (comm_world_rank() == 0)
     rewind(unit)
     read(unit, nml=implicit_fs, iostat=ios, iomsg=msg)
+    ! fs_gpu_opt bit 512 for IMEX_IGW's PCG as well (its default when the group is absent or the mode is
+    ! 'split'); the free surface itself decides in fs_opt_flags
+    call comm_shm_want(iand(fs_gpu_opt, 512) /= 0)
     if (ios > 0) then
       do i = 1, len(msg)                     ! nvfortran pads iomsg with NULs (as nc_io's iomsg_text)
         if (iachar(msg(i:i)) < 32) msg(i:i) = ' '

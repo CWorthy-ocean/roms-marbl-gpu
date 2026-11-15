@@ -50,6 +50,7 @@
     broke = .false.; pend = .false.
     iters = 0; resid = 0.0_rp; tole = tol; bnorm = 0.0_rp; alpha = 0.0_rp; beta = 0.0_rp
     if (c2 <= 0.0_rp) return
+    call itw2(9, 0)
     if (warm .and. .not. reuse) &                 ! W M x0 into pf_mq(:,:,:,3) (FP64 operand and result)
       call PF_OP(0, 0.0_rp, 0.0_rp, c2l, x, pf_mq, z, pa, pb, x, q, rczk, czt, czb, cu, cv, hz, wr, ru, rv, pq)
     if (.not. warm) call zero3(x)
@@ -69,7 +70,8 @@
       call PF_START(r0, hv, pf_mq, 3_ip, 0.0_rp, dinv, s, z, s1, s2)
     endif
     loc = [real(s1, 8), real(s2, 8)]
-    call comm_allreduce_sum(2, loc, glob)
+    call pf_sum(2, loc, glob)
+    call itw2(9, 1)
     rho = glob(1); rho0 = glob(1)
     if (warm) then
       bnorm = glob(2)
@@ -91,7 +93,10 @@
     resid = 1.0_rp
     cur = 1                                        ! p of the last sweep 1: pa (1) or pb (2)
     do it = 1, imex_maxit
+      call itw2(10, 0)
       call PF_ZEXCH(z)                             ! one cell, no corners: all the operator reads
+      call itw2(10, 1)
+      call itw2(11, 0)
       mode = 2
       if (it == 1) mode = 1                        ! p = z
       if (cur == 1) then                           ! p_old in pa, p_new into pb
@@ -99,20 +104,27 @@
       else
         call PF_OP(mode, alpha, beta, c2l, x, pf_mq, z, pb, pa, x, q, rczk, czt, czb, cu, cv, hz, wr, ru, rv, pq)
       endif
+      call itw2(11, 1)
       cur = 3 - cur
       pend = .false.                               ! (x += alpha p_old done in the sweep)
       loc(1) = real(pq, 8)
-      call comm_allreduce_sum(1, loc(1:1), glob(1:1))
+      call itw2(12, 0)
+      call pf_sum(1, loc(1:1), glob(1:1))
+      call itw2(12, 1)
       pq = glob(1)
       if (.not. ieee_is_finite(pq) .or. pq <= 0.0_rp) then
         call breakdown('<p,Ap>', pq, it)
         exit
       endif
       alpha = rho / pq
+      call itw2(13, 0)
       call PF_UP(alpha, q, dinv, s, z, s1)
+      call itw2(13, 1)
       pend = .true.                                ! x += alpha p pending
       loc(1) = real(s1, 8)
-      call comm_allreduce_sum(1, loc(1:1), glob(1:1))
+      call itw2(12, 0)
+      call pf_sum(1, loc(1:1), glob(1:1))
+      call itw2(12, 1)
       iters = it
       if (.not. ieee_is_finite(glob(1)) .or. glob(1) < 0.0_8) then
         call breakdown('<r,M^-1 r>', glob(1), it)
@@ -124,6 +136,7 @@
       rho = glob(1)
     enddo
     if (fs_on) then                                ! imex_gpu_stage: the last x update, the stored
+      call itw2(14, 0)
       al = alpha                                   ! W M x, one-cell x exchange
       mqs = (pcg_start == 3 .and. imex_warm == 1)
       if (cur == 1) then
@@ -136,11 +149,13 @@
       if (mqs) then
         ps_mver(s) = coef_version; ps_mc2(s) = c2
       endif
-      if (xring_on) then
+      if (xring_on .and. imex_fast_on) then        ! the ring is current already (ring_sides)
+      else if (xring_on) then
         call pf_ring1_8(x)
       else
         call halo_fill_3d(x, STAGGER_RHO)
       endif
+      call itw2(14, 1)
       return
     endif
     if (pend) then                                 ! the last x += alpha p
@@ -444,12 +459,13 @@
     real(rp), WORK_ATTR intent(in) :: ru(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: rv(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), intent(out) :: pq
-    integer(ip) :: i, j, k, nx, ny, nz, md, inr
+    integer(ip) :: i, j, k, nx, ny, nz, md, inr, rw, re, rs_, rn
     real(rp) :: al, be, c2l, pr, sg, g, w, wm, dv, sv, qq, a, ca, rs(1), zcp, zck
     real(rp) :: fe, fw, fn, fs
     real(PFK) :: ps, qs
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     md = mode; al = alpha; be = beta; c2l = c2
+    call ring_sides(rw, re, rs_, rn)                 ! x's ring updated too (with xring_on)
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*,0,work_stream>>>
 #endif
@@ -458,6 +474,14 @@
         if (ad_act(i, j) > 0.0_rp) then
           inr = 0
           if (i >= 1 .and. i <= nx .and. j >= 1 .and. j <= ny) inr = 1
+          if (j >= 1 .and. j <= ny) then
+            if (i == 0 .and. rw == 1) inr = 1
+            if (i == nx + 1 .and. re == 1) inr = 1
+          endif
+          if (i >= 1 .and. i <= nx) then
+            if (j == 0 .and. rs_ == 1) inr = 1
+            if (j == ny + 1 .and. rn == 1) inr = 1
+          endif
           sg = 0.0_rp; zcp = 0.0_rp
           do k = nz, 1, -1
             if (md == 0) then
@@ -808,12 +832,37 @@
     real(rp), WORK_ATTR intent(in) :: r0(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
     real(rp), WORK_ATTR intent(in) :: hv(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
     integer, intent(in) :: stage
-    integer(ip) :: i, j, k, nx, ny, nz, s, ipd, imq
+    integer(ip) :: i, j, k, nx, ny, nz, s, ipd, imq, m, mx, rw, re, rs, rn
     real(rp) :: al
     if (.not. (pend .or. mqs)) return
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     al = alpha; s = stage
     ipd = merge(1_ip, 0_ip, pend); imq = merge(1_ip, 0_ip, mqs)
+    call ring_sides(rw, re, rs, rn)
+    if (pend .and. rw + re + rs + rn > 0) then       ! the last x update on the ring (ring_sides)
+      mx = max(nx, ny)
+      CUF_DO2
+      do k = 1, nz
+        do m = 1, mx
+          if (m <= ny) then
+            if (rw == 1) then
+              if (ad_act(0, m) > 0.0_rp) x(0, m, k) = x(0, m, k) + al * real(p(0, m, k), 8)
+            endif
+            if (re == 1) then
+              if (ad_act(nx + 1, m) > 0.0_rp) x(nx + 1, m, k) = x(nx + 1, m, k) + al * real(p(nx + 1, m, k), 8)
+            endif
+          endif
+          if (m <= nx) then
+            if (rs == 1) then
+              if (ad_act(m, 0) > 0.0_rp) x(m, 0, k) = x(m, 0, k) + al * real(p(m, 0, k), 8)
+            endif
+            if (rn == 1) then
+              if (ad_act(m, ny + 1) > 0.0_rp) x(m, ny + 1, k) = x(m, ny + 1, k) + al * real(p(m, ny + 1, k), 8)
+            endif
+          endif
+        enddo
+      enddo
+    endif
     CUF_DO3
     do k = 1, nz
       do j = 1, ny
@@ -857,6 +906,10 @@
     integer(ip) :: i, j, k, nx, ny, nz
 #endif
 #if PFK == 4
+    if (xring_on .and. imex_fast_on) then          ! one round, one cell (pf_zring4)
+      call pf_zring4(z)
+      return
+    endif
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     CUF_DO2
     do k = 1, nz

@@ -66,6 +66,7 @@ module imex_igw
                        rmask, umask, vmask, rho1, ru, rv, DU_avg1, DU_avg2, DU_avg_bak, &
                        DV_avg1, DV_avg2, DV_avg_bak, h, &
                        t_west, u_west, t_east, u_east, t_south, v_south, t_north, v_north
+  use gpu_state, only: colact, dry_lim, G_MOM, G_PGF
   use time_state, only: nstp, nnew, nrhs, iic, ntstart, ntimes, dt, is_first_time_step, ninfo_steps
   use formulas, only: g, rho0, AM3_crv, qp2, eos_r00, eos_r01, eos_r02, eos_r03, eos_r04, eos_r05, eos_r10, &
                       eos_r11, eos_r12, eos_r13, eos_r14, eos_rS0, eos_rS1, eos_rS2, eos_r20, eos_K00, eos_K01, &
@@ -74,9 +75,10 @@ module imex_igw
   use halo_mod, only: hg_begin, hg_add, hg_end, halo_fill_3d, halo_fill_3d_w, halo_fill_2d, &
                       F_U, F_V, F_FLXU, F_FLXV
   use comm_mod, only: comm_world_rank, comm_allreduce_sum, comm_allreduce_max, comm_allreduce_min, &
-                      comm_gpu_direct, comm_ring_dev8
+                      comm_gpu_direct, comm_ring_dev8, comm_shm_init, comm_shm_wanted, comm_fs_sum, &
+                      comm_fs_sum_stats
   use arch_mod, only: sync_arch
-  use imex_red, only: red_ensure, red_sum, red_part
+  use imex_red, only: red_ensure, red_sum, red_part, it_set, itw, itw2, it_reb
   use rivers_mod, only: river_on, rivers_pred_flx
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
@@ -160,6 +162,27 @@ module imex_igw
   ! face transports F formed in the cell kernel; sweep 2 skips land
   ! columns. 0: the session-2 kernels. Default 1 since session 3.
   integer     :: imex_gpu_sweep = 1
+  ! GPU only: timing windows (imex_red): 0 off (default; no synchronisation), 1 the IMEX hooks and
+  ! the phases of the step, 2 also the pieces inside the stage solve; IMEX_WIN lines at the last step.
+  ! Results are the same at 0, 1 and 2. The default is set in imex_read_namelist (no initial value
+  ! here: declaration initial values in this module have crashed nvfortran 25.9, GPU_IMEX_MODAL_PORT.md
+  ! sec. 9.6)
+  integer     :: imex_gpu_timers
+  ! The default fused path in effect (imex_gpu_stage, imex_gpu_sweep and imex_gpu_redu 1): imex_fast_on
+  ! (check_settings; visc3d reads it). On it the IMEX kernels skip deep land as the stock kernels do (the
+  ! dry-column rule; pgu, pgv are zeroed at deep-land faces once, when the skip first applies: pg_dz), the
+  ! mixing split's velocity is formed only where a stress kernel reads it (visc3d), and with the one-cell
+  ! x exchange (xring_on) the FP32 z of each PCG iteration goes through the x ring in one round
+  ! (pf_zring4) and x's ring is kept current inside the solve (ring_sides)
+  logical, public, protected :: imex_fast_on
+  logical :: pg_dz
+  ! fs_gpu_opt bit 512 (decided at the first fused solve, pf_sum): the fused PCG's reductions through the
+  ! shared-memory window when all compute ranks (1, 2 or 4) share a node (comm_fs_sum; MPI_Allreduce
+  ! otherwise). IMEX makes the window itself (comm_shm_init; the free surface makes it only at its first
+  ! step, after this step's IMEX solves, and not at all in the split loop), so every solve of a run sums
+  ! the same way and a restart stays exact. On 4 ranks the pairwise order differs from MPI_Allreduce's
+  ! (rounding level); the diagnostics' reductions stay on MPI_Allreduce
+  logical :: shm_set, shm_use
   ! CPU 73a63afb (FS_SPEC 3.8, 9b-H): imex_rst_state 1 (default) the IMEX state in the EXACT_RESTART
   ! files (one time-less copy, with the second record of each pair), 0 none (small files, the old
   ! inexact restart); imex_redu (CPU: rank-count-independent integer-digit sums) read, only 0 on
@@ -208,7 +231,7 @@ module imex_igw
        imex_redu, imex_rst_state, imex_mix_split, &
        imex_obc_mode, imex_obc_nmodes, imex_obc_q0, imex_obc_tref, &
        imex_obc_mprint, imex_obc_cmin, &
-       imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep
+       imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep, imex_gpu_timers
 
   ! Weights (set_derived_weights): regular step and first step of a run
   real(rp) :: wpg_pred(2), wflx_pred(3), wpg_corr(3), wrhs_corr(4)
@@ -359,6 +382,9 @@ contains
     character(len=1024) :: found
     talk = (comm_world_rank() == 0)
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
+    imex_gpu_timers = 0                  ! the default (see the declaration)
+    imex_fast_on = .false.; pg_dz = .false.
+    shm_set = .false.; shm_use = .false.
     rewind(unit)
     msg = ''
     read(unit, nml=imex_igw_settings, iostat=ios, iomsg=msg)
@@ -386,6 +412,7 @@ contains
     endif
     imex_on = .true.
     call check_settings()
+    call it_set(imex_gpu_timers)
     call set_derived_weights()
     if (talk) call print_settings()
   end subroutine imex_read_namelist
@@ -514,6 +541,7 @@ contains
     stage_on = (imex_gpu_stage == 1) .and. pf_on .and. imex_warm == 1 &
                .and. imex_theta_p > 0.0_rp .and. imex_theta_c > 0.0_rp
     if (imex_gpu_sweep < 0 .or. imex_gpu_sweep > 1) call bad('imex_gpu_sweep must be 0 or 1')
+    if (imex_gpu_timers < 0 .or. imex_gpu_timers > 2) call bad('imex_gpu_timers must be 0, 1 or 2')
     sweep_on = (imex_gpu_sweep == 1) .and. pf_on
     ! 'modal' on the GPU (obm_decide): the face term lives in the restructured sweep (PF_OPS), the face
     ! values in the fused stage (solve_stage_fast); imex_pcg_start 0 (apply_m, CPU's unfused operator)
@@ -522,6 +550,7 @@ contains
     if (trim(imex_obc_mode) == 'modal' .and. .not. obm_gpu_ok) call bad("imex_obc_mode = 'modal' on the GPU" &
          // ' needs imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm 1, theta_p, theta_c > 0, imex_gpu_stage 1' &
          // ' and imex_gpu_sweep 1')
+    imex_fast_on = stage_on .and. sweep_on .and. redu_on
     if (nerr > 0) error stop 'imex_igw: unsupported &imex_igw_settings (see above)'
   contains
     subroutine bad(what)
@@ -570,8 +599,9 @@ contains
          '  imex_solver_prec =', pf_prec
     if (imex_solver_prec /= pf_prec) write(*,'(3x,a)') 'imex_solver_prec = 4 needs imex_pcg_fused = 1 in effect:' &
          // ' imex_solver_prec = 8'
-    write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_gpu_redu =', imex_gpu_redu, &
-         '  imex_gpu_stage =', merge(1, 0, stage_on), '  imex_gpu_sweep =', merge(1, 0, sweep_on)
+    write(*,'(3x,a,i2,a,i2,a,i2,a,i2)') 'imex_gpu_redu =', imex_gpu_redu, &
+         '  imex_gpu_stage =', merge(1, 0, stage_on), '  imex_gpu_sweep =', merge(1, 0, sweep_on), &
+         '  imex_gpu_timers =', imex_gpu_timers
     write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_redu =', imex_redu, '  imex_rst_state =', imex_rst_state, &
          '  imex_mix_split =', imex_mix_split
     write(*,'(3x,a,a,a)') "imex_obc_mode = '", trim(imex_obc_mode), "' (resolved at the first step: 'auto'" &
@@ -668,6 +698,7 @@ contains
     if (.not. imex_on) return
     if (.not. allocated(pgu)) call imex_alloc()
     if (.not. obm_decided) call obm_decide()        ! 'modal' or 'fixed' (may turn the restart inexact)
+    if (bref_due()) call it_reb()
     ! (exact restart with the IMEX state read, rst_read: an ordinary step; u^n-1 is the
     ! restart's earlier record, in slot 3-nstp; pg_nm1 and the solver state come from the file)
     first_step = ((iic == ntstart) .and. .not. rst_read) .or. is_first_time_step()
@@ -684,9 +715,26 @@ contains
 
   subroutine copy_level_n()
     ! u_nm1, v_nm1 := u, v(nstp) (whole arrays, halos included)
-    integer(ip) :: i, j, k, is, ie, js, je, nz, n
+    integer(ip) :: i, j, k, is, ie, js, je, nz, n, lmd
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je; nz = decomp%nz
     n = nstp
+    if (imex_fast_on) then
+      ! one thread per column, deep land skipped (its u, v are constant)
+      lmd = dry_lim(G_MOM)
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = js, je
+        do i = is, ie
+          if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
+          do k = 1, nz
+            u_nm1(i, j, k) = u(i, j, k, n)
+            v_nm1(i, j, k) = v(i, j, k, n)
+          enddo
+        enddo
+      enddo
+      return
+    endif
     CUF_DO3
     do k = 1, nz
       do j = js, je
@@ -720,9 +768,48 @@ contains
     integer(ip) :: tmp
     if (.not. imex_on) return
     tmp = ipg_nm1; ipg_nm1 = ipg_n; ipg_n = tmp
+    call itw(17, 0)
     call copy_level_n()
+    call itw(17, 1)
     call imex_diag_line()
+    if (iic == ntstart + ntimes - 1) call pf_sum_stats()
   end subroutine imex_shift_levels
+
+  subroutine pf_sum(n, loc, glob)
+    ! the fused PCG's sums over the compute ranks (fs_gpu_opt bit 512: see shm_use). Collective; the
+    ! first call (the run's first fused solve, every rank) makes the window
+    integer, intent(in) :: n
+    real(8), intent(in) :: loc(n)
+    real(8), intent(out) :: glob(n)
+    logical :: ok
+    if (.not. shm_set) then
+      shm_set = .true.
+      shm_use = comm_shm_wanted()
+      ok = .false.
+      if (shm_use) call comm_shm_init(ok)   ! ok: the window is in use (else comm_fs_sum is MPI_Allreduce)
+      if (talk) write(*,'(1x,a,l2)') 'IMEX_IGW: fs_gpu_opt 512: PCG reductions through shared memory:', ok
+    endif
+    if (shm_use) then
+      call comm_fs_sum(n, loc, glob)
+    else
+      call comm_allreduce_sum(n, loc, glob)
+    endif
+  end subroutine pf_sum
+
+  subroutine pf_sum_stats()
+    ! last step: with ROMS_GPU_FS_SHM_CMP, comm_fs_sum's comparison with MPI_Allreduce (the free surface's and
+    ! IMEX's sums together; collective)
+    logical :: son, scmp
+    integer(8) :: sn, sd
+    real(8) :: c(2), cg(2)
+    if (.not. shm_use) return
+    call comm_fs_sum_stats(son, scmp, sn, sd)
+    if (.not. (son .and. scmp)) return
+    c(1) = real(sn, 8); c(2) = real(sd, 8)
+    call comm_allreduce_max(2, c, cg)
+    if (talk) write(*,'(1x,a,i12,a,i10,a)') 'IMEX_STAT shared-memory sums (ROMS_GPU_FS_SHM_CMP, free surface and' &
+         // ' IMEX):', nint(cg(1), 8), ' reductions, ', nint(cg(2), 8), ' values differing from MPI_Allreduce'
+  end subroutine pf_sum_stats
 
   subroutine imex_diag_line()
     ! CPU imex_diag_line: stage statistics since the last line (cadence as
@@ -763,10 +850,11 @@ contains
     ! them by the weighted combination, and restore the current level's
     ! depth mean (the weights act on the baroclinic part only).
     integer(ip), intent(in) :: i_ru_lo, i_ru_hi, j_rv_lo, j_rv_hi
-    integer(ip) :: i, j, k, nx, ny, nz, sc, s1, s2
+    integer(ip) :: i, j, k, nx, ny, nz, sc, s1, s2, lmd
     real(rp) :: w1, w2, w3, sc_u, sr_u, sh_u, hf
     if (.not. imex_on) return
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    call itw(1, 0)
     if (nrhs == 3) then            ! corrector: level *, combine (*, n, n-1)
       sc = 3; s1 = ipg_n; s2 = ipg_nm1
       w1 = wpg_corr(1); w2 = wpg_corr(2); w3 = wpg_corr(3)
@@ -774,11 +862,43 @@ contains
       sc = ipg_n; s1 = ipg_nm1; s2 = ipg_nm1
       w1 = wpg_pred(1); w2 = wpg_pred(2); w3 = 0.0_rp
     endif
+    ! fused path: deep-land faces skipped (G_PGF, as prsgrd); their stores are zeroed once, when the
+    ! skip first applies, so that the restart files hold zeros there whatever the run's history
+    lmd = 0
+    if (imex_fast_on) lmd = dry_lim(G_PGF)
+    if (lmd > 0 .and. .not. pg_dz) then
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = 1, ny
+        do i = i_ru_lo, i_ru_hi
+          if (colact(i, j) == 0) then
+            do k = 1, nz
+              pgu(i, j, k, 1) = 0.0_rp; pgu(i, j, k, 2) = 0.0_rp; pgu(i, j, k, 3) = 0.0_rp
+            enddo
+          endif
+        enddo
+      enddo
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = j_rv_lo, j_rv_hi
+        do i = 1, nx
+          if (colact(i, j) == 0) then
+            do k = 1, nz
+              pgv(i, j, k, 1) = 0.0_rp; pgv(i, j, k, 2) = 0.0_rp; pgv(i, j, k, 3) = 0.0_rp
+            enddo
+          endif
+        enddo
+      enddo
+      pg_dz = .true.
+    endif
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 1, ny
       do i = i_ru_lo, i_ru_hi
+        if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
         sc_u = 0.0_rp; sr_u = 0.0_rp; sh_u = 0.0_rp
         do k = 1, nz
           pgu(i, j, k, sc) = ru(i, j, k)
@@ -802,6 +922,7 @@ contains
 #endif
     do j = j_rv_lo, j_rv_hi
       do i = 1, nx
+        if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
         sc_u = 0.0_rp; sr_u = 0.0_rp; sh_u = 0.0_rp
         do k = 1, nz
           pgv(i, j, k, sc) = rv(i, j, k)
@@ -820,6 +941,7 @@ contains
         enddo
       enddo
     enddo
+    call itw(1, 1)
   end subroutine imex_pg_store_combine
 
   !======================================================================
@@ -832,12 +954,15 @@ contains
     ! imex_pred_btfix_tile); exchange; omega (We, Wi). set_HUV1 overwrites
     ! FlxU, FlxV later as usual.
     use geom, only: omega
-    integer(ip) :: i, j, k, nx, ny, nz, is, ie, js, je, n_new, n_stp, first
+    integer(ip) :: i, j, k, nx, ny, nz, is, ie, js, je, n_new, n_stp, first, lmd
     integer(ip) :: i_v0, i_v1, j_u0, j_u1
     real(rp) :: w1, w2, w3, sd, sf, dcc, mis, pbx
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     n_new = nnew; n_stp = nstp
+    call itw(15, 0)
+    lmd = 0
+    if (imex_fast_on) lmd = dry_lim(G_MOM)    ! fused path: deep land skipped
     w1 = wflx_pred(1); w2 = wflx_pred(2); w3 = wflx_pred(3)
     first = merge(1_ip, 0_ip, is_first_time_step())
     i_v0 = 1; i_v1 = nx; j_u0 = 1; j_u1 = ny
@@ -857,6 +982,7 @@ contains
 #endif
       do j = j_u0, j_u1
         do i = 1, nx + 1
+          if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
           sd = 0.0_rp; sf = 0.0_rp
           do k = 1, nz
             dcc = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * dn_u(i, j)
@@ -879,6 +1005,7 @@ contains
 #endif
       do j = 1, ny + 1
         do i = i_v0, i_v1
+          if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
           sd = 0.0_rp; sf = 0.0_rp
           do k = 1, nz
             dcc = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * dm_v(i, j)
@@ -980,6 +1107,7 @@ contains
     call hg_add(F_FLXV)
     call hg_end()
     call omega()
+    call itw(15, 1)
   end subroutine imex_predictor_transport
 
   !======================================================================
@@ -999,9 +1127,13 @@ contains
     if (.not. imex_solver_enabled) return
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    call itw(1 + stage, 0)
+    call itw2(4, 0)
     call imex_step_setup()
+    call itw2(4, 1)
     if (stage_on) then
       call solve_stage_fast(stage, dtau, cfbak)
+      call itw(1 + stage, 1)
       return
     endif
     CUF_DO3
@@ -1140,6 +1272,7 @@ contains
     integer :: is_, iters
     integer(ip) :: i, j, k, nx, ny, nz
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    call itw2(5, 0)
     if (stage == imex_stage_pred) then
       is_ = 1
       dts = dt; cb = 0.0_rp
@@ -1155,7 +1288,10 @@ contains
       call hg_add(F_U, nnew)
       call hg_add(F_V, nnew)
       call hg_end()
+      call itw2(5, 1)
+      call itw2(6, 0)
       call rhs_transport(wflx_pred, nnew, nstp, .false., 0.0_rp, 0_ip)
+      call itw2(6, 1)
     else
       is_ = 2
       dts = dt; cb = 0.0_rp
@@ -1165,20 +1301,27 @@ contains
       call hg_add(F_U, nnew)
       call hg_add(F_V, nnew)
       call hg_end()
+      call itw2(5, 1)
+      call itw2(6, 0)
       call rhs_transport(wrhs_corr(2:4), 3_ip, nstp, .true., wrhs_corr(1), nnew)
+      call itw2(6, 1)
     endif
     c2 = (theta * dts)**2
     fs_on = .true.; fs_dtl = dts; fs_cb = cb
+    call itw2(7, 0)
     call solve_fused(is_, c2, tol, iters, resid)
+    call itw2(7, 1)
     fs_on = .false.
     if (is_ == 1) fs_dpw = .false.
     if (imex_verbose >= 1 .and. talk) write(*,'(1x,a,i6,i2,a,i5,a,es24.16)') 'IMEX_SOLVE', iic, is_, &
          ' its', iters, ' resid', resid
+    call itw2(8, 0)
     if (is_ == 1) then
       call correct_fast(stage, theta * dts, hs1)
     else
       call correct_fast(stage, theta * dts, hs2)
     endif
+    call itw2(8, 1)
     st_n(is_) = st_n(is_) + 1
     st_it(is_) = st_it(is_) + iters
     st_itmax(is_) = max(st_itmax(is_), iters)
@@ -1336,7 +1479,7 @@ contains
     ! then imex_adj_setup. imex_setup_lag = 1: dza and imex_adj_setup only
     ! on the steps that rebuild b_ref (coef_version bumped there, Hz, rshu,
     ! rshv saved as the operator's hz_op, rshu_op, rshv_op).
-    integer(ip) :: i, j, k, nx, ny, nz, is, ie, js, je
+    integer(ip) :: i, j, k, nx, ny, nz, is, ie, js, je, lmd
     logical :: lag_skip
     if (coef_iic == iic) return
     lag_skip = .false.
@@ -1347,11 +1490,14 @@ contains
       rst_pend = .false.
     endif
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    lmd = 0
+    if (imex_fast_on) lmd = dry_lim(G_MOM)    ! fused path: deep land skipped (constant Hz)
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 1, ny
       do i = 1, nx + 1
+        if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
         rshu(i, j) = 0.0_rp
         do k = 1, nz
           rshu(i, j) = rshu(i, j) + 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k))
@@ -1364,6 +1510,7 @@ contains
 #endif
     do j = 1, ny + 1
       do i = 1, nx
+        if (lmd > 0) then; if (colact(i, j) == 0) cycle; end if
         rshv(i, j) = 0.0_rp
         do k = 1, nz
           rshv(i, j) = rshv(i, j) + 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k))
@@ -2933,6 +3080,90 @@ contains
   !======================================================================
   ! Whole-array helpers (halos included)
   !======================================================================
+  subroutine ring_sides(rw, re, rs, rn)
+    ! With the one-cell x exchange (xring_on) on the fused path: 1 on each side of the tile that has a
+    ! neighbour (an MPI rank or the periodic self-wrap), whose ring cells pf_ring1_8 fills; 0 elsewhere
+    ! (physical edges; every side without xring_on). x on those ring cells is updated by the solve
+    ! with the operands its owner uses (z exchanged exactly, p formed on the ring from it, the same alpha),
+    ! so it stays equal to the owner's value; corners and physical-edge ghosts are left as they are, as
+    ! pf_ring1_8 leaves them
+    integer(ip), intent(out) :: rw, re, rs, rn
+    rw = 0; re = 0; rs = 0; rn = 0
+    if (.not. (xring_on .and. imex_fast_on)) return
+    if (decomp%nbr_w /= NBR_NONE) rw = 1
+    if (decomp%nbr_e /= NBR_NONE) re = 1
+    if (decomp%nbr_s /= NBR_NONE) rs = 1
+    if (decomp%nbr_n /= NBR_NONE) rn = 1
+  end subroutine ring_sides
+
+  subroutine pf_zring4(a)
+    ! xring_on: the halo of the real(4) z one cell wide, without corners, in one round:
+    ! the tile's four edge rows converted to real(8) (exact) into the x exchange's ring buffers, one
+    ! comm_ring_dev8 call, converted back (exact). The values the operator reads (one cell, no corners)
+    ! are those of pf_zexch4's exchange through wk_z; physical-edge ghosts and corners are left as they
+    ! are, as pf_ring1_8 leaves them for x.
+    real(4), WORK_ATTR intent(inout) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
+    integer(ip) :: k, m, nx, ny, nz, mx, nb(4), w, e, s, n
+    integer :: ierr
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    nb = [decomp%nbr_w, decomp%nbr_e, decomp%nbr_s, decomp%nbr_n]
+    if (all(nb == NBR_NONE)) return
+    if (.not. allocated(rg8_sw)) then
+      allocate(rg8_sw(ny * nz), rg8_se(ny * nz), rg8_rw(ny * nz), rg8_re(ny * nz))
+      allocate(rg8_ss(nx * nz), rg8_sn(nx * nz), rg8_rs(nx * nz), rg8_rn(nx * nz))
+      rg8_sw = 0; rg8_se = 0; rg8_rw = 0; rg8_re = 0; rg8_ss = 0; rg8_sn = 0; rg8_rs = 0; rg8_rn = 0
+    endif
+    mx = max(nx, ny)
+    CUF_DO2
+    do k = 1, nz
+      do m = 1, mx
+        if (m <= ny) then
+          rg8_sw(m + (k - 1) * ny) = real(a(1, m, k), 8); rg8_se(m + (k - 1) * ny) = real(a(nx, m, k), 8)
+        endif
+        if (m <= nx) then
+          rg8_ss(m + (k - 1) * nx) = real(a(m, 1, k), 8); rg8_sn(m + (k - 1) * nx) = real(a(m, ny, k), 8)
+        endif
+      enddo
+    enddo
+    if (any(nb >= 0)) then
+#ifdef USE_CUDA
+      ierr = cudaStreamSynchronize(work_stream)
+      if (ierr /= 0) error stop 'pf_zring4: stream sync'
+#endif
+      call comm_ring_dev8(nb, int(ny * nz), int(nx * nz), rg8_sw, rg8_se, rg8_ss, rg8_sn, rg8_rw, rg8_re, rg8_rs, rg8_rn)
+    endif
+    w = nb(1); e = nb(2); s = nb(3); n = nb(4)
+    CUF_DO2
+    do k = 1, nz
+      do m = 1, mx
+        if (m <= ny) then
+          if (w == NBR_SELF) then
+            a(0, m, k) = real(rg8_se(m + (k - 1) * ny), 4)
+          else if (w /= NBR_NONE) then
+            a(0, m, k) = real(rg8_rw(m + (k - 1) * ny), 4)
+          endif
+          if (e == NBR_SELF) then
+            a(nx + 1, m, k) = real(rg8_sw(m + (k - 1) * ny), 4)
+          else if (e /= NBR_NONE) then
+            a(nx + 1, m, k) = real(rg8_re(m + (k - 1) * ny), 4)
+          endif
+        endif
+        if (m <= nx) then
+          if (s == NBR_SELF) then
+            a(m, 0, k) = real(rg8_sn(m + (k - 1) * nx), 4)
+          else if (s /= NBR_NONE) then
+            a(m, 0, k) = real(rg8_rs(m + (k - 1) * nx), 4)
+          endif
+          if (n == NBR_SELF) then
+            a(m, ny + 1, k) = real(rg8_ss(m + (k - 1) * nx), 4)
+          else if (n /= NBR_NONE) then
+            a(m, ny + 1, k) = real(rg8_rn(m + (k - 1) * nx), 4)
+          endif
+        endif
+      enddo
+    enddo
+  end subroutine pf_zring4
+
   subroutine copy3(a, b)
     real(rp), WORK_ATTR intent(in) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
     real(rp), WORK_ATTR intent(inout) :: b(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
@@ -3085,7 +3316,9 @@ contains
     ! is applied here, fused with the face write
     integer, intent(in) :: stage
     if (.not. imex_on) return
+    call itw(16, 0)
     if (imex_obc_modal) call obm_correct_faces(stage)
+    call itw(16, 1)
   end subroutine imex_obc_faces
 
   logical function imex_stage_on()

@@ -283,6 +283,28 @@ v0.1.2-beta, bit for bit.
   timestep, or the run stops at start-up, as in UCLA ROMS. Runs without
   these outputs, `_bgc_avg` with `wrt_bgc_his = .true.`, and `_cdr` with
   `marbl_timestep` = `dt` are unchanged, bit for bit.
+- IMEX step faster on the GPU, results unchanged bit for bit except for one
+  rounding-level lever. On the default fused path the IMEX kernels skip
+  deep land as the stock kernels do, the mixing split forms its velocity
+  only where the stress kernels read it, each PCG iteration exchanges its
+  FP32 search direction in one round through the solution's one-cell
+  ring, the solution's halo is kept current inside the solve (no exchange
+  at its end), and the deterministic reduction spreads its strided sums
+  over 16 blocks on tiles of 65536 columns or more. Restart files hold
+  zeros in `imex_pgu`, `imex_pgv` at deep land instead of
+  history-dependent values (from the third step of a run, once the
+  dry-column skip applies). With `fs_gpu_opt` bit 512 (in the default)
+  the PCG's reductions of every fused IMEX solve also use the free
+  surface's shared-memory sum when all compute ranks share one node: the
+  same rounding-level change as for the free surface on four ranks
+  (iteration counts unchanged), none on one or two ranks or several
+  nodes. New GPU-only key `imex_gpu_timers` (default 0): 1 and 2 print
+  `IMEX_WIN` lines with synchronised windows of the IMEX step (the stage
+  windows on the fused path). Median step against the previous code
+  (A B B A in one job after a warm-up run, Derecho A100; sargasso and the
+  nest with equal tiles, Pac with the default 'wet' tiles and land weight
+  0.35): sargasso 2x2 -4.4 %, the California Current nest 2x2 -3.1 %,
+  Pac 8x1 on 2 nodes and 16x1 on 4 nodes -2.7 % each.
 - Namelists written from UCLA ROMS's current template (after 0.14.0) run:
   `&bgc_settings` `bgc_physics_subcycle` and `bgc_physics_timestep` (and the
   testing keys `bgc_subcycle_pos`, `bgc_subcycle_diag`) and
@@ -521,20 +543,27 @@ v0.1.2-beta, bit for bit.
     fields are within 2.1 times the CPU's own regular-to-strict build
     difference and every restart variable within 5.3 times (the
     largest: the surface boundary-layer depth, at a mixing threshold).
-    With 'modal', prognostic fields are within 3.5 times on sargasso
-    (8.6 in a free-surface solver variable) and every restart variable
+    With 'modal', prognostic fields are within 2.9 times on sargasso
+    (the stored surface water flux, `fs_qd`, reaches 19 times at one
+    step at four interior points around one column whose boundary-layer
+    depth sits at a mixing threshold; 2.7 with `fs_gpu_opt` bit 512 off)
+    and every restart variable
     within 4.1 times on the nest, except in its last steps with all
     boundary settings at non-defaults: up to 9.5 times, and 36 times at
     single points next to the San Francisco Bay estuary, where the
     CPU's own build difference is largest.
-  - Cost (Derecho, A100, no output, one 2-day run each, reference
-    stratification rebuilt every 6 hours): sargasso 2x2
-    (1 node) 1.61 s per simulated day at dt 1440 s against 6.88 for the
-    split step at 480 s (0.23) and 2.68 for the implicit free surface
-    alone at 480 s; Pac 8x1 (2 nodes, tides, rivers) 10.4 s per day at
-    1440 s against 12.5 (split, 900 s; 0.83) and 11.0 (implicit, 900 s).
-    'modal' adds 0.3 % per step to 'fixed' on Pac and 5.7-6.8 % on the
-    California Current nest (2x2, 1 node).
+  - Cost (Derecho, A100, no output, from the mean step after the first
+    10, reference stratification rebuilt every 24 hours, every scheme
+    from the same commit; sargasso and the nest with equal tiles,
+    `tile_balance = 'uniform'`; the Pacific basin with the default
+    `tile_balance = 'wet'` and land weight 0.35): sargasso 2x2 (1 node)
+    1.51 s per simulated day at dt 1440 s against 6.42 for the split
+    step at 480 s (0.23) and 2.65 for the implicit free surface alone at
+    480 s; the California Current nest (2x2, 1 node, tides, rivers) 2.38
+    at 600 s against 11.16 (split, 150 s; 0.21) and 6.61 (implicit,
+    150 s); Pac 8x1 (2 nodes, tides, rivers) 7.18 at 1800 s against 10.05
+    (split, 900 s; 0.71) and 9.64 (implicit, 900 s). 'modal' adds 0.1 %
+    per step to 'fixed' on Pac and about 2 % on the nest.
 - Tides (`&tidal_frc_settings`) cost less per step. The per-constituent
   cos/sin of each call go to the device by one asynchronous copy instead
   of through managed arrays that the host wrote and the first tide kernel
