@@ -314,6 +314,17 @@ v0.1.2-beta, bit for bit.
   times the CPU's strict spread at the first step; now 1.7 times). A file
   whose coarse boundary points are periodic copies gives the same results
   as before, and closed grids are unchanged, bit for bit.
+- Forcing on the model grid in the GPU-only interior shape (rho LLm x
+  MMm, u (LLm+1) x MMm, v LLm x (MMm+1), no boundary points) on a grid
+  with more than one tile: the halo between tiles is now filled from the
+  neighbours after each record, as UCLA ROMS's exchange after each
+  forcing read does (UCLA ROMS reads LLm+2 only). Before, it was never
+  set, so the wind stress from bulk forcing and the tidal potential were
+  wrong next to the tile seams and the result depended on the tiling (on
+  the 39 x 19 closed basin, 1x1 against 2x2: bulk forcing 7e-4 m/s in u
+  at the seam after one step, tidal potential 0.37 m in zeta). Tidal
+  fields read in that shape get the same fill. Forcing in the LLm+2 or
+  2x-coarse shape is unchanged, bit for bit.
 - `rho0` (`&rho0_settings`) is read at run time, as UCLA ROMS reads it:
   one binary runs any reference density. Before, it was a build constant
   (`-DROMS_RHO0`, default 1000), and a namelist with another value
