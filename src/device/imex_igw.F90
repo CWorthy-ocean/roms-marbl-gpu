@@ -35,6 +35,8 @@ module imex_igw
   ! imex_allow_explicit (with the weights it allows), the weights, the
   ! tolerances, imex_maxit, imex_verbose 0/1/2, imex_mix_split 0/1, imex_corr_adv 0/1 (1, the default, on the
   ! fused path only),
+  ! imex_pc 'jacobi'/'modes' with imex_pc_modes, imex_pc_cou_on, imex_pc_cou_k, imex_pc_levels, imex_pc_ncoarse,
+  ! imex_pc_smoother ('modes' on the fused path only, imex_pc_dump 0; imex_pcm.inc),
   ! imex_n2_ref, imex_n2_taper, imex_bref_hours, imex_warm 0/1,
   ! imex_setup_lag 0/1, imex_rst_state 0/1, imex_obc_mode 'fixed'/'modal'/'auto'
   ! with imex_obc_nmodes, imex_obc_q0, imex_obc_tref, imex_obc_cmin,
@@ -80,10 +82,17 @@ module imex_igw
                       comm_fs_sum_stats
   use arch_mod, only: sync_arch
   use imex_red, only: red_ensure, red_sum, red_part, it_set, itw, itw2, it_reb
+  use comm_mod, only: comm_allgather_i4, comm_size
+  use run_timers, only: wall_time
+#ifdef USE_CUDA
+  use fs_ipc, only: ipc_on, ipc_ring_plane
+#endif
   use rivers_mod, only: river_on, rivers_pred_flx
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
   use cudafor, only: cudaStreamSynchronize, cudaDeviceSynchronize
+  use cudafor, only: cudaGraph, cudaGraphExec, cudaStreamBeginCapture, cudaStreamEndCapture, cudaGraphInstantiate, &
+                     cudaGraphLaunch, cudaGraphExecDestroy, cudaGraphDestroy
 #endif
   implicit none
   private
@@ -244,7 +253,8 @@ module imex_igw
        imex_bref_hours, imex_setup_lag, imex_pcg_start, imex_pcg_fused, imex_solver_prec, imex_stage_fused, &
        imex_redu, imex_rst_state, imex_mix_split, imex_corr_adv, &
        imex_obc_mode, imex_obc_nmodes, imex_obc_q0, imex_obc_tref, &
-       imex_obc_mprint, imex_obc_cmin, &
+       imex_obc_mprint, imex_obc_cmin, imex_pc, imex_pc_modes, imex_pc_dump, imex_pc_cou_on, imex_pc_cou_k, &
+       imex_pc_smoother, imex_pc_levels, imex_pc_ncoarse, &
        imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep, imex_gpu_timers
 
   ! Weights (set_derived_weights): regular step and first step of a run
@@ -390,6 +400,66 @@ module imex_igw
   ! restart: imex_obcm (the reference at the faces' ghost cells)
   real(rp), WORK_ATTR allocatable :: obcm3(:,:,:)
 
+  ! imex_pc = 'modes' (CPU bf897292; imex_pcm.inc): the mode-split preconditioner of the stage solves. Keys and
+  ! defaults as the CPU's (set in imex_read_namelist: no declaration initial values in this module, see
+  ! imex_gpu_timers): imex_pc 'jacobi' (default) | 'modes'; imex_pc_modes 0 automatic (default) or 1..4;
+  ! imex_pc_cou_on 0.5, imex_pc_cou_k 0.3 (the automatic switch and K); imex_pc_levels 0 automatic, 2, 3;
+  ! imex_pc_ncoarse 2 (1, 2); imex_pc_smoother 'rbgs' | 'jacobi'; imex_pc_dump (the CPU's measurement dump of
+  ! its unfused reference: only 0 here)
+  character(len=8) :: imex_pc, imex_pc_smoother
+  integer     :: imex_pc_modes, imex_pc_levels, imex_pc_ncoarse, imex_pc_dump
+  real(rp)    :: imex_pc_cou_on, imex_pc_cou_k
+  ! State (CPU names pcm_*): pcm_on the key in effect; pcm_k the modes in use (0: the Jacobi path), pcm_kmax
+  ! the modes built per column, pcm_ver the coef_version of the last build, pcm_sver/pcm_sc2 the stage set-ups,
+  ! pcm_lev the V-cycle levels in use, pcm_nprev the iterations of the stage's last solve (early test);
+  ! pcm_nx, pcm_ny the level sizes (level 0 = the tile); pcm_big the per-mode arrays allocated (at the first
+  ! build that builds modes: a run the automatic switch keeps on Jacobi allocates only the small part)
+  logical :: pcm_on, pcm_big, pcm_jac
+  integer, parameter :: pcm_nl = 3, PCM_NHB = 100, PCM_NT = 64
+  real(rp), parameter :: pcm_cou_l3 = 1.5_rp
+  integer :: pcm_k, pcm_kmax, pcm_ver, pcm_sver(2), pcm_nbuild, pcm_lev, pcm_nprev(2), pcm_nch
+  real(rp) :: pcm_sc2(2), pcm_tbuild
+  integer :: pcm_nx(0:pcm_nl - 1), pcm_ny(0:pcm_nl - 1)
+  ! per build: the modes in the solver's unknown (FP32 values held in real(8), with halos; pcm_phi4 their
+  ! real(4) copy for the FP32 sweeps), their activity, the 2-D operator Phi_m^T A Phi_m in three parts (mass
+  ! pcm_cm; interior per unit c2: centre, east, north pcm_ci, with halos; 'modal' per unit sqrt(c2): centre
+  ! pcm_cb); per stage: act/d_K (pcm_dki) and (Phi^T W d_K Phi)^-1 per column (pcm_gi); pcm_t3 scratch (the
+  ! probe vector, the stage's diagonal); pcm_cmc the columns' c_m max(pm, pn) (the build line's maximum)
+  real(rp), WORK_ATTR allocatable :: pcm_phi(:,:,:,:), pcm_ci(:,:,:,:), pcm_act(:,:,:), pcm_cm(:,:,:), pcm_cb(:,:,:)
+  real(4), WORK_ATTR allocatable :: pcm_phi4(:,:,:,:)
+  real(rp), WORK_ATTR allocatable :: pcm_dki(:,:,:,:), pcm_gi(:,:,:,:,:), pcm_t3(:,:,:), pcm_cmc(:,:)
+  real(rp), WORK_ATTR allocatable :: pcm_ffx(:,:), pcm_ffy(:,:)
+#ifdef USE_CUDA
+#define PCMDEV device,
+#else
+#define PCMDEV
+#endif
+#ifdef USE_CUDA
+  ! the V-cycle levels l = 0..2 of the pcm_k modes, as planes (0:nx0+1, 0:ny0+1) of level 0's size: x (level 0
+  ! = a, the V-cycle's result), b (level 0 = rc = Phi^T rt), the Jacobi smoother's work t; per stage s the
+  ! operator e (row sum), w, s (west and south face conductances), d (1/diagonal); the build's counters
+  ! (histogram of the Courant numbers, columns not converged, dropped modes) and the MPI ring buffers
+  real(rp), device, allocatable :: lv_x(:,:,:,:), lv_b(:,:,:,:), lv_t(:,:,:,:)
+  real(rp), device, allocatable :: lv_e(:,:,:,:,:), lv_w(:,:,:,:,:), lv_s(:,:,:,:,:), lv_d(:,:,:,:,:)
+  integer, device, allocatable :: pcm_hist(:,:), pcm_cnt(:)
+  real(8), device, allocatable :: pcm_rsw(:), pcm_rse(:), pcm_rss(:), pcm_rsn(:), pcm_rrw(:), pcm_rre(:), &
+                                  pcm_rrs(:), pcm_rrn(:)
+  ! pcm_post and the z update of each (stage, sum slot) recorded as a CUDA graph and replayed (PCM_APPLY; when
+  ! the V-cycle's halo exchanges are device-only: the free surface's IPC rings, or no neighbour; the same
+  ! kernels with the same arguments, so the same results); recorded again after each build.
+  ! ROMS_GPU_PCM_GRAPH=0 (test switch) runs the kernels directly
+  type(cudaGraph) :: pcm_gr(4)
+  type(cudaGraphExec) :: pcm_gexec(4)
+#endif
+  logical :: pcm_gready(4), pcm_gmade(4), pcm_capt, pcm_gon
+#ifndef USE_CUDA
+  real(rp), allocatable :: lv_x(:,:,:,:), lv_b(:,:,:,:), lv_t(:,:,:,:)
+  real(rp), allocatable :: lv_e(:,:,:,:,:), lv_w(:,:,:,:,:), lv_s(:,:,:,:,:), lv_d(:,:,:,:,:)
+  integer, allocatable :: pcm_hist(:,:), pcm_cnt(:)
+  real(8), allocatable :: pcm_rsw(:), pcm_rse(:), pcm_rss(:), pcm_rsn(:), pcm_rrw(:), pcm_rre(:), &
+                          pcm_rrs(:), pcm_rrn(:)
+#endif
+
 contains
 
   !======================================================================
@@ -407,6 +477,12 @@ contains
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
     imex_gpu_timers = 0                  ! the default (see the declaration)
     imex_corr_adv = 1                    ! the default (see the declaration)
+    imex_pc = 'jacobi'; imex_pc_modes = 0; imex_pc_cou_on = 0.5_rp; imex_pc_cou_k = 0.3_rp   ! the defaults
+    imex_pc_levels = 0; imex_pc_ncoarse = 2; imex_pc_smoother = 'rbgs'; imex_pc_dump = 0
+    pcm_on = .false.; pcm_big = .false.; pcm_jac = .false.
+    pcm_k = 0; pcm_kmax = 0; pcm_ver = -1; pcm_sver = -1; pcm_nbuild = 0; pcm_lev = 3; pcm_nprev = 1; pcm_nch = 0
+    pcm_sc2 = -1.0_rp; pcm_tbuild = 0.0_rp; pcm_nx = 0; pcm_ny = 0
+    pcm_gready = .false.; pcm_gmade = .false.; pcm_capt = .false.; pcm_gon = .true.
     advb_on = .false.
     imex_fast_on = .false.; pg_dz = .false.
     shm_set = .false.; shm_use = .false.
@@ -584,6 +660,23 @@ contains
          // ' needs the fused stage: imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm 1, theta_p, theta_c > 0,' &
          // ' imex_gpu_stage, imex_gpu_sweep and imex_gpu_redu 1; set imex_corr_adv = 0 for the unfused path')
     advb_on = (imex_corr_adv == 1)
+    ! imex_pc (CPU bf897292): the CPU's value checks; on the GPU 'modes' is in the fused stage (imex_fast_on:
+    ! the start-up, update sweep and sums it extends) and has no measurement dump
+    if (trim(imex_pc) /= 'jacobi' .and. trim(imex_pc) /= 'modes') &
+      call bad("imex_pc = '" // trim(imex_pc) // "' must be 'jacobi' or 'modes'")
+    pcm_on = (trim(imex_pc) == 'modes')
+    if (pcm_on .and. (imex_pc_modes < 0 .or. imex_pc_modes > 4 .or. imex_pc_dump < 0 .or. imex_pc_cou_on < 0.0_rp &
+        .or. imex_pc_cou_k < 0.0_rp .or. (trim(imex_pc_smoother) /= 'rbgs' .and. trim(imex_pc_smoother) /= 'jacobi') &
+        .or. (imex_pc_levels /= 0 .and. imex_pc_levels /= 2 .and. imex_pc_levels /= 3) .or. imex_pc_ncoarse < 1 &
+        .or. imex_pc_ncoarse > 2)) call bad("imex_pc = 'modes' needs imex_pc_modes in 0..4, imex_pc_dump >= 0," &
+         // " imex_pc_cou_on, imex_pc_cou_k >= 0 and imex_pc_smoother 'rbgs' or 'jacobi', imex_pc_levels 0, 2 or 3" &
+         // " and imex_pc_ncoarse 1 or 2")
+    if (pcm_on .and. imex_pc_dump /= 0) call bad('imex_pc_dump: not on the GPU (0; the CPU''s measurement dump of' &
+         // ' its unfused reference)')
+    if (pcm_on .and. .not. imex_fast_on) call bad("imex_pc = 'modes' on the GPU needs the fused stage:" &
+         // ' imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm 1, theta_p, theta_c > 0, imex_gpu_stage,' &
+         // ' imex_gpu_sweep and imex_gpu_redu 1')
+    pcm_jac = (trim(imex_pc_smoother) == 'jacobi')
     if (nerr > 0) error stop 'imex_igw: unsupported &imex_igw_settings (see above)'
   contains
     subroutine bad(what)
@@ -638,6 +731,9 @@ contains
     write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_redu =', imex_redu, '  imex_rst_state =', imex_rst_state, &
          '  imex_mix_split =', imex_mix_split
     if (advb_on) write(*,'(3x,a)') 'imex_corr_adv = 1: corrector rhs with the step''s advective buoyancy change'
+    if (pcm_on) write(*,'(3x,A,I2,A,2F6.2,A,A,A,L2)') "imex_pc = 'modes': mode-split preconditioner, imex_pc_modes =", &
+         imex_pc_modes, ' (0 automatic; thresholds on/K', imex_pc_cou_on, imex_pc_cou_k, '), smoother ', &
+         trim(imex_pc_smoother), ', fused', pf_on
     write(*,'(3x,a,a,a)') "imex_obc_mode = '", trim(imex_obc_mode), "' (resolved at the first step: 'auto'" &
          // " selects 'modal' with an open edge and 3-D boundary data)"
     if (imex_gpu_stage == 1 .and. .not. stage_on) write(*,'(3x,a)') 'imex_gpu_stage = 1 needs the fused solve,' &
@@ -3238,6 +3334,7 @@ contains
     real(rp), WORK_ATTR intent(in) :: rsu(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: rsv(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(inout) :: x(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
+    if (pcm_on) call pcm_setup(is_, c2, hv, rsu, rsv)   ! imex_pc = 'modes' (before the d_K reciprocal; K may be 0)
     if (pf_prec == 8 .or. pf_chk) call pf_setup8(is_, c2, hv)
     if (pf_prec == 4) then
       call pf_setup4(is_, c2, hv)
@@ -3291,6 +3388,7 @@ contains
         enddo
       enddo
       if (imex_obc_modal) call obm_dinv(s, c2, hv, 8)   ! 'modal': + theta dt ob_kd on the boundary cells
+      if (pcm_on .and. pcm_k > 0) call pcm_dinv(s, hv, 8)   ! 'modes': the deflated diagonal act/(W d_K)
       pf_dver8(s) = coef_version; pf_dc28(s) = c2
     endif
   end subroutine pf_setup8
@@ -3369,6 +3467,7 @@ contains
         enddo
       enddo
       if (imex_obc_modal) call obm_dinv(s, c2, hv, 4)   ! 'modal': + theta dt ob_kd on the boundary cells
+      if (pcm_on .and. pcm_k > 0) call pcm_dinv(s, hv, 4)   ! 'modes': the deflated diagonal act/(W d_K)
       pf_dver4(s) = coef_version; pf_dc24(s) = c2
     endif
   end subroutine pf_setup4
@@ -3415,6 +3514,7 @@ contains
   end subroutine pf_check
 
 #include "imex_obm.inc"
+#include "imex_pcm.inc"
 
 #define PFK 8
 #define PF_SOLVE pf_solve8
@@ -3436,6 +3536,9 @@ contains
 #define RG_RE rg8_re
 #define RG_RS rg8_rs
 #define RG_RN rg8_rn
+#define PCM_PHI pcm_phi
+#define PCM_ZADD pcm_zadd8
+#define PCM_APPLY pcm_apply8
 #include "imex_pf.inc"
 #undef PFK
 #undef PF_SOLVE
@@ -3457,7 +3560,13 @@ contains
 #undef RG_RE
 #undef RG_RS
 #undef RG_RN
+#undef PCM_PHI
+#undef PCM_ZADD
+#undef PCM_APPLY
 #define PFK 4
+#define PCM_PHI pcm_phi4
+#define PCM_ZADD pcm_zadd4
+#define PCM_APPLY pcm_apply4
 #define PF_SOLVE pf_solve4
 #define PF_START pf_start4
 #define PF_START_RHS pf_start_rhs4

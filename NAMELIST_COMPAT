@@ -220,7 +220,16 @@
 # (IMEX_ADVB lines at imex_verbose 2); 0 off, the earlier results. On the GPU
 # 1 needs the fused path (imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm
 # 1, imex_gpu_stage, imex_gpu_sweep and imex_gpu_redu on: the defaults);
-# otherwise the run stops at start-up and asks for imex_corr_adv = 0. GPU tuning settings (roms_gpu only; a namelist that
+# otherwise the run stops at start-up and asks for imex_corr_adv = 0.
+# imex_pc ('jacobi', the default; 'modes'), imex_pc_modes (0 automatic, the
+# default; 1-4), imex_pc_cou_on (0.5), imex_pc_cou_k (0.3), imex_pc_levels (0
+# automatic, 2, 3), imex_pc_ncoarse (2; 1, 2), imex_pc_smoother ('rbgs';
+# 'jacobi') and imex_pc_dump (only 0 on the GPU): the mode-split
+# preconditioner of the stage solves (ucla-roms branch imex-pc-modes,
+# bf897292), the same keys, defaults and checks; IMEX_PCM lines at each
+# operator rebuild. On the GPU 'modes' needs the same fused path as
+# imex_corr_adv (the defaults); otherwise the run stops at start-up.
+# GPU tuning settings (roms_gpu only; a namelist that
 # sets one stops UCLA ROMS): imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep
 # (on: deterministic sums, the fused stage, the restructured operator sweep),
 # and imex_gpu_timers (timing runs: 0 off, the default; 1 and 2 print IMEX_WIN

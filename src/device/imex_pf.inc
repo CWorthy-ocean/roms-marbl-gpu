@@ -17,6 +17,14 @@
     ! (deferred x += alpha p_old, p = z + beta p_old, q = W M p, <p,q>),
     ! sweep 2 (rt -= alpha q, z = dt rt, <rt,z>); stop on the recursive FP64
     ! residual; the pending x += alpha p; the stored W M x; x exchanged.
+    ! imex_pc = 'modes' with K > 0 (CPU bf897292, imex_pcgf8/4; pcm): dinv is the deflated act/(W d_K), so
+    ! sweep 2 and the start-up give z_J = d_K^-1 rt, <rt, z_J> (the stopping norm's sum) and rc = Phi^T rt
+    ! (column partials, no tile sum); pcm_post runs the V-cycles and a = act V(rc) - G^-1 rc with <rc, a>
+    ! added to the partials of <rt, z>, PCM_ZADD forms z = z_J + Phi a on the tile (the z exchange of the next
+    ! iteration carries it to the ring); one reduction carries (<rt,z>, <rt,z_J>) (start-up: (<rt,z>, <b,
+    ! d_K^-1 b>, <rt,z_J>)); the stop is on sqrt(<rt,z_J>/s0). Where convergence is expected (the stage's last
+    ! count reached, or the last two residuals predict <= 4 tol) <rt,z_J> is reduced and tested before the
+    ! V-cycle (the same sums: the same iterates)
     use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
     real(rp), WORK_ATTR intent(inout) :: r0(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
     real(rp), WORK_ATTR intent(inout) :: x(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
@@ -43,13 +51,17 @@
     integer(ip) :: i, j, k, nx, ny, nz, s
     integer :: it, mode, cur
     real(rp) :: rho, rho0, pq, alpha, beta, tole, bnorm, s1, s2, al, c2l
-    real(8) :: loc(2), glob(2)
-    logical :: broke, pend, mqs
+    real(rp) :: s0, rk, rp1, rp2
+    real(8) :: loc(2), glob(2), loc3(3), glob3(3)
+    logical :: broke, pend, mqs, pcm, etest
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     s = stage; c2l = c2
     broke = .false.; pend = .false.
     iters = 0; resid = 0.0_rp; tole = tol; bnorm = 0.0_rp; alpha = 0.0_rp; beta = 0.0_rp
+    rp1 = 1.0_rp; rp2 = 1.0_rp                     ! 'modes': the last two relative residuals (early test)
     if (c2 <= 0.0_rp) return
+    pcm = pcm_on .and. pcm_k > 0
+    if (pcm .and. .not. fs_on) error stop "imex_igw: imex_pc = 'modes' needs the fused stage (imex_gpu_stage 1)"
     call itw2(9, 0)
     if (warm .and. .not. reuse) &                 ! W M x0 into pf_mq(:,:,:,3) (FP64 operand and result)
       call PF_OP(0, 0.0_rp, 0.0_rp, c2l, x, pf_mq, z, pa, pb, x, q, rczk, czt, czb, cu, cv, hz, wr, ru, rv, pq)
@@ -69,13 +81,22 @@
     else
       call PF_START(r0, hv, pf_mq, 3_ip, 0.0_rp, dinv, s, z, s1, s2)
     endif
-    loc = [real(s1, 8), real(s2, 8)]
-    call pf_sum(2, loc, glob)
+    if (pcm) then                                  ! 'modes': z = z_J + Phi a, the sums (<rt,z>, <b,d_K^-1 b>, <rt,z_J>)
+      call PCM_APPLY(s, 3, z)
+      call red_sum(3, loc3)
+      call pf_sum(3, loc3, glob3)
+      glob(1) = glob3(1); glob(2) = glob3(2)
+    else
+      loc = [real(s1, 8), real(s2, 8)]
+      call pf_sum(2, loc, glob)
+    endif
     call itw2(9, 1)
     rho = glob(1); rho0 = glob(1)
+    s0 = rho0                                      ! the stopping test's norm at the start
+    if (pcm) s0 = glob3(3)
     if (warm) then
       bnorm = glob(2)
-      tole = min(0.5_rp, tol * sqrt(bnorm / max(glob(1), 1.e-300_8)))
+      tole = min(0.5_rp, tol * sqrt(bnorm / max(s0, 1.e-300_8)))
     endif
     if (.not. ieee_is_finite(rho0)) then           ! non-finite rhs or coefficients
       resid = 1.0_rp
@@ -120,21 +141,52 @@
       call itw2(13, 0)
       call PF_UP(alpha, q, dinv, s, z, s1)
       call itw2(13, 1)
+      etest = .false.                              ! 'modes': the stopping norm <rt,z_J> is known before the
+      if (pcm) then                                ! V-cycle; where convergence is expected (the stage's last
+        etest = it >= pcm_nprev(s)                 ! count reached, or the last two residuals predict <= 4 tol)
+        if (it >= 2) etest = etest .or. rp1 * rp1 <= 4.0_rp * tole * rp2
+      endif
+      if (etest) then                              ! test it first: the converging iteration has no V-cycle
+        call itw2(35, 0)
+        call red_sum(1, loc(1:1))
+        call pf_sum(1, loc(1:1), glob(1:1))
+        call itw2(35, 1)
+        rk = glob(1)
+        if (ieee_is_finite(rk) .and. rk >= 0.0_rp) then
+          if (sqrt(rk / s0) <= tole) then
+            pend = .true.; iters = it
+            resid = sqrt(rk / s0)
+            exit
+          endif
+        endif
+      endif
       pend = .true.                                ! x += alpha p pending
-      loc(1) = real(s1, 8)
-      call itw2(12, 0)
-      call pf_sum(1, loc(1:1), glob(1:1))
-      call itw2(12, 1)
+      if (pcm) then                                ! 'modes': V-cycles on rc (formed in sweep 2), z, the sums
+        call PCM_APPLY(s, 2, z)
+        call red_sum(2, loc)
+        call itw2(12, 0)
+        call pf_sum(2, loc, glob)
+        call itw2(12, 1)
+        rk = glob(2)
+      else
+        loc(1) = real(s1, 8)
+        call itw2(12, 0)
+        call pf_sum(1, loc(1:1), glob(1:1))
+        call itw2(12, 1)
+        rk = glob(1)
+      endif
       iters = it
-      if (.not. ieee_is_finite(glob(1)) .or. glob(1) < 0.0_8) then
+      if (.not. ieee_is_finite(glob(1)) .or. glob(1) < 0.0_8 .or. .not. ieee_is_finite(rk)) then
         call breakdown('<r,M^-1 r>', glob(1), it)
         exit
       endif
-      resid = sqrt(glob(1) / rho0)
+      resid = sqrt(rk / s0)
       if (resid <= tole) exit
+      rp2 = rp1; rp1 = resid
       beta = glob(1) / rho
       rho = glob(1)
     enddo
+    if (pcm) pcm_nprev(s) = max(iters, 1)
     if (fs_on) then                                ! imex_gpu_stage: the last x update, the stored
       call itw2(14, 0)
       al = alpha                                   ! W M x, one-cell x exchange
@@ -145,7 +197,7 @@
         call PF_XMQ(pend, mqs, al, pb, x, r0, hv, s)
       endif
       if (broke .or. resid > tole) n_maxit_hits = n_maxit_hits + 1
-      if (warm) resid = resid * sqrt(rho0 / max(bnorm, 1.e-300_8))
+      if (warm) resid = resid * sqrt(s0 / max(bnorm, 1.e-300_8))
       if (mqs) then
         ps_mver(s) = coef_version; ps_mc2(s) = c2
       endif
@@ -167,7 +219,7 @@
       endif
     endif
     if (broke .or. resid > tole) n_maxit_hits = n_maxit_hits + 1
-    if (warm) resid = resid * sqrt(rho0 / max(bnorm, 1.e-300_8))   ! relative to the cold solve's norm
+    if (warm) resid = resid * sqrt(s0 / max(bnorm, 1.e-300_8))   ! relative to the cold solve's norm
     if (pcg_start == 3 .and. imex_warm == 1) then  ! W M x = W act b - rt for the next solve
       CUF_DO3
       do k = 1, nz
@@ -191,6 +243,42 @@
            what, ' =', val, ' at iteration', iter, '; stopped with relative residual', resid
     end subroutine breakdown
   end subroutine PF_SOLVE
+
+  subroutine PCM_APPLY(s, slot, z)
+    ! 'modes': pcm_post (the V-cycles, a, the partials) and PCM_ZADD (z = z_J + Phi a), recorded as one CUDA
+    ! graph per (stage, slot) and replayed where the V-cycle's exchanges are device-only (pcm_gdev)
+    integer, intent(in) :: s, slot
+    real(PFK), WORK_ATTR intent(inout) :: z(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
+#ifdef USE_CUDA
+    integer :: g, ierr
+    if (pcm_gon .and. pcm_gdev()) then
+      g = s + 2 * (slot - 2)
+      if (.not. pcm_gready(g)) then
+        if (pcm_gmade(g)) then
+          ierr = cudaGraphExecDestroy(pcm_gexec(g)); ierr = cudaGraphDestroy(pcm_gr(g))
+        endif
+        ierr = cudaStreamBeginCapture(work_stream, 0)
+        if (ierr /= 0) error stop 'imex_igw: pcm graph: begin capture'
+        pcm_capt = .true.
+        call pcm_post(s, slot)
+        call PCM_ZADD(z)
+        pcm_capt = .false.
+        ierr = cudaStreamEndCapture(work_stream, pcm_gr(g))
+        if (ierr /= 0) error stop 'imex_igw: pcm graph: end capture'
+        ierr = cudaGraphInstantiate(pcm_gexec(g), pcm_gr(g), 0)
+        if (ierr /= 0) error stop 'imex_igw: pcm graph: instantiate'
+        pcm_gready(g) = .true.; pcm_gmade(g) = .true.
+      endif
+      call itw2(33, 0)
+      ierr = cudaGraphLaunch(pcm_gexec(g), work_stream)
+      if (ierr /= 0) error stop 'imex_igw: pcm graph: launch'
+      call itw2(33, 1)
+      return
+    endif
+#endif
+    call pcm_post(s, slot)
+    call PCM_ZADD(z)
+  end subroutine PCM_APPLY
 
   subroutine PF_START(r0, hv, q0, sq, wq, dinv, stage, z, rz, bb)
     ! rt = W act b - wq q0(:,:,:,sq) (W M x0), z = dt rt (rounded to real(PFK)),
@@ -636,10 +724,40 @@
     real(PFK), WORK_ATTR intent(inout) :: z(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
     real(rp), intent(out) :: rz
     integer(ip) :: i, j, k, nx, ny, nz, s
-    real(rp) :: al, rr, a, ca, rs(1)
+    real(rp) :: al, rr, a, ca, rs(1), r1, r2, r3, r4
     real(PFK) :: zs
+    integer(ip) :: kk
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     al = alpha; s = stage; a = 0.0_rp
+    if (pcm_on .and. pcm_k > 0) then      ! 'modes' (imex_fast_on): z = z_J = d_K^-1 rt, the column partials of
+      kk = pcm_k                          ! <rt, z_J> in red_part(:, 1) (no tile sum: pcm_post adds <rc, a>) and
+      CUF_DO2                             ! rc = Phi^T rt per mode into lv_b(:, :, m, 0) (CPU imex_pf_up<k>)
+      do j = 1, ny
+        do i = 1, nx
+          ca = 0.0_rp; r1 = 0.0_rp; r2 = 0.0_rp; r3 = 0.0_rp; r4 = 0.0_rp
+          if (act(i, j) > 0.0_rp) then
+            do k = 1, nz
+              rr = wk_r(i, j, k) - al * real(q(i, j, k), 8)
+              wk_r(i, j, k) = rr
+              zs = real(rr * real(dinv(i, j, k, s), 8), PFK)
+              z(i, j, k) = zs
+              ca = ca + rr * real(zs, 8)
+              r1 = r1 + real(PCM_PHI(i, j, k, 1), 8) * rr
+              if (kk >= 2) r2 = r2 + real(PCM_PHI(i, j, k, 2), 8) * rr
+              if (kk >= 3) r3 = r3 + real(PCM_PHI(i, j, k, 3), 8) * rr
+              if (kk >= 4) r4 = r4 + real(PCM_PHI(i, j, k, 4), 8) * rr
+            enddo
+          endif
+          red_part(i + (j - 1) * nx, 1) = ca
+          lv_b(i, j, 1, 0) = r1
+          if (kk >= 2) lv_b(i, j, 2, 0) = r2
+          if (kk >= 3) lv_b(i, j, 3, 0) = r3
+          if (kk >= 4) lv_b(i, j, 4, 0) = r4
+        enddo
+      enddo
+      rz = 0.0_rp
+      return
+    endif
     if (sweep_on) then                    ! imex_gpu_sweep: land columns skipped (rt, q, z, dinv are 0 there)
       if (redu_on) then
 #ifdef USE_CUDA
@@ -738,8 +856,8 @@
     integer, intent(in) :: stage
     real(PFK), WORK_ATTR intent(inout) :: z(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
     real(rp), intent(out) :: rz, bb
-    integer(ip) :: i, j, k, nx, ny, nz, s, m, pr
-    real(rp) :: w, b1, bt, rt, a, b, ca, cb, rs(2), dtl, cf, zr, wv, wm, d, rr
+    integer(ip) :: i, j, k, nx, ny, nz, s, m, pr, kk
+    real(rp) :: w, b1, bt, rt, a, b, ca, cb, rs(2), dtl, cf, zr, wv, wm, d, rr, r1, r2, r3, r4
     real(PFK) :: zs
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     s = stage; m = sq; w = wq; a = 0.0_rp; b = 0.0_rp
@@ -747,6 +865,55 @@
     pr = merge(1_ip, 0_ip, stage == imex_stage_pred)
     if (pr == 1 .and. fs_dpw) pr = 2               ! dpw rescaled at this step's b_ref rebuild
     if (pr == 0 .and. advb_on) pr = 3              ! imex_corr_adv: the memory term dps - X (advb_rhs)
+    if (pcm_on .and. pcm_k > 0) then               ! 'modes' (imex_fast_on): as the redu_on pass below, and rc =
+      kk = pcm_k                                   ! Phi^T rt per mode into lv_b(:, :, m, 0) (CPU pcm_rcsum); the
+      CUF_DO2                                      ! column partials stay in red_part(:, 1:2) (pcm_post, red_sum 3)
+      do j = 1, ny
+        do i = 1, nx
+          ca = 0.0_rp; cb = 0.0_rp; wm = 0.0_rp
+          r1 = 0.0_rp; r2 = 0.0_rp; r3 = 0.0_rp; r4 = 0.0_rp
+          if (act(i, j) > 0.0_rp) then
+          do k = 1, nz
+            wv = 0.0_rp
+            if (k < nz) wv = wm - (wk_fu(i + 1, j, k) - wk_fu(i, j, k) + wk_fv(i, j + 1, k) - wk_fv(i, j, k))
+            d = -ad_en2(i, j, k) * (ad_cu(i + 1, j, k) * wk_fu(i + 1, j, k) - ad_cu(i, j, k) * wk_fu(i, j, k) &
+                + ad_cv(i, j + 1, k) * wk_fv(i, j + 1, k) - ad_cv(i, j, k) * wk_fv(i, j, k) &
+                + ad_czt(i, j, k) * wv - ad_czb(i, j, k) * wm)
+            wm = wv
+            rr = zr + act(i, j) * dtl * ad_n2c(i, j, k) * d
+            if (pr == 1) then
+              rr = rr - cf * (hs1(i, j, k) + hs2(i, j, k))
+            else if (pr == 2) then
+              rr = rr - cf * dpw(i, j, k)
+            else if (pr == 3) then
+              rr = rr - advb_mem(i, j, k)
+            else
+              rr = rr - hs1(i, j, k)
+            endif
+            r0(i, j, k) = rr
+            b1 = act(i, j) * rr / ad_n2c(i, j, k)
+            bt = darea(i, j) * hv(i, j, k) * b1
+            rt = act(i, j) * bt - w * q0(i, j, k, m)
+            zs = real(rt * real(dinv(i, j, k, s), 8), PFK)
+            wk_r(i, j, k) = rt; z(i, j, k) = zs
+            ca = ca + rt * real(zs, 8)
+            cb = cb + bt * bt * real(dinv(i, j, k, s), 8)
+            r1 = r1 + pcm_phi(i, j, k, 1) * rt
+            if (kk >= 2) r2 = r2 + pcm_phi(i, j, k, 2) * rt
+            if (kk >= 3) r3 = r3 + pcm_phi(i, j, k, 3) * rt
+            if (kk >= 4) r4 = r4 + pcm_phi(i, j, k, 4) * rt
+          enddo
+          endif
+          red_part(i + (j - 1) * nx, 1) = ca; red_part(i + (j - 1) * nx, 2) = cb
+          lv_b(i, j, 1, 0) = r1
+          if (kk >= 2) lv_b(i, j, 2, 0) = r2
+          if (kk >= 3) lv_b(i, j, 3, 0) = r3
+          if (kk >= 4) lv_b(i, j, 4, 0) = r4
+        enddo
+      enddo
+      rz = 0.0_rp; bb = 0.0_rp
+      return
+    endif
     if (redu_on) then
 #ifdef USE_CUDA
       !$cuf kernel do(2) <<<*,*,0,work_stream>>>
