@@ -227,6 +227,30 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- New IMEX keys `imex_pc`, `imex_pc_modes`, `imex_pc_cou_on`,
+  `imex_pc_cou_k`, `imex_pc_levels`, `imex_pc_ncoarse`, `imex_pc_smoother`
+  and `imex_pc_dump` in `&imex_igw_settings`: the port of UCLA ROMS's
+  mode-split preconditioner of the IMEX stage solves (ucla-roms PR for
+  `imex_pc = 'modes'`, branch imex-pc-modes, bf897292), same keys and
+  defaults. With the default `imex_pc = 'jacobi'` results are unchanged bit
+  for bit. With `'modes'` the K fastest vertical modes of each column are
+  taken out of the Jacobi step: each mode's 2-D problem gets one multigrid
+  V-cycle (2 or 3 levels, aggregates inside the tile, kernels over the K
+  modes at once, the free surface's IPC rings for the halos, the V-cycle,
+  the post pass and the z update replayed as a CUDA graph), and the solve
+  stops on the norm of the reduced diagonal, so the tolerances keep their
+  meaning. `imex_pc_modes = 0` (the default) builds no modes where the
+  median mode-1 Courant number is below `imex_pc_cou_on` (the Jacobi path;
+  an IMEX_PCM line says so) and otherwise takes K from the mode Courant
+  numbers. The modes are rebuilt with the operator (`imex_bref_hours`) and
+  at the restart replay; restarts stay exact. Results change at the level
+  of the solver tolerance and depend on the tiling at that level. It needs
+  the default fused IMEX path (as `imex_corr_adv`). Measured with the
+  automatic K (A B B A A B in one job, step medians, 4 A100): Sargasso Sea
+  2 x 2 at 1440 s (K 1) 25.7 -> 24.2 ms (-6 %), at 2160 s (K 2) 29.6 ->
+  25.7 ms (-13 %), at 2880 s (K 3) 32.8 -> 26.4 ms (-20 %); the CCS nest
+  N2 at 600 s and the Pacific at 1440 s (2 nodes) stay on Jacobi (K 0, the
+  same cost).
 - `imex_corr_adv` is now 1 by default, as in UCLA ROMS (ucla-roms branch
   imex-corr-adv-default, 0595719e), so every IMEX run that does not set
   the key gives different results; `imex_corr_adv = 0` gives the earlier

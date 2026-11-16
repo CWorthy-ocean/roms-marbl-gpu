@@ -199,6 +199,15 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   so the `imex_corr_adv` kernels write the arithmetic out; and editing one
   format string there made `fort2` abort with a malloc assertion in the
   full `make gpu`, while the file alone compiled. Build every commit.
+  From `imex_pcm.inc` (the `imex_pc = 'modes'` port): a global kernel there
+  that read `imex_red`'s device array `red_part` crashed the host inside
+  `cudaLaunchKernel` (SIGSEGV, no CUDA error); the same pass as a CUF kernel
+  runs. Small edits of the file twice left a runtime routine undeclared in
+  the LLVM module (`pgf90_man_dealloc03_i8` for one `deallocate` of three
+  managed arrays, `pgf90_dev_memset4v` for an integer device-array
+  assignment): one array per `deallocate`, and a zeroing kernel, compiled.
+  A compile of `imex_igw.F90` alone against the modules of a full build
+  (about 1 min on a build node) catches these before the 12-min build.
 - If a run differs from its own bit-identical repeats, rerun it on other nodes
   before you debug: a faulty GPU node has given silently wrong results. Wrap
   job runs in `timeout`.
