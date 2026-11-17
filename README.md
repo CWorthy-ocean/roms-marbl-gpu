@@ -227,6 +227,15 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- BGC subcycling: the sub-pass criterion no longer counts the face across
+  an open edge of the boundary row (the row is not advanced by the passes
+  and takes inflow upwind at its value), as in UCLA ROMS (ucla-roms #449).
+  An inflow of window Courant
+  number C there asked for C/(1-C) sub-passes, and the window stopped from
+  C of about 0.98. Results change only from the first window in which a
+  boundary-row cell raised a level's count: on MiniPac at k = 4, one level
+  in one of 24 windows of a day, in the same window as on the CPU, with
+  the BGCSUB m and Courant numbers equal to the CPU's.
 - `imex_verbose = 2` also prints an `IMEX_RH` line per IMEX stage solve,
   as UCLA ROMS does since ucla-roms #442 (4706b498):
   `IMEX_RH <step> <stage> <iterations> <r0> <r1> ... <r_n>`, the start
