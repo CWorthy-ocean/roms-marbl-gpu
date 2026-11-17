@@ -175,7 +175,7 @@ contains
     real(rp), device, intent(in) :: pmon_u_(is:ie, js:je), pnom_v_(is:ie, js:je), sp_(is:ie, js:je)
     real(rp), device, intent(inout) :: cols(7, 0:nx + 1, nz)
     integer(ip) :: tid, i, j, k, ncol
-    real(rp) :: cface, c1d, cout, v1min, crit, rv, cff, dvx, dvy, cfc, ccell, smx, wmx
+    real(rp) :: cface, c1d, cout, v1min, crit, rv, cff, dvx, dvy, cfc, cfx, cfy, ccell, smx, wmx
     tid = (blockIdx%x - 1) * blockDim%x + threadIdx%x
     ncol = nx + 2
     if (tid > ncol * nz) return
@@ -185,29 +185,42 @@ contains
     do j = 0, ny + 1
       if (rmask_(i, j) < 0.5_rp) cycle
       rv = pm_(i, j) * pn_(i, j) / HZS(i, j, k)
-      cff = 0.0_rp; dvx = 0.0_rp; dvy = 0.0_rp; cfc = 0.0_rp
+      cff = 0.0_rp; dvx = 0.0_rp; dvy = 0.0_rp; cfx = 0.0_rp; cfy = 0.0_rp
       if (i + 1 <= ihi) then
         cff = cff + max(VX(i + 1, j, k), 0.0_rp); dvx = dvx + VX(i + 1, j, k)
-        cfc = max(cfc, max(VX(i + 1, j, k), 0.0_rp) * rv)
+        cfx = max(cfx, max(VX(i + 1, j, k), 0.0_rp) * rv)
       endif
       if (i > ilo) then
         cff = cff - min(VX(i, j, k), 0.0_rp); dvx = dvx - VX(i, j, k)
-        cfc = max(cfc, -min(VX(i, j, k), 0.0_rp) * rv)
+        cfx = max(cfx, -min(VX(i, j, k), 0.0_rp) * rv)
       endif
       if (j + 1 <= jhi) then
         cff = cff + max(VY(i, j + 1, k), 0.0_rp); dvy = dvy + VY(i, j + 1, k)
-        cfc = max(cfc, max(VY(i, j + 1, k), 0.0_rp) * rv)
+        cfy = max(cfy, max(VY(i, j + 1, k), 0.0_rp) * rv)
       endif
       if (j > jlo) then
         cff = cff - min(VY(i, j, k), 0.0_rp); dvy = dvy - VY(i, j, k)
-        cfc = max(cfc, -min(VY(i, j, k), 0.0_rp) * rv)
+        cfy = max(cfy, -min(VY(i, j, k), 0.0_rp) * rv)
       endif
+      cfc = max(cfx, cfy)
       cface = max(cface, cfc)
       c1d = max(c1d, dvx * rv, dvy * rv)
       cout = max(cout, cff * rv)
       if (i >= 1 .and. i <= nx .and. j >= 1 .and. j <= ny) v1min = min(v1min, 1.0_rp - (dvx + dvy) * rv)
-      ccell = max(cfc, dvx * rv, dvy * rv)
-      crit = max(crit, ccell / max(min(1.0_rp, 1.0_rp - (dvx + dvy) * rv), 1.0e-3_rp))
+      if (i == ilo .or. i == ihi .or. j == jlo .or. j == jhi) then
+        ! a boundary-row cell at a physical edge (ilo, ihi, jlo, jhi are in
+        ! the loop only there): not advanced by the passes (its pseudo-volume
+        ! stays HZS) and open-boundary inflow is taken upwind at its value, so
+        ! only the sweeps along the row use its swept fractions and 1-D
+        ! convergence, without a pseudo-volume factor; a corner sets nothing
+        ccell = 0.0_rp
+        if (i > ilo .and. i < ihi) ccell = max(ccell, cfx, dvx * rv)
+        if (j > jlo .and. j < jhi) ccell = max(ccell, cfy, dvy * rv)
+        crit = max(crit, ccell)
+      else
+        ccell = max(cfc, dvx * rv, dvy * rv)
+        crit = max(crit, ccell / max(min(1.0_rp, 1.0_rp - (dvx + dvy) * rv), 1.0e-3_rp))
+      endif
     enddo
     if (i >= 1 .and. i <= nx) then
       ! explicit diffusion number with the largest diffusivity of the BGC
