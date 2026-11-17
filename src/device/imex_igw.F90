@@ -34,7 +34,7 @@ module imex_igw
   ! Supported namelist values: the defaults, plus imex_solver_enabled,
   ! imex_allow_explicit (with the weights it allows), the weights, the
   ! tolerances, imex_maxit, imex_verbose 0/1/2, imex_mix_split 0/1, imex_corr_adv 0/1 (1, the default, on the
-  ! fused path only),
+  ! fused path only), imex_corr_adv_clip >= 0 (0.1, the default; 0 off),
   ! imex_pc 'jacobi'/'modes' with imex_pc_modes, imex_pc_cou_on, imex_pc_cou_k, imex_pc_levels, imex_pc_ncoarse,
   ! imex_pc_smoother ('modes' on the fused path only, imex_pc_dump 0; imex_pcm.inc),
   ! imex_n2_ref, imex_n2_taper, imex_bref_hours, imex_warm 0/1,
@@ -218,6 +218,16 @@ module imex_igw
   ! imex_read_namelist (no initial value here, see imex_gpu_timers)
   integer     :: imex_corr_adv
   logical     :: advb_on
+  ! CPU 0b7a1403 (ucla-roms #451; N5_BED_CELL.md): imex_corr_adv = 1: X clipped per cell so that the face
+  ! velocity it commands through the cell's own along-level coupling stays below this Courant number; 0 off.
+  ! Where b_ref varies along a level by much more than its N2 allows (the b_ref smoothing near the bed and the
+  ! surface of sloping columns at fronts; operator N2 near the floor) a cell is stiff along the level, and the
+  ! corrector turns X into a velocity of one cell on one level (1-25 m/s on the CPU's Bay of Bengal nest,
+  ! blow-ups from 810 s). The cap ad_xc is set at each operator build (adj_diag_coef), the clip is in advb_rhs.
+  ! Default 0.1, set in imex_read_namelist (no initial value here, see imex_gpu_timers). clip_on: in effect
+  ! (imex_corr_adv = 1 and the key > 0)
+  real(rp)    :: imex_corr_adv_clip
+  logical     :: clip_on
   ! The CPU's 'modal' open boundary (keys and defaults as the CPU's): 'auto' selects 'modal' with an
   ! open edge and 3-D boundary data (obm_decide). imex_obc_mode, imex_obc_tref: template keys;
   ! imex_obc_nmodes, imex_obc_q0 (0 off, else 0.2-1), imex_obc_cmin, imex_obc_mprint (OBCM/OBCF
@@ -251,7 +261,7 @@ module imex_igw
        imex_verbose, imex_solver_enabled, imex_allow_explicit, imex_selftest, &
        imex_n2_ref, imex_n2_taper, imex_warm, &
        imex_bref_hours, imex_setup_lag, imex_pcg_start, imex_pcg_fused, imex_solver_prec, imex_stage_fused, &
-       imex_redu, imex_rst_state, imex_mix_split, imex_corr_adv, &
+       imex_redu, imex_rst_state, imex_mix_split, imex_corr_adv, imex_corr_adv_clip, &
        imex_obc_mode, imex_obc_nmodes, imex_obc_q0, imex_obc_tref, &
        imex_obc_mprint, imex_obc_cmin, imex_pc, imex_pc_modes, imex_pc_dump, imex_pc_cou_on, imex_pc_cou_k, &
        imex_pc_smoother, imex_pc_levels, imex_pc_ncoarse, &
@@ -305,6 +315,11 @@ module imex_igw
   real(rp), WORK_ATTR allocatable :: advb_rn(:,:,:), advb_bs(:,:,:), advb_mem(:,:,:)
   real(rp), WORK_ATTR allocatable :: advb_fxs(:,:,:), advb_fxr(:,:,:), advb_fes(:,:,:), advb_fer(:,:,:)
   real(rp), WORK_ATTR allocatable :: advb_sfu(:,:), advb_sfv(:,:), advb_dg(:,:,:)
+  ! imex_corr_adv_clip (clip_on; imex_alloc): the cap of |X| per cell (CPU ad_xc; adj_diag_coef, which holds
+  ! the along-level part dd_h of the diagonal in it while it sums the faces), and per column the clipped and
+  ! the active cell-steps since the last IMEX_CLIP line (imex_verbose >= 1; integers, so the sum over the
+  ! columns is exact in any order). Allocated with one element when the clip is off (the kernels name them)
+  real(rp), WORK_ATTR allocatable :: ad_xc(:,:,:), advb_cc(:,:,:)
   ! the CPU's UP3 constant (advection: c6) and the vertical Courant number above which X = 0 (advb_czmax)
   real(rp), parameter :: advb_c6 = 0.1666666666666666_rp, advb_czmax = 1.0_rp
   integer :: nh(2) = 0, n_maxit_hits = 0
@@ -482,13 +497,14 @@ contains
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
     imex_gpu_timers = 0                  ! the default (see the declaration)
     imex_corr_adv = 1                    ! the default (see the declaration)
+    imex_corr_adv_clip = 0.1_rp          ! the default (see the declaration)
     imex_pc = 'jacobi'; imex_pc_modes = 0; imex_pc_cou_on = 0.5_rp; imex_pc_cou_k = 0.3_rp   ! the defaults
     imex_pc_levels = 0; imex_pc_ncoarse = 2; imex_pc_smoother = 'rbgs'; imex_pc_dump = 0
     pcm_on = .false.; pcm_big = .false.; pcm_jac = .false.
     pcm_k = 0; pcm_kmax = 0; pcm_ver = -1; pcm_sver = -1; pcm_nbuild = 0; pcm_lev = 3; pcm_nprev = 1; pcm_nch = 0
     pcm_sc2 = -1.0_rp; pcm_tbuild = 0.0_rp; pcm_nx = 0; pcm_ny = 0
     pcm_gready = .false.; pcm_gmade = .false.; pcm_capt = .false.; pcm_gon = .true.
-    advb_on = .false.
+    advb_on = .false.; clip_on = .false.
     imex_fast_on = .false.; pg_dz = .false.
     shm_set = .false.; shm_use = .false.
     rewind(unit)
@@ -604,6 +620,7 @@ contains
     if (imex_verbose < 0 .or. imex_verbose > 2) call bad('imex_verbose must be 0, 1 or 2')
     if (imex_mix_split < 0 .or. imex_mix_split > 1) call bad('imex_mix_split must be 0 or 1')
     if (imex_corr_adv < 0 .or. imex_corr_adv > 1) call bad('imex_corr_adv must be 0 or 1')
+    if (imex_corr_adv_clip < 0.0_rp) call bad('imex_corr_adv_clip must be >= 0 (0: off)')
     if (imex_warm < 0 .or. imex_warm > 1) call bad('imex_warm must be 0 or 1')
     if (imex_bref_hours <= 0.0_rp) call bad('imex_bref_hours must be positive')
     if (imex_setup_lag < 0 .or. imex_setup_lag > 1) call bad('imex_setup_lag must be 0 or 1')
@@ -670,6 +687,7 @@ contains
          // ' needs the fused stage: imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm 1, theta_p, theta_c > 0,' &
          // ' imex_gpu_stage, imex_gpu_sweep and imex_gpu_redu 1; set imex_corr_adv = 0 for the unfused path')
     advb_on = (imex_corr_adv == 1)
+    clip_on = advb_on .and. imex_corr_adv_clip > 0.0_rp
     ! imex_pc (CPU bf897292): the CPU's value checks; on the GPU 'modes' is in the fused stage (imex_fast_on:
     ! the start-up, update sweep and sums it extends) and has no measurement dump
     if (trim(imex_pc) /= 'jacobi' .and. trim(imex_pc) /= 'modes') &
@@ -741,6 +759,8 @@ contains
     write(*,'(3x,a,i2,a,i2,a,i2)') 'imex_redu =', imex_redu, '  imex_rst_state =', imex_rst_state, &
          '  imex_mix_split =', imex_mix_split
     if (advb_on) write(*,'(3x,a)') 'imex_corr_adv = 1: corrector rhs with the step''s advective buoyancy change'
+    if (advb_on) write(*,'(3x,a,f7.3,a)') 'imex_corr_adv_clip =', imex_corr_adv_clip, &
+         ' (largest Courant number of the face velocity X commands in a cell; 0 off)'
     if (pcm_on) write(*,'(3x,A,I2,A,2F6.2,A,A,A,L2)') "imex_pc = 'modes': mode-split preconditioner, imex_pc_modes =", &
          imex_pc_modes, ' (0 automatic; thresholds on/K', imex_pc_cou_on, imex_pc_cou_k, '), smoother ', &
          trim(imex_pc_smoother), ', fused', pf_on
@@ -783,6 +803,12 @@ contains
     ad_bb = 0.0_rp; bref_sav = 0.0_rp; ad_n2raw = 0.0_rp
     ad_n2t = 1.0_rp; ad_n2k = 1.0_rp; ad_en2 = 0.0_rp; ad_n2c = 1.0_rp; ad_n2o = 1.0_rp
     ad_cu = 0.0_rp; ad_cv = 0.0_rp; ad_cz = 0.0_rp; ad_czt = 0.0_rp; ad_czb = 0.0_rp; ad_dd = 0.0_rp
+    if (clip_on) then                      ! imex_corr_adv_clip (one element each when it is off)
+      allocate(ad_xc(is:ie, js:je, nz), advb_cc(is:ie, js:je, 2))
+    else
+      allocate(ad_xc(1, 1, 1), advb_cc(1, 1, 1))
+    endif
+    ad_xc = huge(1.0_rp); advb_cc = 0.0_rp
     allocate(bw0(is:ie, js:je, nz), bw1(is:ie, js:je, nz), bw2(is:ie, js:je, nz), bw3(is:ie, js:je, nz))
     allocate(bword(is:ie, js:je, nz))
     bw0 = 0.0_rp; bw1 = 0.0_rp; bw2 = 0.0_rp; bw3 = 0.0_rp; bword = 0
@@ -913,6 +939,7 @@ contains
     call itw(17, 1)
     call imex_diag_line()
     if (iic == ntstart + ntimes - 1) call pf_sum_stats()
+    if (iic == ntstart + ntimes - 1 .and. clip_on .and. imex_verbose >= 1) call clip_line()
   end subroutine imex_shift_levels
 
   subroutine pf_sum(n, loc, glob)
@@ -1679,17 +1706,21 @@ contains
     !   face as rhs_transport does (closed faces 0), W_PF its column recursion (0 at the bottom and top).
     ! sqrt(s) = 1/ad_n2k (imex_n2_taper). imex_verbose >= 2: the IMEX_ADVB lines (rms of NW, X, dps and
     ! max |X| over the act > 0 cells; where max |X| is, global i, j, k, from the rank that holds it).
+    ! clip_on (imex_corr_adv_clip, CPU 0b7a1403): |X| <= ad_xc, the cell's cap (adj_diag_coef), after the
+    ! vertical-Courant rule; at imex_verbose >= 1 the clipped and active cell-steps counted per column (advb_cc).
     real(rp), intent(in) :: dts
-    integer(ip) :: i, j, k, nx, ny, nz, i0, i1, j0, j1, lim, west, east, south, north, lw, le, ow, oe, dg
+    integer(ip) :: i, j, k, nx, ny, nz, i0, i1, j0, j1, lim, west, east, south, north, lw, le, ow, oe, dg, xcl, cc
     integer(ip) :: km, kk, m
     real(rp) :: ga, dtl, sf, f, fr, mk, as, ar, rt, nw, x, qs, qr, ws, wsm, wr, wrm, fzs, fzsm, fzr, fzrm
     real(rp) :: cz, czm, fsr, fsl, frr, frl, fsn, fss, frn, frs, hkm, hkp2, s1, s2, s3, s4, xm, ax
     real(rp) :: mm1, m0, mp1, qm2, qm1, q0, qp1, qp2, ff, d0, dm, dp, cl, cr, fx
-    real(rp) :: hk0, hkp, rh0, rhm, rhp, cpk, cmk, dl0, dlm, dlp, tl, tpl, tmn
+    real(rp) :: hk0, hkp, rh0, rhm, rhp, cpk, cmk, dl0, dlm, dlp, tl, tpl, tmn, nc1, nc2
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     ga = -g / rho0
     dtl = dts
     dg = merge(1_ip, 0_ip, imex_verbose >= 2)
+    xcl = merge(1_ip, 0_ip, clip_on)
+    cc = merge(1_ip, 0_ip, clip_on .and. imex_verbose >= 1)
     call open_edge_codes(west, east, south, north)
     ! b* on the tile's cells and the ghost row/column at physical edges (rho_eos's range, which fills it
     ! from the boundary tracers; deep land as rho_eos skips it), then the halos
@@ -1831,6 +1862,7 @@ contains
     do j = 1, ny
       do i = 1, nx
         s1 = 0.0_rp; s2 = 0.0_rp; s3 = 0.0_rp; s4 = 0.0_rp; xm = 0.0_rp; km = 0
+        nc1 = 0.0_rp; nc2 = 0.0_rp
         if (act(i, j) > 0.0_rp) then
           wsm = 0.0_rp; wrm = 0.0_rp; fzsm = 0.0_rp; fzrm = 0.0_rp; czm = 0.0_rp
           do k = 1, nz
@@ -1902,6 +1934,12 @@ contains
             nw = ad_n2c(i, j, k) * ga * (rho1(i, j, k) - advb_rn(i, j, k)) - hs1(i, j, k)
             x = act(i, j) / ad_n2k(i, j, k) * (ad_n2c(i, j, k) * dtl * rt - nw)
             if (max(czm, cz) > advb_czmax) x = 0.0_rp
+            if (xcl == 1) then                   ! imex_corr_adv_clip
+              if (abs(x) > ad_xc(i, j, k)) then
+                x = sign(ad_xc(i, j, k), x); nc1 = nc1 + 1.0_rp
+              endif
+              nc2 = nc2 + act(i, j)
+            endif
             advb_mem(i, j, k) = hs1(i, j, k) - x
             if (dg == 1) then
               s1 = s1 + nw * nw; s2 = s2 + x * x; s3 = s3 + hs1(i, j, k)**2; s4 = s4 + 1.0_rp
@@ -1916,6 +1954,9 @@ contains
         if (dg == 1) then
           advb_dg(i, j, 1) = s1; advb_dg(i, j, 2) = s2; advb_dg(i, j, 3) = s3; advb_dg(i, j, 4) = s4
           advb_dg(i, j, 5) = xm; advb_dg(i, j, 6) = real(km, rp)
+        endif
+        if (cc == 1) then
+          advb_cc(i, j, 1) = advb_cc(i, j, 1) + nc1; advb_cc(i, j, 2) = advb_cc(i, j, 2) + nc2
         endif
       enddo
     enddo
@@ -1968,6 +2009,36 @@ contains
       write(*,'(1x,A,I8,A,3I5)') 'IMEX_ADVB step', iic, ' max|X| at (i,j,k)', ig, jg, kg
     endif
   end subroutine advb_line
+
+  subroutine clip_line()
+    ! imex_corr_adv_clip, imex_verbose >= 1 (CPU imex_clip_line; rank 0, at each operator build and at the end
+    ! of the run): the cell-steps whose X was clipped since the last line, of all active cell-steps. The
+    ! column counts are integers, so the sums are exact (the CPU's numbers)
+    integer(ip) :: i, j, nx, ny
+    real(rp) :: s1, s2
+    real(8) :: loc(2), glob(2)
+    nx = decomp%nx; ny = decomp%ny
+    s1 = 0.0_rp; s2 = 0.0_rp
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, ny
+      do i = 1, nx
+        s1 = s1 + advb_cc(i, j, 1)
+        s2 = s2 + advb_cc(i, j, 2)
+      enddo
+    enddo
+    loc = [real(s1, 8), real(s2, 8)]
+    call comm_allreduce_sum(2, loc, glob)
+    CUF_DO2
+    do j = 1, ny
+      do i = 1, nx
+        advb_cc(i, j, 1) = 0.0_rp; advb_cc(i, j, 2) = 0.0_rp
+      enddo
+    enddo
+    if (talk) write(*,'(1x,A,I8,A,ES11.4,A,ES11.4)') 'IMEX_CLIP', iic, &
+         ' cell-steps with X clipped since the last line', glob(1), ' of', glob(2)
+  end subroutine clip_line
 
   !======================================================================
   ! Per-step setup: geometry, b_ref, coefficients
@@ -2188,7 +2259,8 @@ contains
     call eta_setup1()
     call bcoef()
     call cz_split()
-    call adj_diag_coef()
+    call adj_diag_coef()                   ! (and the cap ad_xc of imex_corr_adv_clip)
+    if (clip_on .and. imex_verbose >= 1) call clip_line()
     ! eta_setup(2): 1/N2
     call recip3(ad_n2t, ad_n2c)
     if (imex_obc_modal) call obm_build()  ! 'modal': modes, admittances and the Jacobi term (CPU obm_build)
@@ -2649,9 +2721,19 @@ contains
     ! column structure of its four faces (open-boundary faces excluded,
     ! cxo, cyo), scaled by pm pn/(Hz n2k^2). The prefix sums qq, pr of the
     ! CPU's arrays are carried as running sums (same order, same values).
-    integer(ip) :: i, j, k, nx, ny, nz, m, ii, jj
+    ! clip_on (imex_corr_adv_clip; CPU 0b7a1403 adj_diag): the cap ad_xc of X (advb_rhs), the |X| at which
+    ! the cell's own response to X alone, eta = X N2/(N2 + c2 dd) (N2 = ad_n2t, c2 = (theta_c dt)^2), moves
+    ! its faces through its along-level coupling by imex_corr_adv_clip dx/dt:
+    !   sqrt(c2 dd_h) N2/(N2 + c2 dd) |X| = imex_corr_adv_clip/(dt max(pm, pn)),
+    ! dd_h = dd without the cell's vertical term (czt = czb = b_cell: dl = c_face - b_cell along the level),
+    ! summed over the faces in ad_xc itself. Huge where dd_h = 0 and in inactive cells. A function of the
+    ! operator's arrays only, so rst_replay rebuilds it. The CPU's expressions and orders
+    integer(ip) :: i, j, k, nx, ny, nz, m, ii, jj, xcl
     real(rp) :: rs, qq, qqp, qtot, pr, prp, hf, cf, q, gam, aa, bq, co
+    real(rp) :: alpha, dtl, c2c, dl, gh, bh, kh, gx
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    xcl = merge(1_ip, 0_ip, clip_on)
+    alpha = imex_corr_adv_clip; dtl = dt; c2c = (imex_theta_c * dt)**2
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
@@ -2660,6 +2742,12 @@ contains
         do k = 1, nz
           ad_dd(i, j, k) = 0.0_rp
         enddo
+        if (xcl == 1) then
+          do k = 1, nz
+            ad_xc(i, j, k) = huge(1.0_rp)
+            if (act(i, j) > 0.0_rp) ad_xc(i, j, k) = 0.0_rp
+          enddo
+        endif
         if (act(i, j) > 0.0_rp) then
           do m = 1, 4
             if (m <= 2) then
@@ -2694,6 +2782,11 @@ contains
                 aa = gam - ad_czt(i, j, k) + ad_czb(i, j, k)
                 bq = gam + cf - ad_czt(i, j, k)
                 ad_dd(i, j, k) = ad_dd(i, j, k) + aa * aa * qqp + bq * bq * q + gam * gam * (qtot - qq)
+                if (xcl == 1) then                 ! dd_h: czt = czb = b_cell, so aa = gam
+                  dl = cf - ad_bb(i, j, k)
+                  gh = -dl * hf * rs; bh = gh + dl
+                  ad_xc(i, j, k) = ad_xc(i, j, k) + gh * gh * (qtot - q) + bh * bh * q
+                endif
                 qqp = qq; prp = pr
               enddo
             endif
@@ -2701,6 +2794,17 @@ contains
           do k = 1, nz
             ad_dd(i, j, k) = ad_dd(i, j, k) * pm(i, j) * pn(i, j) / (Hz(i, j, k) * ad_n2k(i, j, k)**2)
           enddo
+          if (xcl == 1) then
+            do k = 1, nz                         ! kh = c2 dd_h/N2
+              kh = c2c * pm(i, j) * pn(i, j) / (Hz(i, j, k) * ad_n2k(i, j, k)**2 * ad_n2t(i, j, k)) * ad_xc(i, j, k)
+              gx = sqrt(max(kh, 0.0_rp) * ad_n2t(i, j, k)) * ad_n2t(i, j, k) / (ad_n2t(i, j, k) + c2c * ad_dd(i, j, k))
+              if (gx > 0.0_rp) then
+                ad_xc(i, j, k) = alpha / (dtl * max(pm(i, j), pn(i, j)) * gx)
+              else
+                ad_xc(i, j, k) = huge(1.0_rp)
+              endif
+            enddo
+          endif
         endif
       enddo
     enddo
