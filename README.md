@@ -227,6 +227,22 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- `imex_verbose = 2` also prints an `IMEX_RH` line per IMEX stage solve,
+  as UCLA ROMS does since ucla-roms #442 (4706b498):
+  `IMEX_RH <step> <stage> <iterations> <r0> <r1> ... <r_n>`, the start
+  residual and the residual after each iteration, relative to the
+  right-hand side in the norm of the stopping test (the reduced diagonal's
+  norm with `imex_pc = 'modes'`). The last value is the `IMEX_SOLVE`
+  resid; a cold start has r0 = 1. It covers the fused solve in both
+  storage kinds, with Jacobi or `'modes'`; `imex_pcg_start = 0` prints
+  none, as on the CPU. The values are the sums the solve already brings to
+  the host, stored per iteration and printed once per solve, so the
+  results are unchanged. On sargasso 'modal' (FP64 solver storage,
+  tolerances 1e-12, 2 x 2, 20 steps) the lines equal those of UCLA ROMS
+  56ce923d character for character, with Jacobi and with `'modes'` (K 3).
+  The lines cost nothing measurable: sargasso 2 x 2 at 1440 s runs
+  27.7 ms per step at `imex_verbose = 2` with or without them (26.4 ms at
+  1; the difference is the existing level-2 checks).
 - New IMEX keys `imex_pc`, `imex_pc_modes`, `imex_pc_cou_on`,
   `imex_pc_cou_k`, `imex_pc_levels`, `imex_pc_ncoarse`, `imex_pc_smoother`
   and `imex_pc_dump` in `&imex_igw_settings`: the port of UCLA ROMS's
