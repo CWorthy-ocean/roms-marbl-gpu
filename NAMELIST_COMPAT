@@ -224,6 +224,16 @@
 # 1 needs the fused path (imex_pcg_start 2 or 3, imex_pcg_fused 1, imex_warm
 # 1, imex_gpu_stage, imex_gpu_sweep and imex_gpu_redu on: the defaults);
 # otherwise the run stops at start-up and asks for imex_corr_adv = 0.
+# imex_corr_adv_clip (ucla-roms #451, 0b7a1403; a solver setting on both
+# codes, not in the template): with imex_corr_adv = 1, the largest
+# Courant number of the face velocity that the advective buoyancy change
+# X commands in a cell through the cell's own along-level coupling; |X|
+# is clipped per cell to that cap, set at each operator build. 0.1 is the
+# default, 0 turns the clip off (the earlier results), a value < 0 stops
+# the run at start-up. Where no cell is clipped results are the same as
+# with 0. imex_verbose >= 1 prints IMEX_CLIP lines (clipped and active
+# cell-steps since the last line) at each operator build and at the end
+# of the run, as on the CPU.
 # imex_pc ('jacobi', the default; 'modes'), imex_pc_modes (0 automatic, the
 # default; 1-4), imex_pc_cou_on (0.5), imex_pc_cou_k (0.3), imex_pc_levels (0
 # automatic, 2, 3), imex_pc_ncoarse (2; 1, 2), imex_pc_smoother ('rbgs';

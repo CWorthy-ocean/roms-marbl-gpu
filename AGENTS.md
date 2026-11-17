@@ -208,6 +208,12 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   assignment): one array per `deallocate`, and a zeroing kernel, compiled.
   A compile of `imex_igw.F90` alone against the modules of a full build
   (about 1 min on a build node) catches these before the 12-min build.
+  It does not catch the `fort2` abort ("munmap_chunk(): invalid pointer"
+  in the full `make gpu`): the `imex_corr_adv_clip` port met it again with
+  an internal write (`write(cbuf, fmt) ...`) in `check_settings`; with a
+  plain message in its place the build passed, and so did the same code
+  with more added elsewhere. It depends on the whole file, not on one
+  construct: try small variants of the new code in separate builds.
 - If a run differs from its own bit-identical repeats, rerun it on other nodes
   before you debug: a faulty GPU node has given silently wrong results. Wrap
   job runs in `timeout`.

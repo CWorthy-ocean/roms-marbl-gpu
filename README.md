@@ -227,6 +227,34 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- New IMEX key `imex_corr_adv_clip` in `&imex_igw_settings`, the port of
+  UCLA ROMS's key of the same name (CWorthy-ocean/ucla-roms#451,
+  0b7a1403), with its default 0.1, its check (a value < 0 stops the run)
+  and its `IMEX_CLIP` line. With `imex_corr_adv = 1` the IMEX corrector
+  adds X, the step's advective buoyancy change. Where the b_ref
+  smoothing leaves a cell whose b_ref varies along its level far more
+  than its N2 allows (near the bed and the surface of sloping columns at
+  fronts), the implicit correction turned X into a velocity through that
+  cell's faces on one level: 1-25 m/s and blow-ups at 810 and 840 s on
+  UCLA ROMS's Bay of Bengal nest. The key caps |X| per cell so that the
+  cell's own response to X moves its faces, through its along-level
+  coupling, by at most that Courant number times dx/dt. The cap is set
+  at each operator build from the operator's arrays, so restarts stay
+  exact and the restart file is unchanged. 0 turns the clip off and
+  gives the earlier results bit for bit; where no cell is clipped the
+  default gives them too. `imex_verbose >= 1` prints
+  `IMEX_CLIP <step> cell-steps with X clipped since the last line <n> of
+  <active>` at each operator build and at the end of the run.
+  Checked against UCLA ROMS 0b7a1403 on its Bay of Bengal nest (N5,
+  780 s, 36 steps, 4 x 2 tiles, strict-parity setting): the same solver
+  iteration counts, the same clipped cells at every step until the
+  CPU's own regular and strict builds part (2127 clipped cell-steps on
+  the GPU, 2128 and 2145 on the CPU), caps equal to 6e-10, fields within
+  5.3 times the CPU's strict spread (5.3 also with `imex_corr_adv = 0`).
+  At 840 s on that nest the corrector's largest velocity correction
+  stays below 0.5 m/s, where `dev` exceeded 1 m/s at 100 of 300 steps
+  (up to 8.4 m/s). The Sargasso Sea and California Current runs clip no
+  cell. Cost: +0.2-0.3 % per step.
 - BGC subcycling: the sub-pass criterion no longer counts the face across
   an open edge of the boundary row (the row is not advanced by the passes
   and takes inflow upwind at its value), as in UCLA ROMS (ucla-roms #449).
