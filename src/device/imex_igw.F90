@@ -124,7 +124,7 @@ module imex_igw
   real(rp)    :: imex_tol_pred = 1.e-2_rp, imex_tol_corr = 1.e-3_rp
   integer     :: imex_maxit = 200
   ! 0 quiet, 1 solver statistics (IMEX line, IMEX_SOLVE), 2 + the true FP64 residual of every
-  ! solve (IMEX_PCHK) and max |dp|; 0, 1 and 2 give the same results
+  ! solve (IMEX_PCHK), its residual history (IMEX_RH) and max |dp|; 0, 1 and 2 give the same results
   integer     :: imex_verbose = 0
   integer     :: imex_selftest = 0
   logical, public, protected :: imex_solver_enabled = .true.
@@ -311,6 +311,11 @@ module imex_igw
   ! In effect (check_settings): the setup lag, the start-up mode, the fused
   ! solve and its storage kind, the IMEX_PCHK check (fused, verbose >= 1)
   logical :: lag_on = .false., pf_on = .false., pf_chk = .false.
+  ! CPU 4706b498: rh_on (imex_verbose >= 2): IMEX_RH line per fused stage solve (PF_SOLVE); rh_res(it) the
+  ! stopping test's sum of iteration it (host array, rh_n = imex_maxit entries)
+  logical :: rh_on = .false.
+  integer :: rh_n = 0
+  real(8), allocatable :: rh_res(:)
   ! imex_gpu_redu = 1 in effect
   logical :: redu_on = .false.
   ! imex_gpu_stage = 1 in effect; fs_on: the solve being run forms the rhs
@@ -630,6 +635,11 @@ contains
     pf_prec = 8
     if (pf_on .and. imex_solver_prec == 4) pf_prec = 4
     pf_chk = pf_on .and. imex_verbose >= 2           ! CPU 24967a92: IMEX_PCHK at imex_verbose >= 2
+    rh_on = imex_verbose >= 2                        ! CPU 4706b498: IMEX_RH (scalars of the solve; the step is unchanged)
+    if (rh_on .and. .not. allocated(rh_res)) then
+      rh_n = imex_maxit
+      allocate(rh_res(rh_n)); rh_res = 0.0_8
+    endif
     ! What the GPU has: imex_pcg_start 0 (imex_pcg_warm/imex_pcg) or the
     ! fused solve (start 2, 3); the CPU's imex_pcg_sc (start 1, or 2/3
     ! unfused) is not ported
@@ -3512,6 +3522,24 @@ contains
     if (talk) write(*,'(1x,a,i2,i5,a,i2,3es24.16)') 'IMEX_PCHK', stage, iters, ' prec', pf_prec, &
          resid, sqrt(glob(1) / max(glob(3), 1.e-300_8)), sqrt(glob(2) / max(glob(3), 1.e-300_8))
   end subroutine pf_check
+
+  subroutine imex_rh_line(stage, iters, warm, rho0, bnorm)
+    ! CPU 4706b498 imex_rh_line (imex_verbose >= 2): one IMEX_RH line per stage solve (rank 0): step,
+    ! stage, iterations, the start residual and the residual after each iteration, all relative to the
+    ! right-hand side, sqrt(<r,z>/<b,z_b>) in the norm of the stopping test (warm start: rho0 the start
+    ! sum of that norm and bnorm = <b,D^-1 b>; cold start: the start residual is 1). The last value is
+    ! the IMEX_SOLVE resid. The sums are the solve's own reductions (rh_res): no extra communication.
+    integer, intent(in) :: stage, iters
+    logical, intent(in) :: warm
+    real(rp), intent(in) :: rho0, bnorm
+    real(8) :: r0
+    integer :: it
+    if (.not. talk) return
+    r0 = 1.0_8
+    if (warm) r0 = sqrt(rho0 / max(bnorm, 1.e-300_8))
+    write(*,'(1x,A,I7,I2,I4,*(ES10.3))') 'IMEX_RH', iic, stage, iters, r0, &
+      (r0 * sqrt(abs(rh_res(it)) / max(rho0, 1.e-300_8)), it = 1, min(iters, rh_n))
+  end subroutine imex_rh_line
 
 #include "imex_obm.inc"
 #include "imex_pcm.inc"

@@ -155,6 +155,7 @@
         if (ieee_is_finite(rk) .and. rk >= 0.0_rp) then
           if (sqrt(rk / s0) <= tole) then
             pend = .true.; iters = it
+            if (rh_on) rh_res(min(it, rh_n)) = rk
             resid = sqrt(rk / s0)
             exit
           endif
@@ -176,6 +177,7 @@
         rk = glob(1)
       endif
       iters = it
+      if (rh_on) rh_res(min(it, rh_n)) = rk        ! imex_verbose >= 2: residual history (IMEX_RH)
       if (.not. ieee_is_finite(glob(1)) .or. glob(1) < 0.0_8 .or. .not. ieee_is_finite(rk)) then
         call breakdown('<r,M^-1 r>', glob(1), it)
         exit
@@ -197,6 +199,7 @@
         call PF_XMQ(pend, mqs, al, pb, x, r0, hv, s)
       endif
       if (broke .or. resid > tole) n_maxit_hits = n_maxit_hits + 1
+      if (rh_on) call imex_rh_line(stage, iters, warm, s0, bnorm)
       if (warm) resid = resid * sqrt(s0 / max(bnorm, 1.e-300_8))
       if (mqs) then
         ps_mver(s) = coef_version; ps_mc2(s) = c2
@@ -219,6 +222,7 @@
       endif
     endif
     if (broke .or. resid > tole) n_maxit_hits = n_maxit_hits + 1
+    if (rh_on) call imex_rh_line(stage, iters, warm, s0, bnorm)
     if (warm) resid = resid * sqrt(s0 / max(bnorm, 1.e-300_8))   ! relative to the cold solve's norm
     if (pcg_start == 3 .and. imex_warm == 1) then  ! W M x = W act b - rt for the next solve
       CUF_DO3
