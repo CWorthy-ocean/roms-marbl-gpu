@@ -180,7 +180,10 @@
 # template; defaults in brackets):
 #   imex_verbose     0 quiet; 1 solver statistics (IMEX line,           [0]
 #                    IMEX_SOLVE); 2 + the true FP64 residual of every
-#                    solve (IMEX_PCHK) and max |dp|; same results
+#                    solve (IMEX_PCHK), its residual history (IMEX_RH,
+#                    ucla-roms #442: one line per fused stage solve,
+#                    none with imex_pcg_start 0, as on the CPU) and
+#                    max |dp|; same results
 #   imex_bref_hours  rebuild interval (model hours) of the reference     [24]
 #                    stratification b_ref, the operator, its
 #                    preconditioner and the 'modal' boundary modes; 12
