@@ -61,6 +61,7 @@ program test_obc
   write(unit,'(a)') '&ubind_settings'
   write(unit,'(a)') '    ubind = 0.1'
   write(unit,'(a)') '/'
+  write(unit,'(a)') '&imex_igw_settings imex_igw = .false. /'   ! required in every namelist
   close(unit)
 
   call load_case('build/toy_obc.nml')

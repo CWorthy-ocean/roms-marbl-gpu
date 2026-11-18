@@ -116,7 +116,9 @@ def get_key(text, group, key):
 
 
 def drop_group(text, group):
-    """Remove the group from namelist text (if present)."""
+    """Remove the group from namelist text (if present), also one written on one line
+    ('&group key = value /')."""
+    text = re.sub(r'(?im)^[ \t]*&' + group + r'\b[^\n]*/[ \t]*(?:![^\n]*)?\n?', '', text)
     return re.sub(r'(?ims)^[ \t]*&' + group + r'\b[^\n]*\n.*?^[ \t]*/[ \t]*\n?', '', text)
 
 
@@ -186,6 +188,7 @@ def setup(a):
                  ('implicit_fs', 'fs_mode', 'implicit' if s['imp'] else 'split')]
         edits += [('bgc_settings', kk, v) for kk, v in s['bgc'].items()]
         t = drop_group(t, 'imex_igw_settings')
+        edits += [('imex_igw_settings', 'imex_igw', bool(s['imex']))]     # required in every namelist
         edits += [('imex_igw_settings', kk, v) for kk, v in (s['imex'] or {}).items()]
         for g, kk, v in edits:
             t = set_key(t, g, kk, v)

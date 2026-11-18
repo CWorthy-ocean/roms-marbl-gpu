@@ -152,3 +152,7 @@
 &passive_tracers
     write_passive = .true.
 /
+
+&imex_igw_settings
+    imex_igw = .false.
+/

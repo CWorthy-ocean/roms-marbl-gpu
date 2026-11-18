@@ -49,6 +49,7 @@ program test_bulk
   write(unit,'(a)') '&rho0_settings'
   write(unit,'(a)') '    rho0 = 1025.0'
   write(unit,'(a)') '/'
+  write(unit,'(a)') '&imex_igw_settings imex_igw = .false. /'   ! required in every namelist
   close(unit)
 
   call load_case('build/toy_bulk.nml')

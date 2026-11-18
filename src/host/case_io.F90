@@ -228,7 +228,7 @@ contains
     call read_cdr_gas_output_namelist(unit)
     call read_cdr_output_namelist(unit)
     call read_upscale_namelist(unit)
-    call imex_read_namelist(unit)         ! &imex_igw_settings: IMEX_IGW on when present
+    call imex_read_namelist(unit)         ! &imex_igw_settings (required): IMEX_IGW on when imex_igw = .true.
     call fs_read_namelist(unit)           ! &implicit_fs: implicit free surface when fs_mode = 'implicit'
     case_ntp_est = nt_bgc + ntp + ncdr        ! MARBL + generic + CDR_LITE (ntp = nt_passive here)
 
@@ -2014,6 +2014,7 @@ contains
     write(unit,'(a)') "    output_root_name = './output'"
     write(unit,'(a)') "    title = 'toy_case'"
     write(unit,'(a)') '/'
+    write(unit,'(a)') '&imex_igw_settings imex_igw = .false. /'   ! required in every namelist
     close(unit)
     deallocate(a2, au, av, a3, au3, av3)
   end subroutine write_toy_case

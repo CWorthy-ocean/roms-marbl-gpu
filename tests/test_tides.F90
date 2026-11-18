@@ -48,6 +48,7 @@ program test_tides
   write(unit,'(a)') '    bry_tides = .true.'
   write(unit,'(a)') '    ana_tides = .false.'
   write(unit,'(a)') '/'
+  write(unit,'(a)') '&imex_igw_settings imex_igw = .false. /'   ! required in every namelist
   close(unit)
 
   call load_case('build/toy_tides.nml')
