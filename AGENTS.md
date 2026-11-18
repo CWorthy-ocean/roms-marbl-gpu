@@ -283,7 +283,8 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
      partly covered by a record (the previous record's tail, a variable
      the record does not write) is read with `O_DIRECT` first. A change to
      the segment or ownership logic needs `test_cdf_write` and a
-     comparison by value with `ROMS_GPU_OUT_FORMAT=nc4` output.
+     comparison by value with the output of the code before the change
+     (or of a 1x1 run, whose single compute rank writes serially).
   A `cdf_direct: WATCHDOG` line on stderr means a `pwrite` had not returned
   after `ROMS_GPU_IO_WATCHDOG` seconds (60): keep the log and the node
   names; one benchmark run was 60 times slower on one node for a reason

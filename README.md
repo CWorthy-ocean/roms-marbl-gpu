@@ -48,8 +48,10 @@ stops the run at start-up and lists the switches.
 - MPI with Fortran bindings. A CUDA-aware MPI is optional: it lets halo
   exchanges go straight from GPU to GPU; otherwise they go through pinned
   host memory.
-- NetCDF-C and NetCDF-Fortran built with parallel I/O (parallel HDF5);
-  `nf-config` and `nc-config` on the `PATH`.
+- NetCDF-C and NetCDF-Fortran, with netCDF-4 (HDF5) support to read
+  netCDF-4 input files; parallel I/O is not needed (output is CDF5,
+  written by the model's writer ranks). `nf-config` and `nc-config` on the
+  `PATH`.
 - Python 3 for `tools/gpu_layout.py` (standard library only); `numpy` and
   `netCDF4` for the comparison tools.
 
@@ -126,18 +128,15 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
     writers are spread over the nodes. The writers are numbered
     round-robin over the nodes, so each output file's writer group spans
     all of them: the Pacific basin's records were written at 9-13 GB/s
-    with 8 writers on each of 2 nodes (CDF5 output; with netCDF-4 a node
-    writes one shared file at about 1.3 GB/s however many writers it
-    has), so a file written from more nodes is written faster. If the
-    compute ranks do not number
+    with 8 writers on each of 2 nodes, so a file written from more nodes
+    is written faster. If the compute ranks do not number
     `np_xi x np_eta` the run stops and prints the layout it expected. This
     is the layout to use on more than one node.
   - `ROMS_GPU_NWRITERS` unset: the first `np_xi x np_eta` ranks compute and
     every extra rank is a writer, so the writers sit on the last node.
   - Writer groups: each file is written by one group of writers;
     `ROMS_GPU_IO_GROUP` sets the writers per group (default: all writers,
-    at most 64, with CDF5 output; with `ROMS_GPU_OUT_FORMAT=nc4` 4 per
-    node that holds writers, at most half the writers).
+    at most 64).
   - Forcing reader (optional, `ROMS_GPU_FRC_READER=1`): the last rank of
     every node reads the surface forcing and boundary records ahead of the
     model, each record whole and in file order, so that the compute ranks'
@@ -176,9 +175,8 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   A netCDF-4 file is read through netCDF as before (`whole`; a start-up
   line says so), and so is a variable the direct reader cannot place (a
   type other than double, float, int, short or byte, or a file cut
-  short). `whole` forces the netCDF reads, and `mpiio` reads the windows
-  collectively through parallel netCDF (netCDF-4 files). Results are the
-  same bit for bit with every reader. `ROMS_GPU_PAR_READ_VERIFY=1` reads
+  short). `whole` forces the netCDF reads. Results are the same bit for
+  bit with either reader. `ROMS_GPU_PAR_READ_VERIFY=1` reads
   every variable a second time through netCDF and reports any difference
   (a check; slower). `ROMS_GPU_DIRECT_PIECE_MB` sets the size of each read
   (default 1024). The forcing files are read through netCDF, but their
@@ -204,8 +202,7 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   more `tools/submit_gpu.sh` sets `lfs setstripe -c 48 -S 16M` on the
   output directory, and the model prints a WARNING when such a file lies
   on fewer than 16 OSTs or on stripes under 4 MiB (`ROMS_GPU_IO_WIDE_GB`
-  sets the record size, default 4). Settings: `ROMS_GPU_OUT_FORMAT=nc4`
-  writes netCDF-4 as before (parallel HDF5, two groups); `ROMS_GPU_IO_DIRECT=0`
+  sets the record size, default 4). Settings: `ROMS_GPU_IO_DIRECT=0`
   writes the same byte ranges through the page cache (taken by itself, with
   a line in the log, when the file system refuses `O_DIRECT`);
   `ROMS_GPU_IO_PIECE_MB` sets the size of one write (default 1024);
@@ -298,6 +295,14 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- The netCDF-4 output writer is gone: `ROMS_GPU_OUT_FORMAT` no longer
+  exists (output is always CDF5; `nccopy -k nc4` converts a file for
+  HDF5-only tools), and neither does `ROMS_GPU_PAR_READ=mpiio` (the
+  collective window reads of netCDF-4 start-up files; `direct` and
+  `whole` remain). netCDF-4 input files are read as before. The model no
+  longer needs a netCDF built with parallel I/O. A run without history
+  output no longer pins a history-sized staging buffer at start-up (about
+  3 s on the Pacific basin).
 - Shorter output stalls when a restart is written: history and restart
   records no longer share the compute ranks' staging buffers (a history
   record staged right after a restart record pinned a second buffer of
@@ -324,7 +329,7 @@ v0.1.2-beta, bit for bit.
   attributes and values are unchanged (compared by value with the
   netCDF-4 output). Values never written read as 0 instead of the fill
   value. HDF5-only readers (`h5py`, xarray's `h5netcdf` engine) cannot
-  open CDF5; `ROMS_GPU_OUT_FORMAT=nc4` gives netCDF-4 output as before.
+  open CDF5; `ROMS_GPU_OUT_FORMAT=nc4` gave netCDF-4 output as before (removed since).
   Restarts written by the model are read at the next start with the
   `O_DIRECT` reader. `tools/submit_gpu.sh` puts the output directory of
   runs with records of 4 GiB or more on a wide Lustre stripe. Pacific
