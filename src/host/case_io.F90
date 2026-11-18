@@ -9,7 +9,8 @@ module case_io
   use nc_io
   use host_buf, only: host_read_2d, host_read_3d
   use par_read, only: pr_begin, pr_flush, pr_take, pr_end, pr_taking, pr_store_2d, pr_store_3d, pr_store_3d_pt
-  use frc_io, only: read_forcing_namelist, init_forcing, set_forces, close_frc_cache, init_cflx_corr
+  use frc_io, only: read_forcing_namelist, init_forcing, set_forces, close_frc_cache, init_cflx_corr, &
+                    frc_warm_start, frc_warm_flush, frc_warm_end
   use bry_io, only: init_bry, set_bry_all
   use tide_io, only: read_tide_namelist, init_tides, set_tides
   use river_io, only: read_river_namelist, init_rivers, set_rivers
@@ -708,6 +709,9 @@ contains
     call init_spn_arrays()              ! ub_tune: fluxes and averages for the _spn output
     if (marbl_on) call marbl_gpu_setup_tracers()
     call passive_finish_list()          ! without MARBL: generic + CDR_LITE tracers
+    ! the forcing files' start-up bytes, read ahead by threads in the
+    ! background during the grid and initial-state reads (frc_io)
+    call frc_warm_start()
 
     call nc_open_read(case_grdname, ncid)
     xi_rho = nc_dim_len(ncid, 'xi_rho')
@@ -823,6 +827,7 @@ contains
     if (marbl_on) call marbl_gpu_init_forcing()
     call wall_stamp('marbl forcing init')
     call init_bry()
+    call frc_warm_flush()              ! read the first records' bytes ahead (frc_io)
     call wall_stamp('boundary init')
     call init_tides()
     call wall_stamp('tide init')
@@ -847,9 +852,13 @@ contains
     call close_frc_cache()
     frc_slot = 0
     call set_forces()
+    call wall_stamp('first forcing records')
     call set_rivers(0)                ! river volume at time n for set_HUV (CPU: set_forces)
+    call wall_stamp('first river records')
     call set_bry_all()
+    call wall_stamp('first boundary records')
     call set_tides(pot_phase=fs_pot_phase)   ! the implicit free surface's potential time (0.5 otherwise)
+    call wall_stamp('first tides')
     ! The CPU's start-up diagnostics before its initial history record
     ! (main.F90 after this set_forces: set_depth, set_HUV, omega,
     ! rho_eos): the initial record's rho, omega and w, and the depths the
@@ -864,8 +873,11 @@ contains
     call bgcsub_init()
     ! the CPU's initial MARBL diagnostics (its first wrt_bgc)
     if (marbl_on) call marbl_gpu_init_diagnostics()
+    call wall_stamp('initial diagnostics')
+    call frc_warm_end()
     call set_output_root(case_output_root, case_title)
     call init_output()
+    call wall_stamp('history/restart output init')
     call set_avg_root(case_output_root)
     call init_avg_output()            ! before the outputs that write a double record at start-up
     call init_cdr_lite_output()       ! after the history/restart staging is sized

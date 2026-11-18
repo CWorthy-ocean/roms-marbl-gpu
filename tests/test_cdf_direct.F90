@@ -7,6 +7,7 @@ program test_cdf_direct
   ! variable alignments (nf90_enddef), a file with one short record variable
   ! (records packed, not padded), a truncated copy, a variable that is not
   ! in the file, types left to netCDF, and a netCDF-4 file (refused).
+  ! Also cdf_header (the parse alone) and the warm-up threads (cdf_warm_*).
   ! usage: test_cdf_direct <scratch directory>   (exit status 1 on a failure)
   use, intrinsic :: iso_fortran_env, only: int8, int16, int32, int64, real32, real64
   use netcdf
@@ -30,6 +31,7 @@ program test_cdf_direct
   call run_format('cdf1_onerec.nc', nf90_classic_model, 3, .false.)
   call run_format('cdf5_trunc.nc', nf90_64bit_data, 0, .true.)
   call refuse_nc4('nc4.nc')
+  call warm_test('cdf5.nc', 'nc4.nc')
   write(*,'(a,i0,a,i0)') 'test_cdf_direct: checks ', ncheck, '  failures ', nfail
   if (nfail > 0) then
     write(*,'(a)') 'test_cdf_direct: FAIL'
@@ -432,5 +434,52 @@ contains
     write(*,'(3a)') trim(name), ': refused: ', trim(msg)
     call cdf_close(f)
   end subroutine refuse_nc4
+
+  subroutine warm_test(name, name4)
+    ! cdf_header gives cdf_open's parse; the warm-up threads read queued
+    ! ranges (in the file, past its end, of length 0) and join, twice.
+    character(len=*), intent(in) :: name, name4
+    character(len=600) :: path
+    character(len=256) :: msg
+    type(cdf_file_t) :: f, g
+    integer :: fd, k
+    logical :: ok
+    path = trim(dir)//'/'//name
+    ok = cdf_open(trim(path), f, msg)
+    call chk(ok, trim(name)//': cdf_open for cdf_header')
+    ok = cdf_header(trim(path), g, msg)
+    call chk(ok, trim(name)//': cdf_header ('//trim(msg)//')')
+    call chk(g%fd == -1, trim(name)//': cdf_header leaves nothing open')
+    call chk(g%nvars == f%nvars .and. g%numrecs == f%numrecs .and. g%recsize == f%recsize .and. &
+             g%fsize == f%fsize, trim(name)//': cdf_header = cdf_open parse')
+    if (ok .and. g%nvars == f%nvars) then
+      do k = 1, f%nvars
+        call chk(g%v(k)%name == f%v(k)%name .and. g%v(k)%begin == f%v(k)%begin .and. g%v(k)%vlen == f%v(k)%vlen, &
+                 trim(name)//': cdf_header variable '//trim(f%v(k)%name))
+      enddo
+    endif
+    ok = cdf_header(trim(dir)//'/'//name4, g, msg)
+    call chk(.not. ok, trim(name4)//': cdf_header refuses netCDF-4')
+    fd = cdf_ro_open(trim(path))
+    call chk(fd >= 0, trim(name)//': cdf_ro_open')
+    do k = 0, 199
+      call cdf_warm_add(fd, int(k, int64) * 512_int64, 8192_int64)
+    enddo
+    call cdf_warm_add(fd, f%fsize + 100000_int64, 4096_int64)       ! past the end: the thread stops there
+    call cdf_warm_add(fd, 0_int64, 0_int64)                           ! empty: not queued
+    call chk(cdf_warm_count() == 201, trim(name)//': warm-up ranges queued')
+    call cdf_warm_launch(4)
+    call cdf_warm_add(fd, 0_int64, 4096_int64)                        ! while running: ignored
+    call cdf_warm_join()
+    call chk(cdf_warm_count() == 0, trim(name)//': warm-up joined and emptied')
+    call cdf_warm_add(fd, 0_int64, f%fsize)
+    call cdf_warm_launch(64)
+    call cdf_warm_join()
+    call chk(cdf_warm_count() == 0, trim(name)//': second warm-up joined')
+    call cdf_ro_close(fd)
+    call chk(fd == -1, trim(name)//': cdf_ro_close')
+    write(*,'(3a)') trim(name), ': cdf_header and warm-up threads ok'
+    call cdf_close(f)
+  end subroutine warm_test
 
 end program test_cdf_direct

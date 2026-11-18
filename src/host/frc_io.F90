@@ -17,6 +17,8 @@ module frc_io
   use run_timers, only: wall_time
   use frc_reader, only: frc_reader_on, frc_reader_ahead
   use halo_mod, only: halo_fill_2d
+  use cdf_direct, only: cdf_file_t, cdf_header, cdf_ro_open, cdf_ro_close, cdf_warm_add, cdf_warm_launch, &
+                        cdf_warm_join, cdf_warm_count, cdf_var_index
   use netcdf, only: nf90_inquire, nf90_inq_varid, nf90_inquire_variable, nf90_inquire_dimension, nf90_get_var, &
                     nf90_double, nf90_float, nf90_max_var_dims, nf90_open, nf90_nowrite
 #ifdef USE_CUDA
@@ -165,6 +167,34 @@ module frc_io
   public :: uwnd, vwnd
   public :: write_toy_flux
   public :: write_toy_bulk
+  public :: frc_warm_start, frc_warm_series, frc_warm_flush, frc_warm_end
+
+  ! Start-up warm-up of the forcing files (ROMS_GPU_FRC_WARM = threads per
+  ! compute rank, default 8; 0 off). The start-up reads of the forcing files
+  ! are many small netCDF reads, each a file-system round trip when the
+  ! files are cold on the node (Pac: ~18 s of start-up). A few threads per
+  ! compute rank read the same bytes ahead with plain preads (cdf_direct
+  ! cdf_warm_*: page cache only, the data are discarded), many at a time:
+  !   frc_warm_start (before the grid and restart reads, in the background
+  !     while they run): every file's first 4 MiB (netCDF's open) and last
+  !     64 KiB (the size query), every value of its 1-D record variables
+  !     (the time axes: one value per record, a record apart, in netCDF's
+  !     8-KiB blocks), and all of the tide file (init_tides reads it whole);
+  !   frc_warm_series (after a series' catalog) queues the records its
+  !     first bracket at the start time needs and the next one (the whole
+  !     variable slab); frc_warm_flush reads them, before the first reads.
+  ! The files (start-up) and series (first records) are dealt over each
+  ! node's compute ranks (page caches are per node). The model's own reads
+  ! are unchanged, so are the results. A file that is not classic netCDF
+  ! (netCDF-4) gets its first 4 MiB only. posix_fadvise(WILLNEED) would be
+  ! simpler, but Derecho's Lustre client ignores it (nothing became
+  ! resident), so the bytes are read for real.
+  logical :: warm_on = .false., warm_p2 = .false.
+  integer :: warm_nthr = 8, warm_ml = 0, warm_nl = 1, warm_k = 0
+  integer :: warm_fd(max_frc) = -1
+  logical :: warm_parsed(max_frc) = .false., warm_ok(max_frc) = .false.
+  type(cdf_file_t), save :: warm_hdr(max_frc)
+  real(8) :: warm_t0 = 0.0d0
 
 contains
 
@@ -636,6 +666,7 @@ contains
     s%ready = .true.
     allocate(s%buf(s%n1, s%n2, 2))
     s%buf = 0.0_rp
+    call frc_warm_series(s%vname, s%paths, s%irec, s%times, s%ntot, s%cycle)
     if (s%ntot >= 2) then
       ! No bracket yet: the first advance_series (the first set_forces /
       ! set_bgc_forces) reads the two records it needs.
@@ -2018,5 +2049,179 @@ contains
     call nc_close(ncid)
     deallocate(ar)
   end subroutine write_toy_bulk
+
+  ! ------------------------- start-up warm-up (read-ahead threads) -------------------------
+
+  subroutine frc_warm_start()
+    ! Collective over the compute ranks (the node-local split). Each node's
+    ! compute ranks share the files round robin; a rank first reads its
+    ! files' headers with its threads (concurrently; a short wait), parses
+    ! them, then queues their start-up ranges and returns while the threads
+    ! read them.
+    character(len=8) :: val
+    integer :: st, i, n
+#ifdef USE_MPI
+    integer :: ncomm, ierr
+#endif
+    warm_nthr = 8
+    call get_environment_variable('ROMS_GPU_FRC_WARM', val, status=st)
+    if (st == 0 .and. len_trim(val) > 0) then
+      read(val, *, iostat=st) n
+      if (st == 0) warm_nthr = max(0, min(n, 64))
+    endif
+    warm_on = (warm_nthr > 0 .and. case_nfrc >= 1)
+    if (.not. warm_on) return
+    warm_t0 = wall_time()
+    warm_ml = 0; warm_nl = 1
+#ifdef USE_MPI
+    call MPI_Comm_split_type(comm_compute(), MPI_COMM_TYPE_SHARED, comm_rank(), MPI_INFO_NULL, ncomm, ierr)
+    call MPI_Comm_rank(ncomm, warm_ml, ierr)
+    call MPI_Comm_size(ncomm, warm_nl, ierr)
+    call MPI_Comm_free(ncomm, ierr)
+#endif
+    do i = 1, case_nfrc
+      if (mod(i - 1, warm_nl) /= warm_ml) cycle
+      call queue(i, 0_8, 4194304_8)                 ! the header (netCDF's open reads the first 4 MiB)
+    enddo
+    call cdf_warm_launch(warm_nthr)
+    call cdf_warm_join()
+    do i = 1, case_nfrc
+      if (mod(i - 1, warm_nl) == warm_ml) call warm_file(i)
+    enddo
+    n = cdf_warm_count()
+    call cdf_warm_launch(warm_nthr)
+    write(*,'(a,i0,a,i0,a,i0,a,f7.3,a)') 'forcing warm-up: rank ', comm_rank(), '  ', n, ' ranges, ', warm_nthr, &
+         ' threads (ROMS_GPU_FRC_WARM), queued in ', wall_time() - warm_t0, ' s'
+  end subroutine frc_warm_start
+
+  subroutine warm_file(i)
+    ! Queue the start-up ranges of forcing file i (its header is cached).
+    integer, intent(in) :: i
+    integer :: iv, k
+    integer(8) :: off, a, c
+    integer(8), parameter :: HEAD = 4194304_8, TAIL = 65536_8, BLK = 8192_8
+    if (.not. warm_parse(i)) return
+    associate (h => warm_hdr(i))
+      if (h%hdr_end > HEAD) call queue(i, HEAD, h%hdr_end - HEAD)
+      call queue(i, max(0_8, h%fsize - TAIL), TAIL)
+      if (cdf_var_index(h, 'omega') > 0) then
+        ! the tide file: init_tides reads every constituent of it
+        if (h%fsize <= 17179869184_8) then
+          do c = 0, (h%fsize - 1) / HEAD
+            call queue(i, c * HEAD, min(HEAD, h%fsize - c * HEAD))
+          enddo
+        endif
+        return
+      endif
+      do iv = 1, h%nvars
+        if (.not. h%v(iv)%isrec .or. h%v(iv)%ndims /= 1) cycle
+        ! a time axis: one value per record, read by netCDF in 8-KiB blocks
+        do k = 1, int(h%numrecs)
+          off = h%v(iv)%begin + int(k - 1, 8) * h%recsize
+          a = (off / BLK) * BLK
+          call queue(i, a, min(BLK, h%fsize - a))
+        enddo
+      enddo
+    end associate
+  end subroutine warm_file
+
+  logical function warm_parse(i) result(ok)
+    ! The header of forcing file i (classic formats only), parsed once; it
+    ! is the same on every rank, so every rank queues the same ranges.
+    integer, intent(in) :: i
+    character(len=256) :: msg
+    if (.not. warm_parsed(i)) then
+      warm_parsed(i) = .true.
+      warm_ok(i) = cdf_header(trim(case_frcfiles(i)), warm_hdr(i), msg)
+    endif
+    ok = warm_ok(i)
+  end function warm_parse
+
+  subroutine queue(i, off, n)
+    ! Queue a range of forcing file i for this rank's threads.
+    integer, intent(in) :: i
+    integer(8), intent(in) :: off, n
+    if (warm_fd(i) < 0) warm_fd(i) = cdf_ro_open(case_frcfiles(i))
+    if (warm_fd(i) < 0) return
+    call cdf_warm_add(warm_fd(i), off, n)
+  end subroutine queue
+
+  subroutine frc_warm_series(vname, paths, irec, times, ntot, cycle)
+    ! After a series' catalog (frc_io bind_series, bry_io bind1/bindz):
+    ! queue the records the first bracket at the start time needs (as
+    ! advance_series / cyc_bracket choose them) and the one after, each the
+    ! variable's whole slab of that record. The first call waits for the
+    ! start-up threads (long done by then: the catalogs needed their data).
+    character(len=*), intent(in) :: vname
+    character(len=*), intent(in) :: paths(:)
+    integer,          intent(in) :: irec(:), ntot
+    real(rp),         intent(in) :: times(:), cycle
+    integer :: i1, i2, rec, i, k, f, iv, idx(3)
+    real(rp) :: t1, t2, tneed
+    integer(8) :: off
+    if (.not. warm_on .or. ntot < 2) return
+    if (.not. warm_p2) then
+      call cdf_warm_join()
+      warm_p2 = .true.
+      warm_k = 0
+    endif
+    ! the series are dealt over the node's compute ranks (every rank binds
+    ! every series, in the same order)
+    warm_k = warm_k + 1
+    if (mod(warm_k - 1, warm_nl) /= warm_ml) return
+    tneed = tdays
+    if (cycle > 0.0_rp) then
+      call cyc_bracket(times, ntot, cycle, tneed, i1, i2, t1, t2)
+      idx = (/i1, i2, mod(i2, ntot) + 1/)
+    else
+      rec = 1
+      do i = 1, ntot - 1
+        if (times(i) <= tneed .and. times(i + 1) >= tneed) then
+          rec = i
+          exit
+        endif
+        if (times(i) <= tneed) rec = i
+      enddo
+      rec = max(1, min(rec, ntot - 1))
+      idx = (/rec, rec + 1, min(rec + 2, ntot)/)
+    endif
+    do k = 1, 3
+      if (k == 3 .and. idx(3) == idx(2)) exit
+      f = 0
+      do i = 1, case_nfrc
+        if (trim(case_frcfiles(i)) == trim(paths(idx(k)))) then
+          f = i
+          exit
+        endif
+      enddo
+      if (f == 0) cycle
+      if (.not. warm_parse(f)) cycle
+      iv = cdf_var_index(warm_hdr(f), trim(vname))
+      if (iv == 0) cycle
+      off = warm_hdr(f)%v(iv)%begin
+      if (warm_hdr(f)%v(iv)%isrec) off = off + int(irec(idx(k)) - 1, 8) * warm_hdr(f)%recsize
+      call queue(f, off, warm_hdr(f)%v(iv)%vlen)
+    enddo
+  end subroutine frc_warm_series
+
+  subroutine frc_warm_flush()
+    ! Read the queued first records (in the background; frc_warm_end waits).
+    if (.not. warm_on) return
+    if (.not. warm_p2) call cdf_warm_join()
+    write(*,'(a,i0,a,i0,a,f7.3,a)') 'forcing warm-up: rank ', comm_rank(), '  ', cdf_warm_count(), &
+         ' first-record ranges at ', wall_time() - warm_t0, ' s'
+    call cdf_warm_launch(warm_nthr)
+  end subroutine frc_warm_flush
+
+  subroutine frc_warm_end()
+    ! After the first records are in: wait for the threads, close the descriptors.
+    integer :: i
+    if (.not. warm_on) return
+    call cdf_warm_join()
+    do i = 1, max_frc
+      call cdf_ro_close(warm_fd(i))
+    enddo
+    warm_on = .false.
+  end subroutine frc_warm_end
 
 end module frc_io
