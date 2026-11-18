@@ -248,6 +248,27 @@ v0.1.2-beta, bit for bit.
   44-51 s to read and distribute and now takes 8.5-9.5 s; start-up fell
   from 72-85 s to 38-40 s. netCDF-4 files are read as before. Results are
   unchanged, bit for bit, with every file format.
+- `imex_pc = 'modes'` (the mode-split preconditioner of the IMEX stage
+  solves) is now the default, as in UCLA ROMS (ucla-roms branch
+  imex-pc-modes-default, 8c1d6909); it was `'jacobi'`. With the default
+  `imex_pc_modes = 0` it builds no modes where the median mode-1 Courant
+  number is below `imex_pc_cou_on` and runs the Jacobi path, so those runs
+  are unchanged bit for bit (Sargasso Sea at 480 s, K 0: restart files
+  and solver lines identical to `dev`; the CCS nest N2 at 600 s and the
+  Pacific at 1440 s were K 0 in the port's measurements). Where it keeps
+  modes, results change at the level of the solver tolerance and the
+  solves are faster (bullet on the new keys below: -6 % per step at
+  1440 s, -13 to -20 % at longer steps on the Sargasso Sea).
+  `imex_pc = 'jacobi'` gives the earlier results bit for bit. 'modes' needs
+  the default fused IMEX path: a namelist that asks for another path (for
+  example `imex_pcg_start = 0`) stops at start-up and is told to set
+  `imex_pc = 'jacobi'`; the start-up print names the Jacobi
+  preconditioner when it is selected. Checked against UCLA ROMS 8c1d6909
+  with both codes at their new defaults (Sargasso Sea 'modal', 1440 s,
+  2 x 2, 20 steps, strict-parity setting; the automatic switch picks K 1
+  on both, with equal IMEX_PCM lines): identical IMEX and free-surface
+  iteration sequences, fields within 2.7 times the CPU's strict spread
+  (prognostic fields 1.4; the Jacobi control 3.2 and 1.4).
 - New IMEX key `imex_corr_adv_clip` in `&imex_igw_settings`, the port of
   UCLA ROMS's key of the same name (CWorthy-ocean/ucla-roms#451,
   0b7a1403), with its default 0.1, its check (a value < 0 stops the run)
@@ -306,8 +327,8 @@ v0.1.2-beta, bit for bit.
   and `imex_pc_dump` in `&imex_igw_settings`: the port of UCLA ROMS's
   mode-split preconditioner of the IMEX stage solves (ucla-roms PR for
   `imex_pc = 'modes'`, branch imex-pc-modes, bf897292), same keys and
-  defaults. With the default `imex_pc = 'jacobi'` results are unchanged bit
-  for bit. With `'modes'` the K fastest vertical modes of each column are
+  defaults. With `imex_pc = 'jacobi'` (the default until the change at the
+  top of this list) results are unchanged bit for bit. With `'modes'` the K fastest vertical modes of each column are
   taken out of the Jacobi step: each mode's 2-D problem gets one multigrid
   V-cycle (2 or 3 levels, aggregates inside the tile, kernels over the K
   modes at once, the free surface's IPC rings for the halos, the V-cycle,
@@ -663,8 +684,9 @@ v0.1.2-beta, bit for bit.
   model is unchanged): the port of UCLA ROMS's IMEX_IGW (ucla-roms
   #433, with the 'modal' open boundary of #434), which treats the
   internal-wave terms of the
-  LF-AM3 baroclinic step implicitly (an elliptic solve per stage, Jacobi
-  PCG with FP32 storage) so that the baroclinic step can be several times
+  LF-AM3 baroclinic step implicitly (an elliptic solve per stage, PCG
+  with FP32 storage, preconditioned by the mode-split preconditioner
+  `imex_pc = 'modes'`, which is Jacobi where it builds no modes) so that the baroclinic step can be several times
   longer than the internal-wave limit. It runs on the implicit free
   surface with its defaults. The open boundary is the CPU's 'modal' one
   (the characteristic, per-mode Flather condition of the internal modes,
