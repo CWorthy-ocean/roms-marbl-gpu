@@ -2,6 +2,8 @@
 module obc
   ! Flather M2 (normal) + Chapman zeta; Orlanski M3/T on open edges.
   ! Closed wall when obc_* is false. Periodic edges are not physical.
+  ! The explicit Orlanski updates cap cy to [-1, 1] and cx, cext to 1 (and the
+  ! normal updates, already convex, cap cext), so each is a convex average.
   ! All edge and corner updates run as device kernels on work_stream: the
   ! host only branches on edge flags, so no managed field is touched from
   ! the host (host loops here used to migrate whole pages every fast step).
@@ -158,10 +160,11 @@ contains
                  (pn(m, 0) + pn(m - 1, 0) + pn(m, 1) + pn(m - 1, 1))
             cy = 0.125_rp * dtf * (ubar(m, 0, ks) + ubar(m, 1, ks)) * &
                  (pm(m, 0) + pm(m - 1, 0) + pm(m, 1) + pm(m - 1, 1))
+            cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
             if (cx > 0.0_rp) then
-              cext = 0.0_rp
+              cext = 0.0_rp; cx = min(cx, 1.0_rp)
             else
-              cext = -cx; cx = 0.0_rp
+              cext = min(-cx, 1.0_rp); cx = 0.0_rp
             endif
             ubar(m, 0, kn) = (1.0_rp - cx) * (ubar(m, 0, ks) &
                  - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c) &
@@ -186,10 +189,11 @@ contains
                  (pn(m, ny) + pn(m - 1, ny) + pn(m, ny + 1) + pn(m - 1, ny + 1))
             cy = 0.125_rp * dtf * (ubar(m, ny, ks) + ubar(m, ny + 1, ks)) * &
                  (pm(m, ny) + pm(m - 1, ny) + pm(m, ny + 1) + pm(m - 1, ny + 1))
+            cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
             if (cx > 0.0_rp) then
-              cext = 0.0_rp
+              cext = 0.0_rp; cx = min(cx, 1.0_rp)
             else
-              cext = -cx; cx = 0.0_rp
+              cext = min(-cx, 1.0_rp); cx = 0.0_rp
             endif
             ubar(m, ny + 1, kn) = (1.0_rp - cx) * (ubar(m, ny + 1, ks) &
                  - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c) &
@@ -268,10 +272,11 @@ contains
                  (pm(0, m) + pm(0, m - 1) + pm(1, m) + pm(1, m - 1))
             cy = 0.125_rp * dtf * (vbar(0, m, ks) + vbar(1, m, ks)) * &
                  (pn(0, m) + pn(0, m - 1) + pn(1, m) + pn(1, m - 1))
+            cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
             if (cx > 0.0_rp) then
-              cext = 0.0_rp
+              cext = 0.0_rp; cx = min(cx, 1.0_rp)
             else
-              cext = -cx; cx = 0.0_rp
+              cext = min(-cx, 1.0_rp); cx = 0.0_rp
             endif
             vbar(0, m, kn) = (1.0_rp - cx) * (vbar(0, m, ks) &
                  - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c) &
@@ -296,10 +301,11 @@ contains
                  (pm(nx, m) + pm(nx, m - 1) + pm(nx + 1, m) + pm(nx + 1, m - 1))
             cy = 0.125_rp * dtf * (vbar(nx, m, ks) + vbar(nx + 1, m, ks)) * &
                  (pn(nx, m) + pn(nx, m - 1) + pn(nx + 1, m) + pn(nx + 1, m - 1))
+            cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
             if (cx > 0.0_rp) then
-              cext = 0.0_rp
+              cext = 0.0_rp; cx = min(cx, 1.0_rp)
             else
-              cext = -cx; cx = 0.0_rp
+              cext = min(-cx, 1.0_rp); cx = 0.0_rp
             endif
             vbar(nx + 1, m, kn) = (1.0_rp - cx) * (vbar(nx + 1, m, ks) &
                  - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c) &
@@ -385,10 +391,11 @@ contains
                  (pn(m, 0) + pn(m - 1, 0) + pn(m, 1) + pn(m - 1, 1))
             cy = 0.125_rp * dtf * (ubar(m, 0, ks) + ubar(m, 1, ks)) * &
                  (pm(m, 0) + pm(m - 1, 0) + pm(m, 1) + pm(m - 1, 1))
+            cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
             if (cx > 0.0_rp) then
-              cext = 0.0_rp
+              cext = 0.0_rp; cx = min(cx, 1.0_rp)
             else
-              cext = -cx; cx = 0.0_rp
+              cext = min(-cx, 1.0_rp); cx = 0.0_rp
             endif
             ubar(m, 0, kn) = (1.0_rp - cx) * (ubar(m, 0, ks) &
                  - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c) &
@@ -413,10 +420,11 @@ contains
                  (pn(m, ny) + pn(m - 1, ny) + pn(m, ny + 1) + pn(m - 1, ny + 1))
             cy = 0.125_rp * dtf * (ubar(m, ny, ks) + ubar(m, ny + 1, ks)) * &
                  (pm(m, ny) + pm(m - 1, ny) + pm(m, ny + 1) + pm(m - 1, ny + 1))
+            cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
             if (cx > 0.0_rp) then
-              cext = 0.0_rp
+              cext = 0.0_rp; cx = min(cx, 1.0_rp)
             else
-              cext = -cx; cx = 0.0_rp
+              cext = min(-cx, 1.0_rp); cx = 0.0_rp
             endif
             ubar(m, ny + 1, kn) = (1.0_rp - cx) * (ubar(m, ny + 1, ks) &
                  - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c) &
@@ -476,10 +484,11 @@ contains
                  (pm(0, m) + pm(0, m - 1) + pm(1, m) + pm(1, m - 1))
             cy = 0.125_rp * dtf * (vbar(0, m, ks) + vbar(1, m, ks)) * &
                  (pn(0, m) + pn(0, m - 1) + pn(1, m) + pn(1, m - 1))
+            cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
             if (cx > 0.0_rp) then
-              cext = 0.0_rp
+              cext = 0.0_rp; cx = min(cx, 1.0_rp)
             else
-              cext = -cx; cx = 0.0_rp
+              cext = min(-cx, 1.0_rp); cx = 0.0_rp
             endif
             vbar(0, m, kn) = (1.0_rp - cx) * (vbar(0, m, ks) &
                  - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c) &
@@ -504,10 +513,11 @@ contains
                  (pm(nx, m) + pm(nx, m - 1) + pm(nx + 1, m) + pm(nx + 1, m - 1))
             cy = 0.125_rp * dtf * (vbar(nx, m, ks) + vbar(nx + 1, m, ks)) * &
                  (pn(nx, m) + pn(nx, m - 1) + pn(nx + 1, m) + pn(nx + 1, m - 1))
+            cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
             if (cx > 0.0_rp) then
-              cext = 0.0_rp
+              cext = 0.0_rp; cx = min(cx, 1.0_rp)
             else
-              cext = -cx; cx = 0.0_rp
+              cext = min(-cx, 1.0_rp); cx = 0.0_rp
             endif
             vbar(nx + 1, m, kn) = (1.0_rp - cx) * (vbar(nx + 1, m, ks) &
                  - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c) &
@@ -622,7 +632,7 @@ contains
             else
               cext = ub
             endif
-            cext = cext * dtw * 0.5_rp * (pm(0, j) + pm(1, j))
+            cext = min(cext * dtw * 0.5_rp * (pm(0, j) + pm(1, j)), 1.0_rp)
           else
             cext = 0.0_rp
           endif
@@ -666,7 +676,7 @@ contains
             else
               cext = ub
             endif
-            cext = cext * dtw * 0.5_rp * (pm(nx, j) + pm(nx + 1, j))
+            cext = min(cext * dtw * 0.5_rp * (pm(nx, j) + pm(nx + 1, j)), 1.0_rp)
           else
             cext = 0.0_rp
           endif
@@ -700,10 +710,11 @@ contains
                (pn(i, 0) + pn(i - 1, 0) + pn(i, 1) + pn(i - 1, 1))
           cy = 0.125_rp * dtw * (u(i, 0, k, nr) + u(i, 1, k, nr)) * &
                (pm(i, 0) + pm(i - 1, 0) + pm(i, 1) + pm(i - 1, 1))
+          cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
           if (cx > 0.0_rp) then
-            cext = 0.0_rp
+            cext = 0.0_rp; cx = min(cx, 1.0_rp)
           else
-            cext = -cx; cx = 0.0_rp
+            cext = min(-cx, 1.0_rp); cx = 0.0_rp
           endif
           u(i, 0, k, nn) = (1.0_rp - cx) * (u(i, 0, k, ns) &
                - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c) &
@@ -733,10 +744,11 @@ contains
                (pn(i, ny + 1) + pn(i - 1, ny + 1) + pn(i, ny) + pn(i - 1, ny))
           cy = 0.125_rp * dtw * (u(i, ny, k, nr) + u(i, ny + 1, k, nr)) * &
                (pm(i, ny + 1) + pm(i - 1, ny + 1) + pm(i, ny) + pm(i - 1, ny))
+          cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
           if (cx > 0.0_rp) then
-            cext = 0.0_rp
+            cext = 0.0_rp; cx = min(cx, 1.0_rp)
           else
-            cext = -cx; cx = 0.0_rp
+            cext = min(-cx, 1.0_rp); cx = 0.0_rp
           endif
           u(i, ny + 1, k, nn) = (1.0_rp - cx) * (u(i, ny + 1, k, ns) &
                - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c) &
@@ -815,7 +827,7 @@ contains
             else
               cext = ub
             endif
-            cext = cext * dtw * 0.5_rp * (pn(i, 0) + pn(i, 1))
+            cext = min(cext * dtw * 0.5_rp * (pn(i, 0) + pn(i, 1)), 1.0_rp)
           else
             cext = 0.0_rp
           endif
@@ -870,7 +882,7 @@ contains
               else
                 cext = ub
               endif
-              cext = cext * dtw * 0.5_rp * (pn(i, ny) + pn(i, ny + 1))
+              cext = min(cext * dtw * 0.5_rp * (pn(i, ny) + pn(i, ny + 1)), 1.0_rp)
             else
               cext = 0.0_rp
             endif
@@ -904,7 +916,7 @@ contains
             else
               cext = ub
             endif
-            cext = cext * dtw * 0.5_rp * (pn(i, ny) + pn(i, ny + 1))
+            cext = min(cext * dtw * 0.5_rp * (pn(i, ny) + pn(i, ny + 1)), 1.0_rp)
           else
             cext = 0.0_rp
           endif
@@ -951,10 +963,11 @@ contains
                (pm(0, j) + pm(0, j - 1) + pm(1, j) + pm(1, j - 1))
           cy = 0.125_rp * dtw * (v(0, j, k, nr) + v(1, j, k, nr)) * &
                (pn(0, j) + pn(0, j - 1) + pn(1, j) + pn(1, j - 1))
+          cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
           if (cx > 0.0_rp) then
-            cext = 0.0_rp
+            cext = 0.0_rp; cx = min(cx, 1.0_rp)
           else
-            cext = -cx; cx = 0.0_rp
+            cext = min(-cx, 1.0_rp); cx = 0.0_rp
           endif
           v(0, j, k, nn) = (1.0_rp - cx) * (v(0, j, k, ns) &
                - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c) &
@@ -984,10 +997,11 @@ contains
                (pm(nx + 1, j) + pm(nx + 1, j - 1) + pm(nx, j) + pm(nx, j - 1))
           cy = 0.125_rp * dtw * (v(nx, j, k, nr) + v(nx + 1, j, k, nr)) * &
                (pn(nx + 1, j) + pn(nx + 1, j - 1) + pn(nx, j) + pn(nx, j - 1))
+          cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
           if (cx > 0.0_rp) then
-            cext = 0.0_rp
+            cext = 0.0_rp; cx = min(cx, 1.0_rp)
           else
-            cext = -cx; cx = 0.0_rp
+            cext = min(-cx, 1.0_rp); cx = 0.0_rp
           endif
           v(nx + 1, j, k, nn) = (1.0_rp - cx) * (v(nx + 1, j, k, ns) &
                - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c) &
@@ -1047,10 +1061,11 @@ contains
             g1p = (t(1, j + 1, k, ns, it) - t(1, j, k, ns, it)) * vmask(1, j + 1)
             cx = -dtw * u(1, j, k, nr) * pm(0, j)
             cy = 0.5_rp * dtw * (v(0, j, k, nr) + v(0, j + 1, k, nr)) * pn(0, j)
+            cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
             if (cx > 0.0_rp) then
-              cext = 0.0_rp
+              cext = 0.0_rp; cx = min(cx, 1.0_rp)
             else
-              cext = -cx; cx = 0.0_rp
+              cext = min(-cx, 1.0_rp); cx = 0.0_rp
             endif
             t(0, j, k, nn, it) = (1.0_rp - cx) * (t(0, j, k, ns, it) &
                  - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p) &
@@ -1082,10 +1097,11 @@ contains
             g1p = (t(nx + 1, j + 1, k, ns, it) - t(nx + 1, j, k, ns, it)) * vmask(nx + 1, j + 1)
             cx = dtw * u(nx + 1, j, k, nr) * pm(nx + 1, j)
             cy = 0.5_rp * dtw * (v(nx + 1, j, k, nr) + v(nx + 1, j + 1, k, nr)) * pn(nx + 1, j)
+            cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
             if (cx > 0.0_rp) then
-              cext = 0.0_rp
+              cext = 0.0_rp; cx = min(cx, 1.0_rp)
             else
-              cext = -cx; cx = 0.0_rp
+              cext = min(-cx, 1.0_rp); cx = 0.0_rp
             endif
             t(nx + 1, j, k, nn, it) = (1.0_rp - cx) * (t(nx + 1, j, k, ns, it) &
                  - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p) &
@@ -1116,10 +1132,11 @@ contains
             g1p = (t(i + 1, 1, k, ns, it) - t(i, 1, k, ns, it)) * umask(i + 1, 1)
             cx = -dtw * v(i, 1, k, nr) * pn(i, 0)
             cy = 0.5_rp * dtw * (u(i, 0, k, nr) + u(i + 1, 0, k, nr)) * pm(i, 0)
+            cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
             if (cx > 0.0_rp) then
-              cext = 0.0_rp
+              cext = 0.0_rp; cx = min(cx, 1.0_rp)
             else
-              cext = -cx; cx = 0.0_rp
+              cext = min(-cx, 1.0_rp); cx = 0.0_rp
             endif
             t(i, 0, k, nn, it) = (1.0_rp - cx) * (t(i, 0, k, ns, it) &
                  - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p) &
@@ -1151,10 +1168,11 @@ contains
             g1p = (t(i + 1, ny + 1, k, ns, it) - t(i, ny + 1, k, ns, it)) * umask(i + 1, ny + 1)
             cx = dtw * v(i, ny + 1, k, nr) * pn(i, ny + 1)
             cy = 0.5_rp * dtw * (u(i, ny + 1, k, nr) + u(i + 1, ny + 1, k, nr)) * pm(i, ny + 1)
+            cy = max(-1.0_rp, min(1.0_rp, cy))   ! Courant numbers <= 1: convex update
             if (cx > 0.0_rp) then
-              cext = 0.0_rp
+              cext = 0.0_rp; cx = min(cx, 1.0_rp)
             else
-              cext = -cx; cx = 0.0_rp
+              cext = min(-cx, 1.0_rp); cx = 0.0_rp
             endif
             t(i, ny + 1, k, nn, it) = (1.0_rp - cx) * (t(i, ny + 1, k, ns, it) &
                  - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p) &
