@@ -1,8 +1,7 @@
 module nc_io
   ! Serial NetCDF-Fortran helpers. Host memory only. PIO later.
   !
-  ! Output format (ROMS_GPU_OUT_FORMAT, nc_out_cdf5): cdf5 (the default)
-  ! or nc4. With cdf5, nc_create defines a file as CDF5 (nf90_64bit_data),
+  ! Output files are CDF5: nc_create defines a file as CDF5 (nf90_64bit_data),
   ! without fill, under the scratch name <path>.hdr; nc_enddef aligns the
   ! fixed-size and the record sections on 4-KiB pages; nc_close then
   !   - copies the header pages into a new file <path> with O_DIRECT and
@@ -10,30 +9,25 @@ module nc_io
   !     fill: no buffered byte ever reaches them, cdf_direct), and reports
   !     a Lustre layout too narrow for a large record (ROMS_GPU_IO_WIDE_GB);
   !   - renames <path>.hdr to <path> when data were put (a serial file).
-  ! Serial writes open classic files with a 64-MiB buffer hint. Chunking
-  ! applies to netCDF-4 files only. nc4: netCDF-4 files as before.
+  ! Serial writes open the files with a 64-MiB buffer hint. Input files may
+  ! be classic or netCDF-4 (read through netCDF).
   use kinds
   use netcdf
   use cdf_direct, only: cdf_file_t, cdf_copy_header, cdf_rename
   implicit none
-#ifdef USE_MPI
-  include 'mpif.h'
-#endif
   private
 
   integer, parameter :: MAXCR = 64                  ! files being defined at once
   integer :: cr_ncid(MAXCR) = -1
   logical :: cr_data(MAXCR) = .false.
   character(len=1024) :: cr_path(MAXCR) = ''
-  integer :: out_fmt = -1                           ! -1 unknown, 0 nc4, 1 cdf5
   integer, parameter :: SERIAL_BUF = 67108864       ! classic-file buffer hint for serial writes (64 MiB)
 
-  public :: nc_out_cdf5, nc_io_direct
+  public :: nc_io_direct
 
   public :: iomsg_text
   public :: nc_open_read
   public :: nc_open_write
-  public :: nc_open_write_par, nc_set_par_access
   public :: nc_create
   public :: nc_sync
   public :: nc_def_var_f
@@ -103,35 +97,9 @@ contains
     character(len=*), intent(in)  :: path
     integer,          intent(out) :: ncid
     integer :: bufr
-    if (nc_out_cdf5()) then
-      bufr = SERIAL_BUF          ! classic files: a large buffer (0.1 GB/s per writer without it)
-      call nc_check(nf90_open(trim(path), nf90_write, ncid, chunksize=bufr), 'openw '//trim(path))
-    else
-      call nc_check(nf90_open(trim(path), nf90_write, ncid), 'openw '//trim(path))
-    endif
+    bufr = SERIAL_BUF          ! classic files: a large buffer (0.1 GB/s per writer without it)
+    call nc_check(nf90_open(trim(path), nf90_write, ncid, chunksize=bufr), 'openw '//trim(path))
   end subroutine nc_open_write
-
-  logical function nc_out_cdf5()
-    ! ROMS_GPU_OUT_FORMAT: cdf5 (default) or nc4 (netCDF-4 output as before)
-    character(len=16) :: val
-    integer :: stat
-    if (out_fmt < 0) then
-      out_fmt = 1
-      call get_environment_variable('ROMS_GPU_OUT_FORMAT', val, status=stat)
-      if (stat == 0) then
-        select case (trim(adjustl(val)))
-        case ('nc4', 'NC4', 'netcdf4')
-          out_fmt = 0
-        case ('cdf5', 'CDF5', '')
-          out_fmt = 1
-        case default
-          write(*,'(3a)') 'nc_io: ROMS_GPU_OUT_FORMAT=', trim(val), ' is not cdf5 or nc4'
-          error stop 'nc_io: ROMS_GPU_OUT_FORMAT'
-        end select
-      endif
-    endif
-    nc_out_cdf5 = (out_fmt == 1)
-  end function nc_out_cdf5
 
   logical function nc_io_direct()
     ! ROMS_GPU_IO_DIRECT: 1 (default) O_DIRECT writes of CDF5 output; 0 the same byte ranges buffered
@@ -163,79 +131,12 @@ contains
     if (i > 0) cr_data(i) = .true.
   end subroutine mark_data
 
-  logical function is_netcdf4(ncid)
-    integer, intent(in) :: ncid
-    integer :: fmt
-    call nc_check(nf90_inquire(ncid, formatNum=fmt), 'inquire format')
-    is_netcdf4 = (fmt == nf90_format_netcdf4)
-  end function is_netcdf4
-
-  subroutine nc_open_write_par(path, ncid, comm)
-    ! Open for writing from several ranks at once (parallel NetCDF-4 /
-    ! HDF5, collective over comm); every variable set to independent access
-    ! so each writer puts its own variables without the others.
-    character(len=*), intent(in)  :: path
-    integer,          intent(out) :: ncid
-    integer,          intent(in)  :: comm
-#ifdef USE_MPI
-    integer :: nvars, v
-    call nc_check(nf90_open(trim(path), ior(nf90_write, nf90_mpiio), ncid, comm=comm, info=MPI_INFO_NULL), &
-                  'parallel open '//trim(path))
-    call nc_check(nf90_inquire(ncid, nvariables=nvars), 'inquire '//trim(path))
-    do v = 1, nvars
-      call nc_check(nf90_var_par_access(ncid, v, nf90_independent), 'par_access')
-    enddo
-#else
-    error stop 'nc_open_write_par: needs MPI'
-#endif
-  end subroutine nc_open_write_par
-
-  subroutine nc_set_par_access(ncid, collective)
-    ! All variables collective (.true.) or independent (parallel NetCDF).
-    integer, intent(in) :: ncid
-    logical, intent(in) :: collective
-#ifdef USE_MPI
-    integer :: nvars, v, mode
-    mode = nf90_independent
-    if (collective) mode = nf90_collective
-    call nc_check(nf90_inquire(ncid, nvariables=nvars), 'inquire')
-    do v = 1, nvars
-      call nc_check(nf90_var_par_access(ncid, v, mode), 'par_access')
-    enddo
-#endif
-  end subroutine nc_set_par_access
-
-  subroutine nc_chunk_one_record(ncid, varid, dimids)
-    integer, intent(in) :: ncid, varid, dimids(:)
-    integer :: i, n, unlim, chunks(size(dimids))
-    logical :: has_rec
-    if (.not. is_netcdf4(ncid)) return          ! classic files are not chunked
-    call nc_check(nf90_inquire(ncid, unlimitedDimId=unlim), 'inquire unlimited')
-    has_rec = .false.
-    do i = 1, size(dimids)
-      if (dimids(i) == unlim) then
-        chunks(i) = 1
-        has_rec = .true.
-      else
-        call nc_check(nf90_inquire_dimension(ncid, dimids(i), len=n), 'dim len')
-        chunks(i) = n
-      endif
-    enddo
-    if (has_rec .and. size(dimids) >= 2) &
-         call nc_check(nf90_def_var_chunking(ncid, varid, nf90_chunked, chunks), 'chunking')
-  end subroutine nc_chunk_one_record
-
   subroutine nc_create(path, ncid)
-    ! nc4: a netCDF-4 file. cdf5: a CDF5 file without fill under the scratch
-    ! name <path>.hdr (nc_close gives it its name).
+    ! A CDF5 file without fill under the scratch name <path>.hdr (nc_close
+    ! gives it its name).
     character(len=*), intent(in)  :: path
     integer,          intent(out) :: ncid
     integer :: i, old
-    if (.not. nc_out_cdf5()) then
-      call nc_check(nf90_create(trim(path), ior(nf90_clobber, nf90_netcdf4), ncid), &
-                    'create '//trim(path))
-      return
-    endif
     call nc_check(nf90_create(trim(path)//'.hdr', ior(nf90_clobber, nf90_64bit_data), ncid), &
                   'create '//trim(path)//'.hdr')
     call nc_check(nf90_set_fill(ncid, nf90_nofill, old), 'set_fill '//trim(path))
@@ -420,10 +321,6 @@ contains
     integer,          intent(in) :: ncid, dimids(:)
     character(len=*), intent(in) :: name
     call nc_check(nf90_def_var(ncid, trim(name), nf90_double, dimids, varid), 'def_var '//trim(name))
-    ! Record variables chunked as one record (as the float history
-    ! variables): one chunk per put, and parallel HDF5 can then write a
-    ! record independently once it has been extended collectively.
-    call nc_chunk_one_record(ncid, varid, dimids)
   end function nc_def_var
 
   integer function nc_def_var_i(ncid, name, dimids) result(varid)
@@ -434,28 +331,10 @@ contains
   end function nc_def_var_i
 
   integer function nc_def_var_f(ncid, name, dimids) result(varid)
-    ! Single-precision variable (history output), chunked as one record:
-    ! the full spatial extents and 1 along the unlimited dimension, so a
-    ! record append is a single contiguous HDF5 write.
+    ! Single-precision variable (history output).
     integer,          intent(in) :: ncid, dimids(:)
     character(len=*), intent(in) :: name
-    integer :: i, n, chunks(size(dimids))
-    logical :: unlim
     call nc_check(nf90_def_var(ncid, trim(name), nf90_float, dimids, varid), 'def_var '//trim(name))
-    unlim = .false.
-    do i = 1, size(dimids)
-      call nc_check(nf90_inquire_dimension(ncid, dimids(i), len=n), 'inq_dim')
-      if (n <= 0) then
-        chunks(i) = 1
-        unlim = .true.
-      else
-        chunks(i) = n
-      endif
-    enddo
-    if (unlim .and. size(dimids) >= 3) then
-      if (is_netcdf4(ncid)) &
-           call nc_check(nf90_def_var_chunking(ncid, varid, nf90_chunked, chunks), 'chunking '//trim(name))
-    endif
   end function nc_def_var_f
 
   subroutine nc_sync(ncid)

@@ -9,13 +9,12 @@ module par_read
   ! MPI. The bytes that land in a tile are exactly the bytes the window read
   ! would have produced.
   !
-  ! The bytes of a whole variable record come from one of three readers
+  ! The bytes of a whole variable record come from one of two readers
   ! (ROMS_GPU_PAR_READ): 'direct' (the default) reads a classic-format file
   ! (CDF-1, CDF-2, CDF-5) with O_DIRECT through cdf_direct, which is several
   ! times faster than buffered reads on Lustre (flush_direct); netCDF-4 files
   ! and anything cdf_direct does not recognise fall back to 'whole', the
-  ! whole-variable reads through netCDF; 'mpiio' reads the windows
-  ! collectively through parallel netCDF (netCDF-4 files only).
+  ! whole-variable reads through netCDF.
   !
   ! Usage (collective; every compute rank runs the same call sequence):
   !   call pr_begin()                 ! phase 1: pr_read_* only record requests
@@ -56,11 +55,10 @@ module par_read
   end type sb_t
   type(ent_t), save :: q(MAXQ)
   integer :: nq = 0, inext = 0, mode = 0   ! mode 0 idle, 1 queueing, 2 taking
-  ! ROMS_GPU_PAR_READ = 'mpiio': every rank reads its windows collectively
-  ! through parallel NetCDF (MPI-IO) instead of the whole-variable scheme.
-  ! 'direct' (default): whole variables with O_DIRECT from classic files
-  ! (flush_direct), else as 'whole'. 'whole': whole variables through netCDF.
-  logical :: use_mpiio = .false., use_direct = .true., mode_checked = .false.
+  ! ROMS_GPU_PAR_READ = 'direct' (default): whole variables with O_DIRECT
+  ! from classic files (flush_direct), else as 'whole'. 'whole': whole
+  ! variables through netCDF.
+  logical :: use_direct = .true., mode_checked = .false.
   ! ROMS_GPU_PAR_READ_VERIFY=1: every direct read is read again through
   ! netCDF and compared bit for bit (a check; doubles the reads).
   logical :: dr_verify = .false.
@@ -261,10 +259,6 @@ contains
     nc = comm_size(); me = comm_rank()
     if (.not. mode_checked) call read_mode(me)
 #ifdef USE_MPI
-    if (use_mpiio .and. nc > 1) then
-      if (flush_mpiio(ncid)) return
-      if (me == 0) write(*,'(a)') 'par_read: parallel (MPI-IO) open not available for this file; using whole-variable reads'
-    endif
     comm = comm_compute()
     allocate(nqs(0:nc - 1))
     call MPI_Allgather(nq, 1, MPI_INTEGER, nqs, 1, MPI_INTEGER, comm, ierr)
@@ -277,7 +271,7 @@ contains
     enddo
     call MPI_Allgather(mine, 4 * nq, MPI_INTEGER, win, 4 * nq, MPI_INTEGER, comm, ierr)
     deallocate(mine)
-    if (use_direct .and. .not. use_mpiio) then
+    if (use_direct) then
       if (flush_direct(ncid, win)) then
         deallocate(win)
         return
@@ -350,23 +344,21 @@ contains
   end subroutine pr_flush
 
   subroutine read_mode(me)
-    ! ROMS_GPU_PAR_READ (direct | whole | mpiio), ROMS_GPU_PAR_READ_VERIFY,
+    ! ROMS_GPU_PAR_READ (direct | whole), ROMS_GPU_PAR_READ_VERIFY,
     ! ROMS_GPU_DIRECT_PIECE_MB; read once.
     integer, intent(in) :: me
     character(len=16) :: val
     integer :: stat, ln, mb, ios
     call get_environment_variable('ROMS_GPU_PAR_READ', val, length=ln, status=stat)
-    use_mpiio = .false.; use_direct = .true.
+    use_direct = .true.
     if (stat == 0 .and. ln > 0) then
       select case (trim(val))
       case ('direct')
       case ('whole')
         use_direct = .false.
-      case ('mpiio')
-        use_mpiio = .true.; use_direct = .false.
       case default
         if (me == 0) write(*,'(3a)') 'par_read: ROMS_GPU_PAR_READ=', trim(val), &
-             ' not known (direct, whole, mpiio); using direct'
+             ' not known (direct, whole); using direct'
       end select
     endif
     call get_environment_variable('ROMS_GPU_PAR_READ_VERIFY', val, length=ln, status=stat)
@@ -596,56 +588,6 @@ contains
     if (dr_verify) write(*,'(a,i0,a,i0,a,i0,a)') 'par_read verify: rank ', me, '  ', nver, ' variables checked, ', &
          nbad, ' differ'
   end function flush_direct
-
-  logical function flush_mpiio(ncid) result(ok)
-    ! Collective window reads: the file is opened once more in parallel mode
-    ! on the compute communicator and every queued window is read by its
-    ! rank with collective access (same variable order on every rank).
-    integer, intent(in) :: ncid
-    integer :: pncid, varid, ndims, k, n, ierr, nvars, v
-    real(8) :: c0, c1
-    character(len=1024) :: path
-    integer, allocatable :: start(:), cnt(:)
-    call nc_check(nf90_inq_path(ncid, n, path), 'inq_path')
-    c0 = wall_time()
-    ok = .false.
-    ierr = nf90_open(trim(path), ior(nf90_nowrite, nf90_mpiio), pncid, comm=comm_compute(), info=MPI_INFO_NULL)
-    if (ierr /= nf90_noerr) return
-    call nc_check(nf90_inquire(pncid, nvariables=nvars), 'inquire')
-    do v = 1, nvars
-      ierr = nf90_var_par_access(pncid, v, nf90_collective)
-      if (ierr /= nf90_noerr) then
-        ierr = nf90_close(pncid)
-        return
-      endif
-    enddo
-    ok = .true.
-    do k = 1, nq
-      n = q(k)%n1 * q(k)%n2 * q(k)%n3
-      allocate(q(k)%buf(n))
-      call nc_check(nf90_inq_varid(pncid, trim(q(k)%name), varid), 'var '//trim(q(k)%name))
-      call nc_check(nf90_inquire_variable(pncid, varid, ndims=ndims), 'ndims '//trim(q(k)%name))
-      if (q(k)%n3 == 1) then
-        if (q(k)%rec > 0 .and. ndims >= 3) then
-          allocate(start(3), cnt(3)); start = (/q(k)%i0f, q(k)%j0f, q(k)%rec/); cnt = (/q(k)%n1, q(k)%n2, 1/)
-        else
-          allocate(start(2), cnt(2)); start = (/q(k)%i0f, q(k)%j0f/); cnt = (/q(k)%n1, q(k)%n2/)
-        endif
-      else
-        if (q(k)%rec > 0 .and. ndims >= 4) then
-          allocate(start(4), cnt(4)); start = (/q(k)%i0f, q(k)%j0f, 1, q(k)%rec/); cnt = (/q(k)%n1, q(k)%n2, q(k)%n3, 1/)
-        else
-          allocate(start(3), cnt(3)); start = (/q(k)%i0f, q(k)%j0f, 1/); cnt = (/q(k)%n1, q(k)%n2, q(k)%n3/)
-        endif
-      endif
-      call nc_check(nf90_get_var(pncid, varid, q(k)%buf, start=start, count=cnt), 'get '//trim(q(k)%name))
-      deallocate(start, cnt)
-    enddo
-    call nc_check(nf90_close(pncid), 'close parallel')
-    c1 = wall_time()
-    write(*,'(a,i0,a,i0,a,f7.2,a)') 'par_read: rank ', comm_rank(), '  vars ', nq, '  collective MPI-IO window reads ', &
-         (c1 - c0), ' s'
-  end function flush_mpiio
 #endif
 
   subroutine stage_to_device(k, n)

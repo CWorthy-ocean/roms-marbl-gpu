@@ -45,8 +45,6 @@ NWOPT=""
 PNOPT=""
 READER=1
 STRIPE=1
-FMTOPT=""
-[ "${ROMS_GPU_OUT_FORMAT:-cdf5}" = nc4 ] && FMTOPT="--format nc4"
 for a in "$@"; do
   case $a in
     NWRITERS=*) NWOPT="--max-writers ${a#NWRITERS=} --target-seconds 0.001" ;;
@@ -54,11 +52,10 @@ for a in "$@"; do
     PERNODE=0) PNOPT="--last-node" ;;
     READER=[01]) READER=${a#READER=} ;;
     STRIPE=[01]) STRIPE=${a#STRIPE=} ;;
-    ROMS_GPU_OUT_FORMAT=nc4) FMTOPT="--format nc4"; EXTRA="${EXTRA},${a}" ;;
     *) EXTRA="${EXTRA},${a}" ;;
   esac
 done
-if [ "$STRIPE" = 1 ] && [ -z "$FMTOPT" ]; then
+if [ "$STRIPE" = 1 ]; then
   read OUTDIR LFSOPT <<< "$($PYTHON "$ROOT/tools/gpu_layout.py" "$NML" --stripe --wide-gb "${ROMS_GPU_IO_WIDE_GB:-4}")"
   if [ -n "$LFSOPT" ]; then
     mkdir -p "$OUTDIR"
@@ -71,7 +68,7 @@ if [ "$STRIPE" = 1 ] && [ -z "$FMTOPT" ]; then
 fi
 RDOPT=""
 if [ "$READER" = 1 ]; then RDOPT="--reader"; EXTRA="${EXTRA},ROMS_GPU_FRC_READER=1"; fi
-LAYOUT=$($PYTHON "$ROOT/tools/gpu_layout.py" "$NML" --gpus-per-node $GPUS_PER_NODE $NWOPT $PNOPT $RDOPT $FMTOPT)
+LAYOUT=$($PYTHON "$ROOT/tools/gpu_layout.py" "$NML" --gpus-per-node $GPUS_PER_NODE $NWOPT $PNOPT $RDOPT)
 read NTILE NW NRANKS SELECT WPN <<< "$LAYOUT"
 [ -n "$SELECT" ] || { echo "submit_gpu.sh: gpu_layout.py gave no layout for $NML" >&2; exit 1; }
 echo "layout: $NTILE compute ranks + $NW writer(s)${RDOPT:+ + forcing readers} = $NRANKS ranks; select=$SELECT"

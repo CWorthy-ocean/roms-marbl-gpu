@@ -178,11 +178,13 @@ contains
     fname_his = ''; fname_rst = ''
     call set_write_bounds()
     call init_staging()
+    call wall_stamp('output staging buffers')
     output_ready = .true.
     if (monthly_restarts) write(*,*) 'monthly_restarts is not implemented; using output_period_rst'
     if (wrt_file_his) then
       write(*,'(a,es12.4,a)') 'history: initial write, period = ', output_period_his, ' s'
       call wrt_his(.true.)
+      call wall_stamp('initial history record staged')
     endif
   end subroutine init_output
 
@@ -657,7 +659,14 @@ contains
     n3w = count((/wrt_O, wrt_Akv, wrt_Akt, wrt_Aks/))
     cap_rec = n2d * nxy + n3d * nxy * nh + n3w * nxy * nhw
     cap_field = nxy * nhw
-    if (wrt_file_his .or. wrt_file_rst) call io_init(cap_rec, cap_field)
+    ! the float set is pinned for history records only: a restart stages
+    ! doubles (io_init8), and pinning a history-sized set took ~3 s per
+    ! rank at start-up (Pacific basin)
+    if (wrt_file_his) then
+      call io_init(cap_rec, cap_field)
+    elseif (wrt_file_rst) then
+      call io_init(1, 1)
+    endif
     ! double-precision capacity for one restart record of this tile
     ! (+ the implicit free surface's rates, scalars and fs_mg_lag fields, when on: 8 2-D fields and 64 values;
     ! + the IMEX state, when on: 11 3-D fields, 'modal' 1 more, and the scalars)
