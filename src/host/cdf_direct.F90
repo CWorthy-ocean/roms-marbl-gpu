@@ -1269,11 +1269,16 @@ contains
   end function cdf_plan
 
   subroutine swap32_copy(s, d)
+    ! d = s with the bytes of every 32-bit word reversed (the swap written
+    ! out, so that the loop vectorises)
     integer(int32), intent(in), contiguous :: s(:)
     integer(int32), intent(inout), contiguous :: d(:)
+    integer(int32), parameter :: M2 = int(z'00FF0000', int32), M3 = int(z'0000FF00', int32)
     integer(int64) :: i
+    integer(int32) :: x
     do i = 1, size(s, kind=int64)
-      d(i) = bswap32(s(i))
+      x = s(i)
+      d(i) = ior(ior(ishft(x, 24), iand(ishft(x, 8), M2)), ior(iand(ishft(x, -8), M3), ishft(x, -24)))
     enddo
   end subroutine swap32_copy
 
@@ -1282,10 +1287,14 @@ contains
     ! words) -> big-endian bytes as 32-bit words: the halves swap places
     integer(int32), intent(in), contiguous :: s(:)
     integer(int32), intent(inout), contiguous :: d(:)
+    integer(int32), parameter :: M2 = int(z'00FF0000', int32), M3 = int(z'0000FF00', int32)
     integer(int64) :: i
+    integer(int32) :: x, y
     do i = 1, size(s, kind=int64) / 2
-      d(2 * i - 1) = bswap32(s(2 * i))
-      d(2 * i) = bswap32(s(2 * i - 1))
+      x = s(2 * i)
+      y = s(2 * i - 1)
+      d(2 * i - 1) = ior(ior(ishft(x, 24), iand(ishft(x, 8), M2)), ior(iand(ishft(x, -8), M3), ishft(x, -24)))
+      d(2 * i) = ior(ior(ishft(y, 24), iand(ishft(y, 8), M2)), ior(iand(ishft(y, -8), M3), ishft(y, -24)))
     enddo
   end subroutine swap64_copy
 

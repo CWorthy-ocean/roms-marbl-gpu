@@ -547,6 +547,20 @@ contains
     call system_clock(c1)
     write(*,'(a,f7.2,a)') 'speed: cdf_pack_r4 float  ', real(N4 * 4, 8) / 1.0d9 / max(real(c1 - c0, 8) / cr, 1.0d-9), &
          ' GB/s (8-byte aligned destination)'
+    call system_clock(c0, cr)
+    do e = 1, N4, 232                         ! rows of a Pacific tile (io_server pack_rows)
+      call cdf_pack_r4(a4(e), min(232_int64, N4 - e + 1), CDF_FLOAT, b, 4_int64 * (e - 1))
+    enddo
+    call system_clock(c1)
+    write(*,'(a,f7.2,a)') 'speed: cdf_pack_r4 float  ', real(N4 * 4, 8) / 1.0d9 / max(real(c1 - c0, 8) / cr, 1.0d-9), &
+         ' GB/s (rows of 232)'
+    call system_clock(c0, cr)
+    do e = 1, N8, 232
+      call cdf_pack_r8(a8(e), min(232_int64, N8 - e + 1), CDF_DOUBLE, b, 4_int64 + 8_int64 * (e - 1))
+    enddo
+    call system_clock(c1)
+    write(*,'(a,f7.2,a)') 'speed: cdf_pack_r8 double ', real(N8 * 8, 8) / 1.0d9 / max(real(c1 - c0, 8) / cr, 1.0d-9), &
+         ' GB/s (rows of 232)'
     call system_clock(c0)
     call cdf_pack_r8(a8, N8, CDF_DOUBLE, b, 4_int64)
     call system_clock(c1)

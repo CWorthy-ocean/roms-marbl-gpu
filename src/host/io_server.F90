@@ -65,7 +65,7 @@ module io_server
   use run_timers, only: wall_time
   use cdf_direct, only: cdf_file_t, cdf_buf_t, cdf_open_w, cdf_close_w, cdf_var_index, cdf_calcsize, &
                         cdf_set_numrecs, cdf_write, cdf_read_page, cdf_pack_r4, cdf_pack_r8, cdf_pack_i4, cdf_plan, &
-                        cdf_truncate, cdf_buf_reserve, cdf_buf_free, cdf_watchdog_set, CDF_INT
+                        cdf_truncate, cdf_buf_reserve, cdf_buf_free, cdf_watchdog_set, CDF_INT, CDF_FLOAT, CDF_DOUBLE
 #ifdef USE_CUDA
   use cudafor
   use arch_mod, only: work_stream
@@ -1154,7 +1154,15 @@ contains
         d_rmw = d_rmw + 1
       endif
       c1 = wall_time()
-      if (sk(s) > 0) then
+      xt = dfile(k)%v(sv(s))%xtype
+      if (sk(s) > 0 .and. ((r0%dbl .and. xt == CDF_DOUBLE) .or. (.not. r0%dbl .and. xt == CDF_FLOAT))) then
+        ! no conversion: each tile's rows go straight from its slab into the page buffer, byte-swapped
+        ! (one pass instead of assembling into gbuf and packing that: half the memory traffic)
+        call pack_rows(s, pbuf, soff(s) - base)
+        c2 = wall_time()
+        t_asm = t_asm + real(c2 - c1)
+        c1 = c2
+      elseif (sk(s) > 0) then
         call assemble_var(isl, sk(s), sgx(s), sgy(s), sn3(s), r0%dbl)
         c2 = wall_time()
         t_asm = t_asm + real(c2 - c1)
@@ -1255,6 +1263,38 @@ contains
         call cdf_pack_r8(v8, n, xt, b, boff)
       endif
     end subroutine pack_seg
+
+    subroutine pack_rows(s, b, boff)
+      ! Segment s (a staged variable stored in the file's own type) into b at
+      ! byte boff, row by row from the tiles' slabs: the global element of
+      ! tile row (j, k) starting at i0 is (k-1)*gx*gy + (j0+j-2)*gx + (i0-1).
+      ! The same values and order as assemble_var + pack_seg (later tiles
+      ! overwrite earlier ones where slabs overlap).
+      integer, intent(in) :: s
+      type(cdf_buf_t), intent(inout) :: b
+      integer(8), intent(in) :: boff
+      integer :: t, iv, j, kk, n1, n2, i0, j0, off, gx, gy, sz
+      integer(8) :: e, src
+      iv = sk(s)
+      gx = sgx(s); gy = sgy(s)
+      sz = dfile(k)%v(sv(s))%xsz
+      do t = 0, size(tbuf, 1) - 1
+        n1 = tmeta(t, isl)%n1(iv); n2 = tmeta(t, isl)%n2(iv)
+        i0 = tmeta(t, isl)%i0f(iv); j0 = tmeta(t, isl)%j0f(iv); off = tmeta(t, isl)%off(iv)
+        if (n1 <= 0) cycle
+        do kk = 1, sn3(s)
+          do j = 1, n2
+            e = int(kk - 1, 8) * gx * gy + int(j0 + j - 2, 8) * gx + (i0 - 1)
+            src = int(off, 8) + int(kk - 1, 8) * n1 * n2 + int(j - 1, 8) * n1
+            if (r0%dbl) then
+              call cdf_pack_r8(tbuf(t, isl)%b8(src), int(n1, 8), xt, b, boff + e * sz)
+            else
+              call cdf_pack_r4(tbuf(t, isl)%b(src), int(n1, 8), xt, b, boff + e * sz)
+            endif
+          enddo
+        enddo
+      enddo
+    end subroutine pack_rows
 
     subroutine head_bytes(s, nb, b)
       ! the first nb bytes of segment s (file representation) into b
