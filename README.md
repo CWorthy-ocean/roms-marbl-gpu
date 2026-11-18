@@ -312,6 +312,23 @@ v0.1.2-beta, bit for bit.
   in the loop 4.8-5.4 s instead of 6.9 s; the time from the end of the
   loop to exit is unchanged (23 s: the last records' writes). Output is
   unchanged.
+- Open boundaries: the explicit Orlanski updates (3-D velocities, tracers
+  including the passive and MARBL tracers, and the tangential barotropic
+  velocity) cap their Courant numbers at 1, as in UCLA ROMS
+  (CWorthy-ocean/ucla-roms#457, 3e1aaec2): the flow along the edge to
+  [-1, 1], the flow across it and the inflow nudging weight to at most 1,
+  so each new boundary value is an average with weights between 0 and 1.
+  Above 1 the update overshot, and along the edge it grew a two-cell
+  checkerboard (UCLA ROMS's Gulf of Mexico nest at 1350-1500 s steps). The
+  normal velocities, already a convex average, cap only the inflow
+  nudging weight. Results change only where a Courant number exceeded 1:
+  the Sargasso Sea, the California Current nest, the small MARBL test
+  domain and the Gulf of Mexico nest at 600 s are unchanged, bit for bit.
+  On the Gulf of Mexico nest at 1350 s the clip acts from the first step
+  (outflow on the east edge, Courant number up to 1.40; inflow on the
+  south edge, 1.46), and the change it makes in the GPU's fields equals
+  the change in UCLA ROMS's to within the CPU's own regular-against-strict
+  spread, at each of the 8 steps compared.
 - Faster cold start with many forcing files: while the grid and restart
   files are read, a few threads per compute rank read ahead the bytes of
   the forcing files that start-up reads next (their headers, every value
