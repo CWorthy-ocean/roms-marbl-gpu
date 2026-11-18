@@ -1,12 +1,34 @@
 module nc_io
   ! Serial NetCDF-Fortran helpers. Host memory only. PIO later.
+  !
+  ! Output format (ROMS_GPU_OUT_FORMAT, nc_out_cdf5): cdf5 (the default)
+  ! or nc4. With cdf5, nc_create defines a file as CDF5 (nf90_64bit_data),
+  ! without fill, under the scratch name <path>.hdr; nc_enddef aligns the
+  ! fixed-size and the record sections on 4-KiB pages; nc_close then
+  !   - copies the header pages into a new file <path> with O_DIRECT and
+  !     removes <path>.hdr when no data were put (the files the writer ranks
+  !     fill: no buffered byte ever reaches them, cdf_direct), and reports
+  !     a Lustre layout too narrow for a large record (ROMS_GPU_IO_WIDE_GB);
+  !   - renames <path>.hdr to <path> when data were put (a serial file).
+  ! Serial writes open classic files with a 64-MiB buffer hint. Chunking
+  ! applies to netCDF-4 files only. nc4: netCDF-4 files as before.
   use kinds
   use netcdf
+  use cdf_direct, only: cdf_file_t, cdf_copy_header, cdf_rename
   implicit none
 #ifdef USE_MPI
   include 'mpif.h'
 #endif
   private
+
+  integer, parameter :: MAXCR = 64                  ! files being defined at once
+  integer :: cr_ncid(MAXCR) = -1
+  logical :: cr_data(MAXCR) = .false.
+  character(len=1024) :: cr_path(MAXCR) = ''
+  integer :: out_fmt = -1                           ! -1 unknown, 0 nc4, 1 cdf5
+  integer, parameter :: SERIAL_BUF = 67108864       ! classic-file buffer hint for serial writes (64 MiB)
+
+  public :: nc_out_cdf5, nc_io_direct
 
   public :: iomsg_text
   public :: nc_open_read
@@ -80,8 +102,73 @@ contains
   subroutine nc_open_write(path, ncid)
     character(len=*), intent(in)  :: path
     integer,          intent(out) :: ncid
-    call nc_check(nf90_open(trim(path), nf90_write, ncid), 'openw '//trim(path))
+    integer :: bufr
+    if (nc_out_cdf5()) then
+      bufr = SERIAL_BUF          ! classic files: a large buffer (0.1 GB/s per writer without it)
+      call nc_check(nf90_open(trim(path), nf90_write, ncid, chunksize=bufr), 'openw '//trim(path))
+    else
+      call nc_check(nf90_open(trim(path), nf90_write, ncid), 'openw '//trim(path))
+    endif
   end subroutine nc_open_write
+
+  logical function nc_out_cdf5()
+    ! ROMS_GPU_OUT_FORMAT: cdf5 (default) or nc4 (netCDF-4 output as before)
+    character(len=16) :: val
+    integer :: stat
+    if (out_fmt < 0) then
+      out_fmt = 1
+      call get_environment_variable('ROMS_GPU_OUT_FORMAT', val, status=stat)
+      if (stat == 0) then
+        select case (trim(adjustl(val)))
+        case ('nc4', 'NC4', 'netcdf4')
+          out_fmt = 0
+        case ('cdf5', 'CDF5', '')
+          out_fmt = 1
+        case default
+          write(*,'(3a)') 'nc_io: ROMS_GPU_OUT_FORMAT=', trim(val), ' is not cdf5 or nc4'
+          error stop 'nc_io: ROMS_GPU_OUT_FORMAT'
+        end select
+      endif
+    endif
+    nc_out_cdf5 = (out_fmt == 1)
+  end function nc_out_cdf5
+
+  logical function nc_io_direct()
+    ! ROMS_GPU_IO_DIRECT: 1 (default) O_DIRECT writes of CDF5 output; 0 the same byte ranges buffered
+    character(len=16) :: val
+    integer :: stat
+    nc_io_direct = .true.
+    call get_environment_variable('ROMS_GPU_IO_DIRECT', val, status=stat)
+    if (stat == 0) nc_io_direct = (trim(adjustl(val)) /= '0')
+  end function nc_io_direct
+
+  integer function cr_slot(ncid)
+    ! the nc_create table entry of ncid (0: not a CDF5 file being created)
+    integer, intent(in) :: ncid
+    integer :: i
+    cr_slot = 0
+    do i = 1, MAXCR
+      if (cr_ncid(i) == ncid .and. ncid >= 0) then
+        cr_slot = i
+        return
+      endif
+    enddo
+  end function cr_slot
+
+  subroutine mark_data(ncid)
+    ! data put into a file still under its scratch name: nc_close renames it
+    integer, intent(in) :: ncid
+    integer :: i
+    i = cr_slot(ncid)
+    if (i > 0) cr_data(i) = .true.
+  end subroutine mark_data
+
+  logical function is_netcdf4(ncid)
+    integer, intent(in) :: ncid
+    integer :: fmt
+    call nc_check(nf90_inquire(ncid, formatNum=fmt), 'inquire format')
+    is_netcdf4 = (fmt == nf90_format_netcdf4)
+  end function is_netcdf4
 
   subroutine nc_open_write_par(path, ncid, comm)
     ! Open for writing from several ranks at once (parallel NetCDF-4 /
@@ -122,6 +209,7 @@ contains
     integer, intent(in) :: ncid, varid, dimids(:)
     integer :: i, n, unlim, chunks(size(dimids))
     logical :: has_rec
+    if (.not. is_netcdf4(ncid)) return          ! classic files are not chunked
     call nc_check(nf90_inquire(ncid, unlimitedDimId=unlim), 'inquire unlimited')
     has_rec = .false.
     do i = 1, size(dimids)
@@ -138,16 +226,80 @@ contains
   end subroutine nc_chunk_one_record
 
   subroutine nc_create(path, ncid)
+    ! nc4: a netCDF-4 file. cdf5: a CDF5 file without fill under the scratch
+    ! name <path>.hdr (nc_close gives it its name).
     character(len=*), intent(in)  :: path
     integer,          intent(out) :: ncid
-    call nc_check(nf90_create(trim(path), ior(nf90_clobber, nf90_netcdf4), ncid), &
-                  'create '//trim(path))
+    integer :: i, old
+    if (.not. nc_out_cdf5()) then
+      call nc_check(nf90_create(trim(path), ior(nf90_clobber, nf90_netcdf4), ncid), &
+                    'create '//trim(path))
+      return
+    endif
+    call nc_check(nf90_create(trim(path)//'.hdr', ior(nf90_clobber, nf90_64bit_data), ncid), &
+                  'create '//trim(path)//'.hdr')
+    call nc_check(nf90_set_fill(ncid, nf90_nofill, old), 'set_fill '//trim(path))
+    do i = 1, MAXCR
+      if (cr_ncid(i) < 0) then
+        cr_ncid(i) = ncid
+        cr_data(i) = .false.
+        cr_path(i) = path
+        return
+      endif
+    enddo
+    error stop 'nc_create: too many files being defined at once (raise MAXCR)'
   end subroutine nc_create
 
   subroutine nc_close(ncid)
     integer, intent(in) :: ncid
+    integer :: i, cmin
+    integer(8) :: smin
+    logical :: laid
+    character(len=256) :: msg
+    character(len=1024) :: path
+    type(cdf_file_t) :: f
+    real(8) :: wide_gb
+    i = cr_slot(ncid)
     call nc_check(nf90_close(ncid), 'close')
+    if (i == 0) return
+    path = cr_path(i)
+    cr_ncid(i) = -1
+    if (cr_data(i)) then
+      ! data were put (a serial file): the scratch file becomes the file
+      if (.not. cdf_rename(trim(path)//'.hdr', trim(path))) then
+        write(*,'(3a)') 'nc_close: rename of ', trim(path), '.hdr failed'
+        error stop 'nc_close: rename'
+      endif
+      return
+    endif
+    ! header only (the writer ranks fill it): copy the header pages with O_DIRECT into a new file
+    if (.not. cdf_copy_header(trim(path)//'.hdr', trim(path), nc_io_direct(), f, cmin, smin, laid, msg)) then
+      write(*,'(4a)') 'nc_close: ', trim(path), ': ', trim(msg)
+      error stop 'nc_close: CDF5 header copy'
+    endif
+    wide_gb = wide_threshold_gb()
+    if (laid .and. f%begin_rec >= 0 .and. real(f%recsize, 8) >= wide_gb * 2.0d0**30) then
+      if (cmin < 16 .or. smin < 4194304_8) then
+        write(*,'(4a,f8.2,a,i0,a,f6.1,a)') 'nc_io: WARNING ', trim(path), ': Lustre layout too narrow for direct ', &
+             'writes of its ', real(f%recsize, 8) / 2.0d0**30, '-GiB records: ', cmin, ' stripes of ', &
+             real(smin, 8) / 1048576.0d0, ' MiB (use lfs setstripe -c 48 -S 16M on the output directory; ' // &
+             'tools/submit_gpu.sh does)'
+      endif
+    endif
   end subroutine nc_close
+
+  real(8) function wide_threshold_gb()
+    ! ROMS_GPU_IO_WIDE_GB: record size (GiB) from which a CDF5 output file
+    ! should lie on a wide Lustre stripe (default 4; tools/gpu_layout.py)
+    character(len=32) :: val
+    integer :: stat
+    wide_threshold_gb = 4.0d0
+    call get_environment_variable('ROMS_GPU_IO_WIDE_GB', val, status=stat)
+    if (stat == 0 .and. len_trim(val) > 0) then
+      read(val, *, iostat=stat) wide_threshold_gb
+      if (stat /= 0) wide_threshold_gb = 4.0d0
+    endif
+  end function wide_threshold_gb
 
   integer function nc_dim_len(ncid, name) result(n)
     integer,          intent(in) :: ncid
@@ -300,8 +452,10 @@ contains
         chunks(i) = n
       endif
     enddo
-    if (unlim .and. size(dimids) >= 3) &
-         call nc_check(nf90_def_var_chunking(ncid, varid, nf90_chunked, chunks), 'chunking '//trim(name))
+    if (unlim .and. size(dimids) >= 3) then
+      if (is_netcdf4(ncid)) &
+           call nc_check(nf90_def_var_chunking(ncid, varid, nf90_chunked, chunks), 'chunking '//trim(name))
+    endif
   end function nc_def_var_f
 
   subroutine nc_sync(ncid)
@@ -320,6 +474,7 @@ contains
     if (present(i0f)) i0 = i0f
     if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     call nc_check(nf90_inquire_variable(ncid, varid, ndims=nd), 'ndims '//trim(name))
     if (nd == 2) then
       ! a line along one edge, (n, time) (the sponge-tuning restart fields):
@@ -342,6 +497,7 @@ contains
     if (present(i0f)) i0 = i0f
     if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     if (nc_timeless(ncid, varid, 3)) then     ! a variable without the record dimension (rec ignored)
       call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, 1/), count=(/n1, n2, n3/)), 'put '//trim(name))
       return
@@ -362,6 +518,7 @@ contains
     if (present(i0f)) i0 = i0f
     if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     call nc_check(nf90_inquire_variable(ncid, varid, ndims=nd), 'ndims '//trim(name))
     if (nd == 2) then   ! a line (n, time), see nc_put_2d_rec_d
       call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, rec/), &
@@ -383,6 +540,7 @@ contains
     if (present(i0f)) i0 = i0f
     if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     if (nc_timeless(ncid, varid, 3)) then     ! a variable without the record dimension (rec ignored)
       call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, 1/), count=(/n1, n2, n3/)), 'put '//trim(name))
       return
@@ -392,8 +550,15 @@ contains
   end subroutine nc_put_3d_rec_f
 
   subroutine nc_enddef(ncid)
+    ! A CDF5 file of nc_create: the fixed-size and the record sections start
+    ! on 4-KiB pages (no page holds header and data: cdf_direct's writers
+    ! write whole pages); no free space in the header (it is never redefined).
     integer, intent(in) :: ncid
-    call nc_check(nf90_enddef(ncid), 'enddef')
+    if (cr_slot(ncid) > 0) then
+      call nc_check(nf90_enddef(ncid, h_minfree=0, v_align=4096, v_minfree=0, r_align=4096), 'enddef')
+    else
+      call nc_check(nf90_enddef(ncid), 'enddef')
+    endif
   end subroutine nc_enddef
 
   subroutine nc_put_2d(ncid, name, arr)
@@ -402,6 +567,7 @@ contains
     real(rp),         intent(in) :: arr(:, :)
     integer :: varid
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     call nc_check(nf90_put_var(ncid, varid, arr), 'put '//trim(name))
   end subroutine nc_put_2d
 
@@ -411,6 +577,7 @@ contains
     real(rp),         intent(in) :: arr(:, :, :)
     integer :: varid
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     call nc_check(nf90_put_var(ncid, varid, arr), 'put '//trim(name))
   end subroutine nc_put_3d
 
@@ -420,6 +587,7 @@ contains
     real(rp),         intent(in) :: arr(:)
     integer :: varid
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     call nc_check(nf90_put_var(ncid, varid, arr), 'put '//trim(name))
   end subroutine nc_put_1d
 
@@ -431,6 +599,7 @@ contains
     real(rp) :: buf(1)
     buf(1) = val
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     call nc_check(nf90_put_var(ncid, varid, buf, start=(/rec/), count=(/1/)), &
                   'putrec '//trim(name))
   end subroutine nc_put_1d_rec
@@ -442,6 +611,7 @@ contains
     integer,          intent(in) :: vals(:)
     integer :: varid
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     call nc_check(nf90_put_var(ncid, varid, vals, start=(/1, rec/), count=(/size(vals), 1/)), &
                   'putrec '//trim(name))
   end subroutine nc_put_ints_rec
@@ -457,6 +627,7 @@ contains
     i0 = 1
     if (present(i0f)) i0 = i0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     call nc_check(nf90_put_var(ncid, varid, vals, start=(/i0, rec/), count=(/size(vals), 1/)), &
                   'putrec '//trim(name))
   end subroutine nc_put_vec_rec_d
@@ -468,6 +639,7 @@ contains
     real(8),          intent(out) :: vals(:)
     integer :: varid
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     call nc_check(nf90_get_var(ncid, varid, vals, start=(/1, rec/), count=(/size(vals), 1/)), &
                   'getrec '//trim(name))
   end subroutine nc_get_vec_rec_d
@@ -482,6 +654,7 @@ contains
     if (present(i0f)) i0 = i0f
     if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, rec/), &
                   count=(/size(arr,1), size(arr,2), 1/)), 'putrec '//trim(name))
   end subroutine nc_put_2d_rec
@@ -497,6 +670,7 @@ contains
     if (present(i0f)) i0 = i0f
     if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call mark_data(ncid)
     if (nc_timeless(ncid, varid, 3)) then     ! a variable without the record dimension (rec ignored)
       call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, 1/), &
                     count=(/size(arr,1), size(arr,2), size(arr,3)/)), 'put '//trim(name))
