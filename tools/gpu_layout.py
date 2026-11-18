@@ -2,32 +2,45 @@
 ranks from the history record size, and the PBS select line to launch it.
 
 usage: python gpu_layout.py <namelist> [--gpus-per-node 4] [--target-seconds 15]
-                                       [--rate-gbps 0.6] [--max-writers 16] [--groups G]
-                                       [--per-node] [--reader]
-Prints:  NTILE NWRITERS NRANKS SELECT   (one line, space separated)
-         NTILE NWRITERS NRANKS SELECT NWPN   with --per-node
+                                       [--rate-gbps 0.6] [--max-writers 64] [--groups G]
+                                       [--per-node | --last-node] [--reader]
+Prints:  NTILE NWRITERS NRANKS SELECT NWPN   per-node layout (NWPN = writers per node)
+         NTILE NWRITERS NRANKS SELECT        last-node layout
 NRANKS counts every rank, forcing readers included.
 
 Rule:
-- Writers per group: one writer streams about 0.6 GB/s (measured, Derecho
-  Lustre). Take the smallest number that writes one history record within
-  --target-seconds, at most 4 (one file's bandwidth is limited, and more
-  writers on one file were slower).
+- Writers per file (one writer group), last-node layout: one writer streams
+  about 0.6 GB/s (measured, Derecho Lustre). Take the smallest number that
+  writes one history record within --target-seconds, at most 4 (one node's
+  buffered Lustre client writes one shared file at about 1.3 GB/s from 4
+  writers on; more writers on one node do not help).
+- Per-node layout: 1 writer per node per file when one writer writes a
+  history record within --target-seconds, else 4 per node per file (the
+  most a node's Lustre client gains from). Pacific basin (31-GB history and
+  63-GB restart records, Derecho A100 nodes): 4 per node per file wrote
+  1.7-1.9 GB/s per file on 2 nodes and 2.9-3.8 GB/s on 4; 2 per node per
+  file 1.1-1.5 GB/s on 2 nodes, no better than 4 writers on one node
+  (1.3-1.5); 8 per node per file 1.9-2.4 GB/s on 2 nodes (one run), at
+  twice the writer ranks.
 - Groups: 2 when the run writes more than one file at a time (history and
   restart, or history split over files by nrpf_his), else 1; --groups
   overrides.
 - The model's io_server writes different files with different groups at
-  the same time. Its default group size, min(4, nwriters/2), matches this
-  layout.
+  the same time. Its default group size, min(4 x writer nodes,
+  nwriters/2), matches this layout.
 
 Layouts:
-- default: the writers are the extra ranks on the last node; the model
-  derives their count from the namelist (every rank after np_xi x np_eta).
-- --per-node: the same number of ranks on every node, NWPN writers per
-  node (the total rounded up to a multiple of the node count), for the
-  model's ROMS_GPU_NWRITERS=NWPN mode. This is the layout a SLURM job
-  (--ntasks-per-node) can express, and it spreads the writer groups over
-  the nodes. np_xi x np_eta must divide evenly over the nodes.
+- per-node (the default on more than one node, when np_xi x np_eta divides
+  evenly over the nodes; --per-node forces it on one node too): the same
+  number of ranks on every node, NWPN writers per node, for the model's
+  ROMS_GPU_NWRITERS=NWPN mode. The model numbers the writers round-robin
+  over the nodes, so every file's writer group spans all nodes and each
+  file is written through every node's Lustre client. This is also the
+  layout a SLURM job (--ntasks-per-node) can express.
+- last-node (the default on one node, or when the tiles do not divide over
+  the nodes; --last-node forces it): the writers are the extra ranks on the
+  last node; the model derives their count from the namelist (every rank
+  after np_xi x np_eta). On one node both layouts place the same ranks.
 - --reader (with either layout): one more rank on every node, the forcing
   reader that reads the forcing records ahead into the node's page cache
   (the model's ROMS_GPU_FRC_READER=1 mode; the reader is the last rank of
@@ -38,14 +51,16 @@ import re
 import sys
 
 args = sys.argv[1:]
-opts = {'--gpus-per-node': 4, '--target-seconds': 15.0, '--rate-gbps': 0.6, '--max-writers': 16, '--groups': 0}
+opts = {'--gpus-per-node': 4, '--target-seconds': 15.0, '--rate-gbps': 0.6, '--max-writers': 64, '--groups': 0}
 path = None
-per_node = False
+layout = None          # None: automatic; 'per-node' or 'last-node'
 reader = 0
 while args:
     a = args.pop(0)
     if a == '--per-node':
-        per_node = True
+        layout = 'per-node'
+    elif a == '--last-node':
+        layout = 'last-node'
     elif a == '--reader':
         reader = 1
     elif a in opts:
@@ -87,9 +102,25 @@ if nt_bgc > 0:
 record_gb = 4.0 * cells * (n3d * nz + n2d) / 1e9
 his = val('wrt_file_his', True)
 rst = val('wrt_file_rst', True)
+ntile = npx * npy
+g = opts['--gpus-per-node']
+nodes = max(1, math.ceil(ntile / g))
+if layout is None:
+    layout = 'per-node' if (nodes > 1 and ntile % nodes == 0) else 'last-node'
+    if nodes > 1 and layout == 'last-node':
+        print('# %d tiles do not divide over %d nodes: last-node layout (every writer on the last node); choose '
+              'np_xi x np_eta as a multiple of the node count to spread the writers' % (ntile, nodes), file=sys.stderr)
+elif layout == 'per-node' and ntile % nodes:
+    sys.exit('gpu_layout.py: %d tiles do not divide over %d nodes of %d GPUs; choose np_xi x np_eta '
+             'as a multiple of the node count' % (ntile, nodes, g))
+wnodes = nodes if layout == 'per-node' else 1    # nodes that hold writers
 per_group = 1
 if his:
-    per_group = max(1, min(4, math.ceil(record_gb / (opts['--rate-gbps'] * opts['--target-seconds']))))
+    need = math.ceil(record_gb / (opts['--rate-gbps'] * opts['--target-seconds']))   # writers at 0.6 GB/s each
+    if wnodes == 1:
+        per_group = max(1, min(4, need))
+    else:
+        per_group = wnodes * (1 if need <= 1 else 4)
 # files in flight at once: history + restart, or several history files
 dt = float(val('dt', 1.0)); ntimes = int(val('ntimes', 1))
 period = float(val('output_period_his', 0.0) or 0.0)
@@ -97,13 +128,7 @@ nrec_his = int(ntimes * dt / period) + 1 if (his and period > 0) else (1 if his 
 split_his = his and int(val('nrpf_his', 20)) < nrec_his
 groups = opts['--groups'] if opts['--groups'] > 0 else (2 if (his and (rst or split_his)) else 1)
 nw = max(1, min(opts['--max-writers'], groups * per_group))
-ntile = npx * npy
-g = opts['--gpus-per-node']
-nodes = max(1, math.ceil(ntile / g))
-if per_node:
-    if ntile % nodes:
-        sys.exit('gpu_layout.py: %d tiles do not divide over %d nodes of %d GPUs; choose np_xi x np_eta '
-                 'as a multiple of the node count' % (ntile, nodes, g))
+if layout == 'per-node':
     wpn = math.ceil(nw / nodes)
     nw = wpn * nodes
     select = '%d:ncpus=64:mpiprocs=%d:ngpus=%d' % (nodes, ntile // nodes + wpn + reader, g)
@@ -123,6 +148,6 @@ else:
     if reader:
         print('# + 1 forcing reader rank on each of %d node(s); run with ROMS_GPU_FRC_READER=1' % nodes,
               file=sys.stderr)
-print('# history record ~%.1f GB -> %d writer(s) per group for <= %.0f s per record at %.1f GB/s each; '
-      '%d group(s) -> %d writer(s)' % (record_gb, per_group, opts['--target-seconds'], opts['--rate-gbps'],
+print('# history record ~%.1f GB -> %d writer(s) per file (%d per node on %d node(s)) for <= %.0f s per record; '
+      '%d group(s) -> %d writer(s)' % (record_gb, per_group, per_group // wnodes, wnodes, opts['--target-seconds'],
                                       groups, nw), file=sys.stderr)

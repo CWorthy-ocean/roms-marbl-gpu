@@ -21,13 +21,16 @@ module io_server
   ! switches files only when a record of the next file is written.
   !
   ! Writer groups: the writer ranks are split into groups of
-  ! ROMS_GPU_IO_GROUP writers (default min(4, max(1, nwriters/2))). File
+  ! ROMS_GPU_IO_GROUP writers (default min(4 x writer nodes, max(1,
+  ! nwriters/2)); writer_groups). Writers are numbered round-robin over the
+  ! nodes (comm_mod), so a group spans the nodes that hold writers. File
   ! nfile of kind fkind belongs to group mod(nfile-1 + fkind-1, ngroups)
   ! (CDR_LITE files: offset 1 with fewer than 3 groups; file_group),
   ! so a restart and the history file of the same number, and consecutive
   ! history files, are written by different groups at the same time. A
-  ! file's bandwidth is limited (more writers on one file do not help;
-  ! two files at once write ~1.3-1.6x faster). Records are dispatched in
+  ! file's bandwidth is limited per node (a node's buffered Lustre client
+  ! writes one shared file at ~1.3 GB/s from 4 writers on; more writers on
+  ! one node do not help, more nodes do). Records are dispatched in
   ! staging order on every compute rank (seq), so each group's writers
   ! complete its records in one order, as their collective file calls need.
   use kinds
@@ -61,7 +64,7 @@ module io_server
   integer, parameter :: CMD_OPEN = 1, CMD_PUT = 2, CMD_QUIT = 3
   integer, parameter :: TAG_CMD = 900, TAG_STR = 901, TAG_TIME = 902, TAG_DATA = 910
   integer, parameter :: MAXV = 256, NAMELEN = 32, PATHLEN = 512   ! variables per record: up to ~240 tracers
-  integer, parameter :: MAXW = 16                                 ! max writer ranks
+  integer, parameter :: MAXW = 64                                 ! max writer ranks per group
   integer, parameter :: NHDR = 8 + 6 * MAXV
   integer, parameter :: NSET = 2
 
@@ -498,16 +501,18 @@ contains
   subroutine writer_groups(nw, gs, ng)
     ! Writers per group and number of groups for nw writers (the same on
     ! the compute and the writer ranks): ROMS_GPU_IO_GROUP, default
-    ! min(4, max(1, nw/2)), lowered until it divides nw.
+    ! min(4 x the nodes that hold writers, max(1, nw/2)) (4 writers per node
+    ! saturate a node's writes to one file), lowered until it divides nw.
     integer, intent(in) :: nw
     integer, intent(out) :: gs, ng
     character(len=16) :: val
-    integer :: stat
-    gs = min(4, max(1, nw / 2))
+    integer :: stat, gdef
+    gdef = min(4 * max(1, comm_writer_nodes()), max(1, nw / 2))
+    gs = gdef
     call get_environment_variable('ROMS_GPU_IO_GROUP', val, status=stat)
     if (stat == 0 .and. len_trim(val) > 0) then
       read(val, *, iostat=stat) gs
-      if (stat /= 0) gs = min(4, max(1, nw / 2))
+      if (stat /= 0) gs = gdef
     endif
     gs = max(1, min(gs, max(nw, 1)))
     do while (mod(max(nw, 1), gs) /= 0)
@@ -658,8 +663,8 @@ contains
     integer :: ierr, iv, n, dest, comm, nw, w, nr, base
     comm = comm_world()
     nw = io_server_count()
-    if (nw > MAXW) error stop 'io: too many writer ranks (raise MAXW)'
     if (wgroup_size == 0) call writer_groups(nw, wgroup_size, wgroups)
+    if (wgroup_size > MAXW) error stop 'io: too many writers per group (raise MAXW)'
     ! the writers of this file's group: writers base .. base + wgroup_size - 1
     base = file_group(pend(idx)%fkind, pend(idx)%nfile) * wgroup_size
     call pack_hdr(pend(idx), pend(idx)%hdr)

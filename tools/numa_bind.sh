@@ -22,17 +22,37 @@ nd=${PALS_NODEID:-${SLURM_NODEID:-}}
 # rank is used as it is, which leaves the last compute ranks of a multi-node
 # job unbound. A forcing reader (ROMS_GPU_FRC_READER=1: the last rank of
 # every node) runs unbound too.
+# Writer and reader ranks never use a GPU, but with MPICH_GPU_SUPPORT_ENABLED=1
+# MPI_Init gives each of them a CUDA context (~0.4 GB) on the first visible
+# GPU, so with writers on every node they all landed next to compute rank 0
+# (8 writers + a reader: 3.7 GB, which pushed Pac's largest tile into managed
+# memory paging, 9x slower steps). io_exec shows each of them one GPU, its
+# node-local rank mod the visible GPUs, which spreads the contexts over the
+# GPUs. (Hiding every GPU is not possible: Cray's GTL then fails in
+# cudaHostRegister, and MPICH_GPU_SUPPORT_ENABLED=0 on these ranks alone
+# hangs MPI_Init.)
+io_exec() {
+  local devs n
+  if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    IFS=, read -r -a devs <<< "$CUDA_VISIBLE_DEVICES"
+  else
+    n=$(nvidia-smi -L 2>/dev/null | wc -l)
+    devs=(); for (( i = 0; i < n; i++ )); do devs+=("$i"); done
+  fi
+  [ ${#devs[@]} -ge 1 ] && export CUDA_VISIBLE_DEVICES=${devs[$(( ${lr:-$r} % ${#devs[@]} ))]}
+  exec "$@"
+}
 nrd=0
 if [ "${ROMS_GPU_FRC_READER:-0}" = 1 ]; then
   nrd=1
-  if [ -n "$lr" ] && [[ "$ls" =~ ^[0-9]+$ ]] && [ "$lr" -eq $(( ls - 1 )) ]; then exec "$@"; fi
+  if [ -n "$lr" ] && [[ "$ls" =~ ^[0-9]+$ ]] && [ "$lr" -eq $(( ls - 1 )) ]; then io_exec "$@"; fi
 fi
 if [ -n "$ROMS_GPU_NWRITERS" ]; then
-  if [ -n "$lr" ] && [[ "$ls" =~ ^[0-9]+$ ]] && [ "$lr" -ge $(( ls - ROMS_GPU_NWRITERS - nrd )) ]; then exec "$@"; fi
+  if [ -n "$lr" ] && [[ "$ls" =~ ^[0-9]+$ ]] && [ "$lr" -ge $(( ls - ROMS_GPU_NWRITERS - nrd )) ]; then io_exec "$@"; fi
 elif [ -n "$NUMA_BIND_NRANKS" ]; then
   below=$r                          # ranks before this one, readers not counted
   if [ "$nrd" = 1 ] && [[ "$nd" =~ ^[0-9]+$ ]]; then below=$(( r - nd )); fi
-  if [ "$below" -ge "$NUMA_BIND_NRANKS" ]; then exec "$@"; fi
+  if [ "$below" -ge "$NUMA_BIND_NRANKS" ]; then io_exec "$@"; fi
 fi
 ng=$(nvidia-smi -L 2>/dev/null | wc -l)
 if [ "$ng" -ge 1 ]; then

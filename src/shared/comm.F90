@@ -12,6 +12,12 @@ module comm_mod
   ! Compute ranks are numbered in world order (node by node), so the tile
   ! decomposition is the same either way; writer_world and compute_of_world
   ! translate between writer, compute and world ranks.
+  ! Writers are numbered round-robin over the nodes that hold writers (the
+  ! first writer of every node, then the second, ...), so that a group of
+  ! consecutive writers (io_server writer groups, one group per file) spans
+  ! the nodes: a node's buffered Lustre client writes one shared file at
+  ! ~1.3 GB/s, whatever its writer count. With every writer on one node
+  ! (the default layout) this is world order.
   ! Forcing readers (ROMS_GPU_FRC_READER = 1, src/host/frc_reader.F90): the
   ! last rank of every node reads the forcing records ahead into the node's
   ! page cache. They are taken out first, and the rules above apply to the
@@ -64,6 +70,8 @@ module comm_mod
   integer :: shm_win = 0, shm_np = 0, shm_me = 0
   integer(8) :: shm_q = 0, shm_ncall = 0, shm_ndiff = 0
   real(8), pointer, volatile :: shm(:,:) => null()
+  integer :: node_lead = 0                    ! lowest world rank on this node (the node's id)
+  integer :: writer_nodes = 0                 ! number of nodes that hold writers
 
   public :: init_comm
   public :: finalize_comm
@@ -94,15 +102,16 @@ module comm_mod
   public :: comm_world_size
   public :: compute_barrier
   public :: comm_compute
+  public :: comm_writer_nodes
 
 contains
 
   subroutine init_comm()
 #ifdef USE_MPI
-    integer :: ierr, color, stat, r, n, nw, nwpn, node_comm, mine, nrd, nrdpn, below
+    integer :: ierr, color, stat, r, n, nw, nwpn, node_comm, mine, nrd, nrdpn, below, key
     logical :: flag
     character(len=8) :: val
-    integer, allocatable :: role(:)
+    integer, allocatable :: role(:), lead(:)
     logical, allocatable :: isrd(:)
     call MPI_Initialized(flag, ierr)
     if (.not. flag) then
@@ -116,6 +125,8 @@ contains
     if (ierr /= MPI_SUCCESS) error stop 'init_comm: MPI_Comm_split_type'
     call MPI_Comm_rank(node_comm, node_rank, ierr)
     call MPI_Comm_size(node_comm, node_size, ierr)
+    node_lead = world_rank
+    call MPI_Bcast(node_lead, 1, MPI_INTEGER, 0, node_comm, ierr)   ! node_comm rank 0 = the node's lowest world rank
     call MPI_Comm_free(node_comm, ierr)
     io_rank_w = -1
     io_nserv = 0
@@ -164,11 +175,13 @@ contains
     endif
     ! the role of every world rank (0 compute, 1 writer, 2 reader): writer,
     ! reader and compute rank tables
-    allocate(role(0:world_size - 1), compute_of_world(0:world_size - 1))
+    allocate(role(0:world_size - 1), compute_of_world(0:world_size - 1), lead(0:world_size - 1))
     mine = merge(1, 0, io_rank_flag)
     if (rd_flag) mine = 2
     call MPI_Allgather(mine, 1, MPI_INTEGER, role, 1, MPI_INTEGER, world_comm, ierr)
     if (ierr /= MPI_SUCCESS) error stop 'init_comm: MPI_Allgather roles'
+    call MPI_Allgather(node_lead, 1, MPI_INTEGER, lead, 1, MPI_INTEGER, world_comm, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'init_comm: MPI_Allgather nodes'
     io_nserv = count(role == 1)
     rd_n = count(role == 2)
     allocate(writer_world(0:max(io_nserv, 1) - 1), reader_world(0:max(rd_n, 1) - 1))
@@ -192,13 +205,20 @@ contains
       endif
     enddo
     ncompute_w = n
-    deallocate(role)
+    if (io_nserv > 0) call order_writers(role, lead)
+    deallocate(role, lead)
     io_rank_w = -1
     if (io_nserv > 0) io_rank_w = writer_world(0)
     if (io_rank_w >= 0 .or. rd_n > 0) then
       color = merge(1, 0, io_rank_flag)
       if (rd_flag) color = 2
-      call MPI_Comm_split(world_comm, color, world_rank, compute_comm, ierr)
+      key = world_rank
+      if (io_rank_flag) then       ! writer index = rank on comm_writers
+        do r = 0, io_nserv - 1
+          if (writer_world(r) == world_rank) key = r
+        enddo
+      endif
+      call MPI_Comm_split(world_comm, color, key, compute_comm, ierr)
       if (ierr /= MPI_SUCCESS) error stop 'init_comm: MPI_Comm_split'
     else
       compute_comm = world_comm
@@ -1147,5 +1167,67 @@ contains
          error stop 'comm_exchange3: real MPI neighbor but this build has no USE_MPI'
 #endif
   end subroutine comm_exchange3
+
+  ! (spread writers: appended at the end of the module; nvfortran 25.9 broke the main build's
+  ! imex_igw.F90 when they sat in the middle, see AGENTS.md)
+  subroutine order_writers(role, lead)
+    ! writer_world in round-robin order over the nodes that hold writers:
+    ! writer k of node j (both counted from 0, nodes in world order) gets the
+    ! sort key k * nodes + j. With all writers on one node this is world order.
+    integer, intent(in) :: role(0:world_size - 1), lead(0:world_size - 1)
+#ifdef USE_MPI
+    integer :: r, q, k, nw, best
+    integer, allocatable :: kloc(:), wkey(:), wr(:)
+    logical, allocatable :: taken(:)
+    allocate(kloc(0:world_size - 1), wkey(0:io_nserv - 1), wr(0:io_nserv - 1), taken(0:io_nserv - 1))
+    kloc = -1                    ! on a writer: the writers before it on its node
+    writer_nodes = 0
+    do r = 0, world_size - 1
+      if (role(r) /= 1) cycle
+      kloc(r) = 0
+      do q = 0, r - 1
+        if (role(q) == 1 .and. lead(q) == lead(r)) kloc(r) = kloc(r) + 1
+      enddo
+      if (kloc(r) == 0) writer_nodes = writer_nodes + 1
+    enddo
+    nw = 0
+    do r = 0, world_size - 1
+      if (role(r) /= 1) cycle
+      ! key: (writer on its node) * nodes + (writer nodes before its node)
+      k = 0
+      do q = 0, world_size - 1
+        if (kloc(q) == 0 .and. lead(q) < lead(r)) k = k + 1
+      enddo
+      wkey(nw) = kloc(r) * writer_nodes + k
+      wr(nw) = r
+      nw = nw + 1
+    enddo
+    taken = .false.
+    do k = 0, io_nserv - 1
+      best = -1
+      do q = 0, io_nserv - 1
+        if (taken(q)) cycle
+        if (best < 0) then
+          best = q
+        elseif (wkey(q) < wkey(best)) then
+          best = q
+        endif
+      enddo
+      taken(best) = .true.
+      writer_world(k) = wr(best)
+    enddo
+    if (world_rank == 0 .and. writer_nodes > 1) then
+      write(*,'(a,i0,a,i0,a)') 'comm: ', io_nserv, ' writers on ', writer_nodes, &
+           ' nodes, numbered round-robin over the nodes (writer:world rank)'
+      write(*,'(a,64(1x,i0,a,i0))') 'comm:  ', (k, ':', writer_world(k), k = 0, io_nserv - 1)
+    endif
+    deallocate(kloc, wkey, wr, taken)
+#endif
+  end subroutine order_writers
+
+  integer function comm_writer_nodes()
+    ! number of nodes that hold writer ranks (0 without writers)
+    comm_writer_nodes = writer_nodes
+  end function comm_writer_nodes
 
 end module comm_mod
