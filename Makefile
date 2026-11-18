@@ -244,6 +244,13 @@ $(GPUDIR)/test_cdf_direct: src/host/cdf_direct.F90 tests/test_cdf_direct.F90 | $
 	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/host/cdf_direct.F90 -o $(GPUDIR)/cdf_direct.o
 	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -o $@ tests/test_cdf_direct.F90 $(GPUDIR)/cdf_direct.o $(LIBS)
 
+# The direct (O_DIRECT) writes of CDF5 output (cdf_copy_header, cdf_plan, cdf_pack_*, cdf_write, ...) with 1-4
+# simulated writers, read back through nf90_get_var: needs netCDF only, no GPU; run it on Lustre.
+#   make build_gpu/test_cdf_write FFLAGS_GPU=... LIBS=...; build_gpu/test_cdf_write <scratch dir on Lustre>
+$(GPUDIR)/test_cdf_write: src/host/cdf_direct.F90 tests/test_cdf_write.F90 | $(GPUDIR)
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/host/cdf_direct.F90 -o $(GPUDIR)/cdf_direct.o
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -o $@ tests/test_cdf_write.F90 $(GPUDIR)/cdf_direct.o $(LIBS)
+
 # Column-by-column check of the device MARBL interior kernels against the
 # unchanged MARBL code (host).
 $(GPUDIR)/test_marbl_interior: $(GPUDIR)/kinds_pre.o $(GPUDIR)/marbl_host.o tests/test_marbl_interior.F90 \

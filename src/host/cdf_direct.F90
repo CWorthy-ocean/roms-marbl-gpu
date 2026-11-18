@@ -19,10 +19,31 @@ module cdf_direct
   !     to real(8), as nf90_get_var into a real(8) array (or into an integer
   !     array and then real(), as par_read's read_full does for integers)
   !     would give, bit for bit.
+  !
+  ! Direct writes (the GPU writers' CDF5 output, io_server): a file whose
+  ! header netCDF has written is
+  !   - created from that header by cdf_copy_header (the header pages copied
+  !     with O_DIRECT into a new file; its Lustre layout read back by
+  !     cdf_layout_fd);
+  !   - opened by every writer with cdf_open_w (O_RDWR + O_DIRECT, the header
+  !     read with O_DIRECT: no buffered byte, no stat, no lseek);
+  !   - described as segments (byte ranges of variables, one owner each);
+  !     cdf_plan gives every 4-KiB page one writing segment, so that every
+  !     page is written whole by one writer (pages are shared only at
+  !     variable boundaries; the bytes a page's writer does not hold reach it
+  !     from their owner);
+  !   - written with cdf_pack_* (host order -> big-endian, converted to the
+  !     file's type as netCDF converts) and cdf_write (aligned pwrite in
+  !     pieces; a watchdog line on stderr while one has not returned after
+  !     cdf_watchdog_set's seconds);
+  !   - completed by cdf_set_numrecs (the first header page rewritten),
+  !     cdf_close_w and cdf_truncate (the length netCDF computes).
   ! ssize_t is taken as C long (LP64 Linux; nvfortran 25.9 has no c_ssize_t).
-  ! Only plain POSIX calls (open, pread, lseek, close, posix_memalign, free)
-  ! through ISO_C_BINDING; no new library. Linux only (O_DIRECT's value is
-  ! architecture-specific); elsewhere cdf_open says it is not available.
+  ! Only plain POSIX calls (open, pread, pwrite, lseek, close, fsync,
+  ! truncate, unlink, rename, fgetxattr, gethostname, write, signal, alarm,
+  ! posix_memalign, free) through ISO_C_BINDING; no new library. Linux only
+  ! (O_DIRECT's value is architecture-specific); elsewhere cdf_open says it
+  ! is not available.
   ! Compiled on its own (Makefile, like frc_reader.F90): plain host code with
   ! external C calls, kept out of nvfortran's main command.
   use, intrinsic :: iso_c_binding
@@ -31,6 +52,9 @@ module cdf_direct
   private
   public :: cdf_file_t, cdf_buf_t, cdf_open, cdf_close, cdf_locate, cdf_read, cdf_unpack, cdf_buf_free
   public :: cdf_progress_if
+  public :: cdf_open_w, cdf_close_w, cdf_var_index, cdf_calcsize, cdf_copy_header, cdf_set_numrecs, cdf_write, &
+            cdf_read_page, cdf_pack_r4, cdf_pack_r8, cdf_pack_i4, cdf_plan, cdf_layout_fd, cdf_truncate, &
+            cdf_unlink, cdf_rename, cdf_buf_reserve, cdf_watchdog_set, cdf_hostname
 
   ! netCDF external types this module converts; others are left to netCDF
   integer, parameter, public :: CDF_BYTE = 1, CDF_CHAR = 2, CDF_SHORT = 3, CDF_INT = 4, CDF_FLOAT = 5, &
@@ -51,8 +75,12 @@ module cdf_direct
     integer :: version = 0                  ! 1, 2 or 5
     integer(c_int) :: fd = -1               ! the O_DIRECT descriptor
     integer(int64) :: numrecs = 0, recsize = 0, fsize = 0, align = 4096
+    integer(int64) :: hdr_end = 0           ! first byte after the header (the lowest variable begin)
+    integer(int64) :: begin_rec = -1        ! start of the record section (-1: no record variable)
     integer :: nvars = 0
     type(cdf_var_t), allocatable :: v(:)
+    integer(int8), allocatable :: page0(:)  ! cdf_open_w: the first header page (numrecs is rewritten in it)
+    character(len=1024) :: path = ''
   end type cdf_file_t
 
   type :: cdf_buf_t
@@ -68,6 +96,19 @@ module cdf_direct
   end interface
 
   integer(c_int), parameter :: O_RDONLY = 0, SEEK_END = 2, EINTR = 4
+  ! Linux open flags (the same on x86-64, aarch64 and ppc64), SIGALRM
+  integer(c_int), parameter :: O_WRONLY = 1, O_RDWR = 2, O_CREAT = 64, O_EXCL = 128, SIGALRM = 14
+  ! Lustre layout magics (lov_user_md v1 / v3, composite layout lov_comp_md_v1)
+  integer(int64), parameter :: LOV_V1 = int(z'0BD10BD0', int64), LOV_V3 = int(z'0BD30BD0', int64), &
+                               LOV_COMP = int(z'0BD60BD0', int64)
+  ! watchdog of the direct writes: while a pwrite has not returned after
+  ! wd_secs seconds (0: off), the SIGALRM handler writes wd_msg to stderr
+  ! (and again every wd_secs); it does nothing else
+  integer(c_int), save :: wd_secs = 60
+  character(kind=c_char), target, save :: wd_msg(700)
+  integer(c_size_t), save :: wd_len = 0
+  logical, save :: wd_installed = .false.
+  character(len=64), save :: host_name = ''
 #if defined(__linux__) && (defined(__x86_64__) || defined(__i386__))
   integer(c_int), parameter :: O_DIRECT = 16384             ! 0o40000
   logical, parameter :: HAVE_DIRECT = .true.
@@ -116,6 +157,63 @@ module cdf_direct
     integer(c_int) function c_getpagesize() bind(C, name='getpagesize')
       import :: c_int
     end function c_getpagesize
+    integer(c_int) function c_open3(path, flags, mode) bind(C, name='open64')
+      ! open with a mode (O_CREAT): open64 is open on LP64 glibc; a second binding label for the 3-argument form
+      import :: c_int, c_char
+      character(kind=c_char), intent(in) :: path(*)
+      integer(c_int), value :: flags, mode
+    end function c_open3
+    integer(c_long) function c_pwrite(fd, buf, n, off) bind(C, name='pwrite')
+      import :: c_int, c_ptr, c_size_t, c_long, c_int64_t
+      integer(c_int), value :: fd
+      type(c_ptr), value :: buf
+      integer(c_size_t), value :: n
+      integer(c_int64_t), value :: off
+    end function c_pwrite
+    integer(c_int) function c_fsync(fd) bind(C, name='fsync')
+      import :: c_int
+      integer(c_int), value :: fd
+    end function c_fsync
+    integer(c_int) function c_truncate(path, n) bind(C, name='truncate')
+      import :: c_int, c_char, c_int64_t
+      character(kind=c_char), intent(in) :: path(*)
+      integer(c_int64_t), value :: n
+    end function c_truncate
+    integer(c_int) function c_unlink(path) bind(C, name='unlink')
+      import :: c_int, c_char
+      character(kind=c_char), intent(in) :: path(*)
+    end function c_unlink
+    integer(c_int) function c_rename(a, b) bind(C, name='rename')
+      import :: c_int, c_char
+      character(kind=c_char), intent(in) :: a(*), b(*)
+    end function c_rename
+    integer(c_long) function c_fgetxattr(fd, name, val, n) bind(C, name='fgetxattr')
+      import :: c_int, c_char, c_ptr, c_size_t, c_long
+      integer(c_int), value :: fd
+      character(kind=c_char), intent(in) :: name(*)
+      type(c_ptr), value :: val
+      integer(c_size_t), value :: n
+    end function c_fgetxattr
+    integer(c_int) function c_gethostname(name, n) bind(C, name='gethostname')
+      import :: c_int, c_char, c_size_t
+      character(kind=c_char) :: name(*)
+      integer(c_size_t), value :: n
+    end function c_gethostname
+    integer(c_long) function c_write(fd, buf, n) bind(C, name='write')
+      import :: c_int, c_ptr, c_size_t, c_long
+      integer(c_int), value :: fd
+      type(c_ptr), value :: buf
+      integer(c_size_t), value :: n
+    end function c_write
+    integer(c_int) function c_alarm(secs) bind(C, name='alarm')
+      import :: c_int
+      integer(c_int), value :: secs
+    end function c_alarm
+    type(c_funptr) function c_signal(sig, handler) bind(C, name='signal')
+      import :: c_int, c_funptr
+      integer(c_int), value :: sig
+      type(c_funptr), value :: handler
+    end function c_signal
 #if defined(__linux__)
     type(c_ptr) function c_errno_location() bind(C, name='__errno_location')
       import :: c_ptr
@@ -218,6 +316,7 @@ contains
     if (f%fd >= 0) ierr = c_close(f%fd)
     f%fd = -1
     if (allocated(f%v)) deallocate(f%v)
+    if (allocated(f%page0)) deallocate(f%page0)
     f%nvars = 0
     f%version = 0
   end subroutine cdf_close
@@ -375,6 +474,17 @@ contains
         if (f%v(i)%isrec) f%recsize = f%v(i)%vraw
       enddo
     endif
+    ! where the header ends (the lowest begin; without variables, the parsed length) and the record section starts
+    f%hdr_end = p
+    f%begin_rec = -1
+    do i = 1, f%nvars
+      if (i == 1) f%hdr_end = f%v(i)%begin
+      f%hdr_end = min(f%hdr_end, f%v(i)%begin)
+      if (f%v(i)%isrec) then
+        if (f%begin_rec < 0) f%begin_rec = f%v(i)%begin
+        f%begin_rec = min(f%begin_rec, f%v(i)%begin)
+      endif
+    enddo
     ok = .true.
     return
 800 continue
@@ -645,5 +755,611 @@ contains
     enddo
     if (allocated(t32)) deallocate(t32)
   end subroutine cdf_unpack
+
+  ! ============================== direct writes ==============================
+
+  subroutine cdf_hostname(name)
+    character(len=*), intent(out) :: name
+    character(kind=c_char) :: h(256)
+    integer :: i
+    name = ''
+    h = c_null_char
+    if (c_gethostname(h, 255_c_size_t) /= 0) return
+    do i = 1, min(len(name), 255)
+      if (h(i) == c_null_char) exit
+      name(i:i) = h(i)
+    enddo
+  end subroutine cdf_hostname
+
+  subroutine cdf_watchdog_set(secs)
+    ! seconds before a pwrite that has not returned is reported (0: no watchdog)
+    integer, intent(in) :: secs
+    wd_secs = int(max(0, secs), c_int)
+  end subroutine cdf_watchdog_set
+
+  subroutine wd_handler(sig) bind(C)
+    ! SIGALRM: the armed text to stderr, then again after wd_secs (write and alarm only)
+    integer(c_int), value :: sig
+    integer(c_long) :: k
+    integer(c_int) :: r
+    if (wd_len > 0) k = c_write(2_c_int, c_loc(wd_msg), wd_len)
+    if (wd_secs > 0) r = c_alarm(wd_secs)
+  end subroutine wd_handler
+
+  subroutine wd_arm(text)
+    character(len=*), intent(in) :: text
+    type(c_funptr) :: old
+    integer :: i, n
+    integer(c_int) :: r
+    if (wd_secs <= 0) return
+    if (.not. wd_installed) then
+      old = c_signal(SIGALRM, c_funloc(wd_handler))
+      wd_installed = .true.
+    endif
+    n = min(len_trim(text), size(wd_msg) - 1)
+    wd_len = 0                     ! the handler never sees a half-written text
+    do i = 1, n
+      wd_msg(i) = text(i:i)
+    enddo
+    wd_msg(n + 1) = c_new_line
+    wd_len = int(n + 1, c_size_t)
+    r = c_alarm(wd_secs)
+  end subroutine wd_arm
+
+  subroutine wd_disarm()
+    integer(c_int) :: r
+    if (wd_secs <= 0) return
+    r = c_alarm(0_c_int)
+    wd_len = 0
+  end subroutine wd_disarm
+
+  real(8) function wtime()
+    integer(int64) :: c, r
+    call system_clock(c, r)
+    wtime = real(c, 8) / real(max(r, 1_int64), 8)
+  end function wtime
+
+  logical function cdf_buf_reserve(b, n) result(ok)
+    ! an aligned buffer of at least n bytes (its contents are lost when it grows)
+    type(cdf_buf_t), intent(inout) :: b
+    integer(int64), intent(in) :: n
+    ok = buf_reserve(b, max(n, 4096_int64), max(4096_int64, int(c_getpagesize(), int64)))
+  end function cdf_buf_reserve
+
+  logical function hdr_from_fd(fd, f, b, nread, msg) result(ok)
+    ! Read the header of the open file fd into the aligned buffer b (from
+    ! 256 KiB, growing) and parse it into f; nread: bytes read (the rest of
+    ! b zero). Works on an O_DIRECT descriptor (aligned sizes and buffer).
+    integer(c_int), intent(in) :: fd
+    type(cdf_file_t), intent(inout) :: f
+    type(cdf_buf_t), intent(inout) :: b
+    integer(int64), intent(out) :: nread
+    character(len=*), intent(inout) :: msg
+    integer(int64) :: nh, got, a
+    integer(c_long) :: k
+    logical :: more
+    ok = .false.
+    nread = 0
+    a = max(4096_int64, int(c_getpagesize(), int64))
+    nh = 262144_int64
+    do
+      if (.not. buf_reserve(b, nh, a)) then
+        msg = 'no memory for the header'
+        return
+      endif
+      got = 0
+      do while (got < nh)
+        k = c_pread(fd, c_loc(b%u8(got + 1)), int(nh - got, c_size_t), int(got, c_int64_t))
+        if (k < 0) then
+          if (errno() == EINTR) cycle
+          write(msg, '(a,i0)') 'header read failed, errno ', errno()
+          return
+        endif
+        if (k == 0) exit
+        got = got + k
+      enddo
+      if (got < nh) b%u8(got + 1:nh) = 0_int8
+      nread = got
+      ok = parse_header(b%u8(1:nh), nh, f, msg, more)
+      if (ok .or. .not. more) return
+      if (got < nh .or. nh >= 268435456_int64) then
+        msg = 'header longer than the file or than 256 MiB'
+        return
+      endif
+      nh = 4 * nh
+    enddo
+  end function hdr_from_fd
+
+  logical function cdf_open_w(path, f, direct, msg) result(ok)
+    ! Open path (a classic file another rank created with cdf_copy_header)
+    ! for direct writes: O_RDWR (+ O_DIRECT when direct), the header read
+    ! through that descriptor and parsed; f%page0 keeps the first page.
+    ! Refused unless the header and the record section start on page
+    ! boundaries. No buffered I/O, no stat, no lseek.
+    character(len=*), intent(in) :: path
+    type(cdf_file_t), intent(inout) :: f
+    logical, intent(in) :: direct
+    character(len=*), intent(out) :: msg
+    type(cdf_buf_t) :: b
+    integer(int64) :: a, nread
+    integer(c_int) :: flags, ierr
+    ok = .false.
+    msg = ''
+    call cdf_close(f)
+    if (direct .and. .not. HAVE_DIRECT) then
+      msg = 'O_DIRECT is not available on this platform'
+      return
+    endif
+    a = max(4096_int64, int(c_getpagesize(), int64))
+    f%align = a
+    flags = O_RDWR
+    if (direct) flags = flags + O_DIRECT
+    f%fd = c_open(trim(path)//c_null_char, flags)
+    if (f%fd < 0) then
+      write(msg, '(a,i0)') 'open for writing failed, errno ', errno()
+      f%fd = -1
+      return
+    endif
+    f%path = path
+    f%fsize = huge(1_int64) / 4         ! unknown (no stat): only the parser's sanity bounds use it
+    ok = hdr_from_fd(f%fd, f, b, nread, msg)
+    if (ok) then
+      if (mod(f%hdr_end, a) /= 0 .or. (f%begin_rec >= 0 .and. mod(max(f%begin_rec, 0_int64), a) /= 0)) then
+        write(msg, '(a,i0,a,i0,a,i0)') 'header end ', f%hdr_end, ' or record section ', f%begin_rec, &
+             ' not on a page boundary of ', a
+        ok = .false.
+      endif
+    endif
+    if (ok) then
+      allocate(f%page0(a))
+      f%page0 = b%u8(1:a)
+    else
+      ierr = c_close(f%fd)
+      f%fd = -1
+    endif
+    call cdf_buf_free(b)
+  end function cdf_open_w
+
+  logical function cdf_close_w(f, dosync) result(ok)
+    ! fsync (dosync) and close a file opened by cdf_open_w
+    type(cdf_file_t), intent(inout) :: f
+    logical, intent(in) :: dosync
+    ok = .true.
+    if (f%fd >= 0) then
+      if (dosync) ok = (c_fsync(f%fd) == 0)
+      if (c_close(f%fd) /= 0) ok = .false.
+    endif
+    f%fd = -1
+    call cdf_close(f)
+  end function cdf_close_w
+
+  integer function cdf_var_index(f, name) result(iv)
+    ! index of variable name in f (0: not there)
+    type(cdf_file_t), intent(in) :: f
+    character(len=*), intent(in) :: name
+    integer :: i
+    iv = 0
+    do i = 1, f%nvars
+      if (f%v(i)%name == name) then
+        iv = i
+        return
+      endif
+    enddo
+  end function cdf_var_index
+
+  integer(int64) function cdf_calcsize(f) result(n)
+    ! the length netCDF gives the file (NC_calcsize): the record section
+    ! after numrecs records, or the end of the last fixed-size variable
+    type(cdf_file_t), intent(in) :: f
+    integer :: i
+    if (f%begin_rec >= 0) then
+      n = f%begin_rec + f%numrecs * f%recsize
+      return
+    endif
+    n = f%hdr_end
+    do i = 1, f%nvars
+      n = max(n, f%v(i)%begin + f%v(i)%vlen)
+    enddo
+  end function cdf_calcsize
+
+  logical function cdf_set_numrecs(f, n) result(ok)
+    ! the record count n into the first header page (O_DIRECT, the whole page)
+    type(cdf_file_t), intent(inout) :: f
+    integer(int64), intent(in) :: n
+    type(cdf_buf_t) :: b
+    integer(int64) :: v, t
+    integer :: q, ns
+    ok = .false.
+    if (.not. allocated(f%page0)) return
+    ns = 4
+    if (f%version == 5) ns = 8
+    v = n
+    do q = ns, 1, -1
+      t = iand(v, 255_int64)
+      if (t > 127) t = t - 256
+      f%page0(4 + q) = int(t, int8)
+      v = ishft(v, -8)
+    enddo
+    if (.not. buf_reserve(b, f%align, f%align)) return
+    b%u8(1:f%align) = f%page0
+    ok = cdf_write(f, b, 0_int64, 0_int64, f%align, f%align)
+    call cdf_buf_free(b)
+    if (ok) f%numrecs = n
+  end function cdf_set_numrecs
+
+  logical function cdf_write(f, b, boff, off, nbytes, piece) result(ok)
+    ! Bytes boff .. boff+nbytes-1 (0-based) of b to the file at off, in
+    ! pwrite pieces of at most piece bytes. With O_DIRECT, off, boff and
+    ! nbytes are multiples of f%align. While a pwrite has not returned after
+    ! the watchdog's seconds, a line names it (file, offset, node); one that
+    ! took longer is reported when it returns.
+    type(cdf_file_t), intent(in) :: f
+    type(cdf_buf_t), intent(in) :: b
+    integer(int64), intent(in) :: boff, off, nbytes, piece
+    integer(int64) :: done, req, pc
+    integer(c_long) :: k
+    real(8) :: t0, dt
+    character(len=700) :: line
+    ok = .false.
+    if (f%fd < 0) return
+    if (len_trim(host_name) == 0) call cdf_hostname(host_name)
+    pc = max(f%align, (piece / f%align) * f%align)
+    done = 0
+    do while (done < nbytes)
+      req = min(pc, nbytes - done)
+      if (wd_secs > 0) then
+        write(line, '(a,i0,a,i0,5a,i0,a)') 'cdf_direct: WATCHDOG pwrite of ', req, ' bytes at offset ', off + done, &
+             ' of ', trim(f%path), ' on ', trim(host_name), ' has not returned after ', wd_secs, ' s'
+        call wd_arm(line)
+      endif
+      t0 = wtime()
+      k = c_pwrite(f%fd, c_loc(b%u8(boff + done + 1)), int(req, c_size_t), int(off + done, c_int64_t))
+      call wd_disarm()
+      dt = wtime() - t0
+      if (wd_secs > 0 .and. dt > real(wd_secs, 8)) then
+        write(*, '(a,i0,a,i0,5a,f9.1,a)') 'cdf_direct: WARNING pwrite of ', req, ' bytes at offset ', off + done, &
+             ' of ', trim(f%path), ' on ', trim(host_name), ' took ', dt, ' s'
+        flush(6)
+      endif
+      if (k < 0) then
+        if (errno() == EINTR) cycle
+        write(*, '(a,i0,a,i0,3a,i0)') 'cdf_direct: pwrite of ', req, ' bytes at offset ', off + done, ' of ', &
+             trim(f%path), ' failed, errno ', errno()
+        flush(6)
+        return
+      endif
+      if (k == 0) return
+      done = done + k
+    enddo
+    ok = .true.
+  end function cdf_write
+
+  logical function cdf_read_page(f, b, boff, off, n) result(ok)
+    ! n bytes (aligned) at file offset off into b at boff, with the
+    ! descriptor of cdf_open_w (O_DIRECT); past the end of the file: zeros
+    type(cdf_file_t), intent(in) :: f
+    type(cdf_buf_t), intent(inout) :: b
+    integer(int64), intent(in) :: boff, off, n
+    integer(int64) :: got
+    integer(c_long) :: k
+    ok = .false.
+    if (f%fd < 0) return
+    got = 0
+    do while (got < n)
+      k = c_pread(f%fd, c_loc(b%u8(boff + got + 1)), int(n - got, c_size_t), int(off + got, c_int64_t))
+      if (k < 0) then
+        if (errno() == EINTR) cycle
+        return
+      endif
+      if (k == 0) exit
+      got = got + k
+    enddo
+    if (got < n) b%u8(boff + got + 1:boff + n) = 0_int8
+    ok = .true.
+  end function cdf_read_page
+
+  logical function cdf_truncate(path, n) result(ok)
+    character(len=*), intent(in) :: path
+    integer(int64), intent(in) :: n
+    ok = (c_truncate(trim(path)//c_null_char, int(n, c_int64_t)) == 0)
+  end function cdf_truncate
+
+  logical function cdf_unlink(path) result(ok)
+    character(len=*), intent(in) :: path
+    ok = (c_unlink(trim(path)//c_null_char) == 0)
+  end function cdf_unlink
+
+  logical function cdf_rename(a, b) result(ok)
+    character(len=*), intent(in) :: a, b
+    ok = (c_rename(trim(a)//c_null_char, trim(b)//c_null_char) == 0)
+  end function cdf_rename
+
+  logical function cdf_layout_fd(fd, off0, off1, cmin, smin) result(found)
+    ! The Lustre layout of the open file fd over bytes off0 .. off1-1: the
+    ! smallest stripe count and stripe size of the layout components that
+    ! cover them (a plain layout: its stripe count and size). A count of -1
+    ! (every OST) is 65535; components with count 0 (the default) are
+    ! skipped. .false.: no Lustre layout (another file system) or one this
+    ! does not read. From the xattr lustre.lov (little-endian lov_user_md
+    ! v1/v3, or lov_comp_md_v1: 32-byte header, 48-byte entries).
+    integer(c_int), intent(in) :: fd
+    integer(int64), intent(in) :: off0, off1
+    integer, intent(out) :: cmin
+    integer(int64), intent(out) :: smin
+    integer(int8), allocatable, target :: x(:)
+    integer(c_long) :: k
+    integer(int64) :: magic, nent, st, en, eo, m2, c
+    integer :: e
+    found = .false.
+    cmin = 0
+    smin = 0
+    allocate(x(65536))
+    k = c_fgetxattr(fd, 'lustre.lov'//c_null_char, c_loc(x), 65536_c_size_t)
+    if (k < 32) return
+    magic = le(0_int64, 4)
+    if (magic == LOV_V1 .or. magic == LOV_V3) then
+      smin = le(24_int64, 4)
+      c = le(28_int64, 2)
+      if (c == 0) return
+      cmin = int(c)
+      found = .true.
+    elseif (magic == LOV_COMP) then
+      nent = le(14_int64, 2)
+      cmin = huge(1)
+      smin = huge(1_int64)
+      do e = 0, int(nent) - 1
+        if (32 + 48 * (e + 1) > k) exit
+        st = le(32_int64 + 48 * e + 8, 8)
+        en = le(32_int64 + 48 * e + 16, 8)
+        eo = le(32_int64 + 48 * e + 24, 4)
+        if (en < 0) en = huge(1_int64)                 ! EOF
+        if (en <= off0 .or. st >= off1) cycle
+        if (eo < 0 .or. eo + 32 > k) cycle
+        m2 = le(eo, 4)
+        if (m2 /= LOV_V1 .and. m2 /= LOV_V3) cycle
+        c = le(eo + 28, 2)
+        if (c == 0) cycle
+        cmin = min(cmin, int(c))
+        smin = min(smin, le(eo + 24, 4))
+        found = .true.
+      enddo
+      if (.not. found) then
+        cmin = 0
+        smin = 0
+      endif
+    endif
+  contains
+    integer(int64) function le(o, nb)
+      ! little-endian nb bytes at offset o (0-based); 8 bytes all 0xff give -1
+      integer(int64), intent(in) :: o
+      integer, intent(in) :: nb
+      integer :: q
+      le = 0
+      do q = nb, 1, -1
+        le = ior(ishft(le, 8), iand(int(x(o + q), int64), 255_int64))
+      enddo
+    end function le
+  end function cdf_layout_fd
+
+  logical function cdf_copy_header(hpath, path, direct, f, cmin, smin, laid, msg) result(ok)
+    ! The header netCDF wrote into the scratch file hpath (nothing else:
+    ! no variable data) becomes the new file path: path is removed if it
+    ! exists, created (with O_DIRECT when direct; in the directory's Lustre
+    ! layout), the header pages written with O_DIRECT, and hpath removed.
+    ! f: the parsed header (no descriptor). laid: a Lustre layout was read,
+    ! cmin / smin over the first record (cdf_layout_fd), or over the
+    ! fixed-size data when there is no record variable.
+    character(len=*), intent(in) :: hpath, path
+    logical, intent(in) :: direct
+    type(cdf_file_t), intent(inout) :: f
+    integer, intent(out) :: cmin
+    integer(int64), intent(out) :: smin
+    logical, intent(out) :: laid
+    character(len=*), intent(out) :: msg
+    type(cdf_buf_t) :: b
+    type(cdf_file_t) :: w
+    integer(c_int) :: fd, flags, ierr
+    integer(int64) :: a, alen, nread, r0, r1
+    logical :: lok
+    ok = .false.
+    laid = .false.
+    cmin = 0
+    smin = 0
+    msg = ''
+    call cdf_close(f)
+    a = max(4096_int64, int(c_getpagesize(), int64))
+    fd = c_open(trim(hpath)//c_null_char, O_RDONLY)
+    if (fd < 0) then
+      write(msg, '(3a,i0)') 'open ', trim(hpath), ' failed, errno ', errno()
+      return
+    endif
+    f%fsize = huge(1_int64) / 4
+    lok = hdr_from_fd(fd, f, b, nread, msg)
+    ierr = c_close(fd)
+    if (.not. lok) then
+      call cdf_buf_free(b)
+      return
+    endif
+    alen = ((f%hdr_end + a - 1) / a) * a
+    if (alen > b%cap) then
+      msg = 'header end past the bytes read'
+      call cdf_buf_free(b)
+      return
+    endif
+    if (alen > nread) b%u8(nread + 1:alen) = 0_int8
+    lok = cdf_unlink(path)                      ! clobber an earlier file of that name
+    flags = O_WRONLY + O_CREAT + O_EXCL
+    if (direct .and. HAVE_DIRECT) flags = flags + O_DIRECT
+    fd = c_open3(trim(path)//c_null_char, flags, 420_c_int)    ! mode 0644
+    if (fd < 0) then
+      write(msg, '(3a,i0)') 'create ', trim(path), ' failed, errno ', errno()
+      call cdf_buf_free(b)
+      return
+    endif
+    w%fd = fd
+    w%align = a
+    w%path = path
+    lok = cdf_write(w, b, 0_int64, 0_int64, alen, alen)
+    call cdf_buf_free(b)
+    if (.not. lok) then
+      write(msg, '(3a)') 'header write to ', trim(path), ' failed'
+      ierr = c_close(fd)
+      return
+    endif
+    if (f%begin_rec >= 0) then
+      r0 = f%begin_rec
+      r1 = f%begin_rec + max(f%recsize, 1_int64)
+    else
+      r0 = f%hdr_end
+      r1 = max(cdf_calcsize(f), r0 + 1)
+    endif
+    laid = cdf_layout_fd(fd, r0, r1, cmin, smin)
+    ierr = c_close(fd)
+    w%fd = -1
+    if (ierr /= 0) then
+      write(msg, '(3a)') 'close of ', trim(path), ' failed'
+      return
+    endif
+    lok = cdf_unlink(hpath)
+    ok = .true.
+  end function cdf_copy_header
+
+  logical function cdf_plan(n, off, nb, a, wseg, wp1, wp2) result(ok)
+    ! Segments 1..n of one write (byte ranges off(i) .. off(i)+nb(i)-1,
+    ! nb(i) > 0, sorted by offset, not overlapping): every a-byte page with
+    ! segment bytes is written by one segment, the one that holds the
+    ! page's first segment byte. wseg(i): the segment that writes the page
+    ! of segment i's first byte (i itself, or the earlier segment whose last
+    ! page it is). wp1(i) .. wp2(i): the pages segment i writes (wp1 > wp2:
+    ! none, a small segment inside another's page). .false.: not sorted,
+    ! overlapping or empty segments.
+    integer, intent(in) :: n
+    integer(int64), intent(in) :: off(n), nb(n), a
+    integer, intent(out) :: wseg(n)
+    integer(int64), intent(out) :: wp1(n), wp2(n)
+    integer :: i, lastw
+    integer(int64) :: fp, lp
+    logical :: first
+    ok = .false.
+    lastw = 0
+    do i = 1, n
+      if (nb(i) <= 0 .or. off(i) < 0) return
+      if (i > 1) then
+        if (off(i) < off(i - 1) + nb(i - 1)) return
+      endif
+      fp = off(i) / a
+      lp = (off(i) + nb(i) - 1) / a
+      first = .true.
+      if (i > 1) first = (off(i - 1) + nb(i - 1) <= fp * a)   ! the previous segment ends before this page
+      if (first) then
+        wseg(i) = i
+        wp1(i) = fp
+      else
+        wseg(i) = lastw
+        wp1(i) = fp + 1
+      endif
+      wp2(i) = lp
+      if (wp1(i) <= wp2(i)) then
+        lastw = i
+      else
+        lastw = wseg(i)
+      endif
+    enddo
+    ok = .true.
+  end function cdf_plan
+
+  subroutine swap32_copy(s, d)
+    integer(int32), intent(in), contiguous :: s(:)
+    integer(int32), intent(inout), contiguous :: d(:)
+    integer(int64) :: i
+    do i = 1, size(s, kind=int64)
+      d(i) = bswap32(s(i))
+    enddo
+  end subroutine swap32_copy
+
+  subroutine swap64_copy(s, d)
+    ! 64-bit values given as pairs of 32-bit words (host order, little-endian
+    ! words) -> big-endian bytes as 32-bit words: the halves swap places
+    integer(int32), intent(in), contiguous :: s(:)
+    integer(int32), intent(inout), contiguous :: d(:)
+    integer(int64) :: i
+    do i = 1, size(s, kind=int64) / 2
+      d(2 * i - 1) = bswap32(s(2 * i))
+      d(2 * i) = bswap32(s(2 * i - 1))
+    enddo
+  end subroutine swap64_copy
+
+  subroutine cdf_pack_r4(src, n, xtype, b, boff)
+    ! n real(4) values into b at byte boff (a multiple of 4) as the file's
+    ! type xtype (float, or double as netCDF converts), big-endian
+    integer(int64), intent(in) :: n, boff
+    real(real32), intent(in), target :: src(*)
+    integer, intent(in) :: xtype
+    type(cdf_buf_t), intent(inout) :: b
+    integer(int32), pointer :: s32(:)
+    real(real64), allocatable, target :: t8(:)
+    integer(int64), parameter :: CH = 1048576
+    integer(int64) :: w, i0, m
+    if (n <= 0) return
+    w = boff / 4
+    select case (xtype)
+    case (CDF_FLOAT)
+      call c_f_pointer(c_loc(src(1)), s32, [n])
+      call swap32_copy(s32(1:n), b%u32(w + 1:w + n))
+    case (CDF_DOUBLE)
+      allocate(t8(min(n, CH)))
+      call c_f_pointer(c_loc(t8(1)), s32, [2 * size(t8, kind=int64)])
+      do i0 = 1, n, CH
+        m = min(CH, n - i0 + 1)
+        t8(1:m) = real(src(i0:i0 + m - 1), real64)
+        call swap64_copy(s32(1:2 * m), b%u32(w + 2 * (i0 - 1) + 1:w + 2 * (i0 - 1) + 2 * m))
+      enddo
+    case default
+      error stop 'cdf_pack_r4: file type not float or double'
+    end select
+  end subroutine cdf_pack_r4
+
+  subroutine cdf_pack_r8(src, n, xtype, b, boff)
+    ! n real(8) values into b at byte boff (a multiple of 4) as the file's
+    ! type xtype (double, or float rounded as netCDF converts), big-endian
+    integer(int64), intent(in) :: n, boff
+    real(real64), intent(in), target :: src(*)
+    integer, intent(in) :: xtype
+    type(cdf_buf_t), intent(inout) :: b
+    integer(int32), pointer :: s32(:)
+    real(real32), allocatable, target :: t4(:)
+    integer(int64), parameter :: CH = 1048576
+    integer(int64) :: w, i0, m
+    if (n <= 0) return
+    w = boff / 4
+    select case (xtype)
+    case (CDF_DOUBLE)
+      call c_f_pointer(c_loc(src(1)), s32, [2 * n])
+      call swap64_copy(s32(1:2 * n), b%u32(w + 1:w + 2 * n))
+    case (CDF_FLOAT)
+      allocate(t4(min(n, CH)))
+      call c_f_pointer(c_loc(t4(1)), s32, [size(t4, kind=int64)])
+      do i0 = 1, n, CH
+        m = min(CH, n - i0 + 1)
+        t4(1:m) = real(src(i0:i0 + m - 1), real32)
+        call swap32_copy(s32(1:m), b%u32(w + i0:w + i0 + m - 1))
+      enddo
+    case default
+      error stop 'cdf_pack_r8: file type not float or double'
+    end select
+  end subroutine cdf_pack_r8
+
+  subroutine cdf_pack_i4(src, n, b, boff)
+    ! n default integers into b at byte boff (a multiple of 4) as netCDF int, big-endian
+    integer(int64), intent(in) :: n, boff
+    integer(int32), intent(in), target :: src(*)
+    type(cdf_buf_t), intent(inout) :: b
+    integer(int32), pointer :: s32(:)
+    integer(int64) :: w
+    if (n <= 0) return
+    w = boff / 4
+    call c_f_pointer(c_loc(src(1)), s32, [n])
+    call swap32_copy(s32(1:n), b%u32(w + 1:w + n))
+  end subroutine cdf_pack_i4
 
 end module cdf_direct
