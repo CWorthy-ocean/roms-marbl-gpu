@@ -60,7 +60,12 @@ first, on the smallest case that exercises it.
 
 - `make gpu` is the only static check. The unit programs in `tests/` and their
   targets (`tests`, `build_gpu/test_marbl_*`) lack modules they use and do not
-  build; fix them only if asked.
+  build; fix them only if asked. The exception is
+  `build_gpu/test_cdf_direct` (netCDF only, no GPU, about 1 s): it checks the
+  O_DIRECT reader `src/host/cdf_direct.F90` against `nf90_get_var` bit for
+  bit on files it writes; run it after any change to that module
+  (`build_gpu/test_cdf_direct <scratch dir>`). With `--file <path> <vars>` it
+  checks a real file.
 - **Bit identity.** With a new feature off, the run must be bit-identical to
   the base binary: `python3 tools/cmp_nc.py A B`. Compare restart files with a
   record every step (history is float32, restarts are double). In split mode
@@ -214,6 +219,16 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   plain message in its place the build passed, and so did the same code
   with more added elsewhere. It depends on the whole file, not on one
   construct: try small variants of the new code in separate builds.
+- nvfortran 25.9 at -O2 (host code) dropped the sign extension of
+  `int(x, int32)` for an `integer(int8)` x inside
+  `ior(ishft(int(b0, int32), 8), ...)`: shorts read by `cdf_direct` came out
+  65536 too large. `cdf_unpack` builds the unsigned value and subtracts
+  65536; keep byte-level integer code under a bit-for-bit unit test.
+  nvfortran 25.9 also has no `c_ssize_t` (use `c_long` on LP64 Linux).
+- Start-up reads use `O_DIRECT` (`ROMS_GPU_PAR_READ`, README "Run"). When a
+  start-up read misbehaves, compare with `ROMS_GPU_PAR_READ=whole`, and run
+  with `ROMS_GPU_PAR_READ_VERIFY=1`, which re-reads every variable through
+  netCDF and names any that differ.
 - If a run differs from its own bit-identical repeats, rerun it on other nodes
   before you debug: a faulty GPU node has given silently wrong results. Wrap
   job runs in `timeout`.
