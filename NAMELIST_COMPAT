@@ -234,14 +234,20 @@
 # with 0. imex_verbose >= 1 prints IMEX_CLIP lines (clipped and active
 # cell-steps since the last line) at each operator build and at the end
 # of the run, as on the CPU.
-# imex_pc ('jacobi', the default; 'modes'), imex_pc_modes (0 automatic, the
+# imex_pc ('modes', the default on both codes since ucla-roms branch
+# imex-pc-modes-default, 8c1d6909; it was 'jacobi' before; 'jacobi'),
+# imex_pc_modes (0 automatic, the
 # default; 1-4), imex_pc_cou_on (0.5), imex_pc_cou_k (0.3), imex_pc_levels (0
 # automatic, 2, 3), imex_pc_ncoarse (2; 1, 2), imex_pc_smoother ('rbgs';
 # 'jacobi') and imex_pc_dump (only 0 on the GPU): the mode-split
 # preconditioner of the stage solves (ucla-roms branch imex-pc-modes,
 # bf897292), the same keys, defaults and checks; IMEX_PCM lines at each
-# operator rebuild. On the GPU 'modes' needs the same fused path as
-# imex_corr_adv (the defaults); otherwise the run stops at start-up.
+# operator rebuild. With imex_pc_modes = 0 it is the Jacobi path wherever
+# it builds no modes (K 0), so those runs are unchanged. On the GPU 'modes'
+# needs the same fused path as imex_corr_adv (the defaults); otherwise the
+# run stops at start-up and asks for imex_pc = 'jacobi' (on the CPU, the
+# diagnostic settings imex_pcg_start 0 or 1, imex_selftest 1 and imex_redu 1
+# with imex_pcg_fused 0 stop the same way).
 # GPU tuning settings (roms_gpu only; a namelist that
 # sets one stops UCLA ROMS): imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep
 # (on: deterministic sums, the fused stage, the restructured operator sweep),
