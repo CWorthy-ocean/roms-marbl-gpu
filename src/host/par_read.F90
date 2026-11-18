@@ -64,7 +64,10 @@ module par_read
   ! ROMS_GPU_PAR_READ_VERIFY=1: every direct read is read again through
   ! netCDF and compared bit for bit (a check; doubles the reads).
   logical :: dr_verify = .false.
-  integer(8) :: dr_piece = 268435456_8      ! O_DIRECT pread size (ROMS_GPU_DIRECT_PIECE_MB, default 256)
+  ! O_DIRECT pread size (ROMS_GPU_DIRECT_PIECE_MB, default 1024): on Derecho's Lustre the
+  ! Pacific restart read took 22.7 s with 64 MiB, 11.7-13.5 with 256, 8.5-9.5 with 1024 and
+  ! 9.8-10.0 with 2048 (one pread per 1.4-GB variable; the MPI progress between pieces is lost)
+  integer(8) :: dr_piece = 1073741824_8
 #ifdef USE_MPI
   ! requests of the previous batch, progressed between the pieces of a read
   integer, allocatable :: prog_req(:)
