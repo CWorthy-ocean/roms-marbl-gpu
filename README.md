@@ -300,6 +300,41 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- New IMEX key `imex_bref_trigger` in `&imex_igw_settings` (default
+  0.646; 0 off), the port of UCLA ROMS's key of the same name
+  (CWorthy-ocean/ucla-roms#456): the reference stratification
+  b_ref, the operator and its preconditioner are also rebuilt before the
+  `imex_bref_hours` cadence when b_ref has gone stale. Between rebuilds
+  the step carries the difference between the present stratification and
+  b_ref's explicitly; under a deepening mixed layer it grows, and at long
+  steps a grid-scale mode of the stiff internal waves can grow out of it.
+  Every corrector measures each interior column's exposure E (that
+  difference projected on the column's three fastest vertical modes of
+  the operator's N2, weighted by how far the step leaves the mode
+  unresolved, as a fraction of the stiff-mode limit of the time-step
+  weights: x_inf = 0.3096 for the defaults, printed at start-up). When
+  the domain maximum exceeds the key and b_ref is at least 1 h old, the
+  next step rebuilds it; `imex_bref_hours` stays the longest age.
+  Columns within two cells of an open edge are left out. The decision is
+  one MPI max of one number per step, so the rebuild steps do not depend
+  on the tiling, and the age of b_ref is in the restart file, so restarts
+  stay exact (the restart file is unchanged). Runs without a demand are
+  unchanged bit for bit (Sargasso Sea at 1440 s and the California
+  Current nest at 600 s, 2 x 2); `imex_bref_trigger = 0` gives the
+  earlier results in every run. E is printed in every run, as on the CPU:
+  an `IMEX_BREF_DEMAND` line at each demand, `IMEX_BREF_E` lines at each
+  rebuild (its reason, the age of b_ref, the largest E since the last
+  rebuild with its column and mode), after each `IMEX` line
+  (`imex_verbose >= 1`) and at the end of the run. On the Sargasso Sea
+  at 2880 s (3 days from a developed state) the GPU rebuilds on demand at
+  the CPU's steps (3 demands), with the default settings and in the
+  strict-parity setting (FP64 solver storage, tolerances 1e-12), where E,
+  its column and its mode are the CPU's at every step and the fields end
+  within 0.99 times the CPU's strict spread; the same steps on 2 x 2 and
+  4 x 1 tiles. Cost of the measure: +0.3 % per step on the Sargasso Sea
+  (2 x 2, 1440 s) and +0.4 % on the California Current nest (2 x 2,
+  600 s), step medians on 4 A100 (0.08-0.12 ms per step); a rebuild on
+  demand costs what a rebuild at the cadence costs.
 - Every namelist needs `&imex_igw_settings` with the new required key
   `imex_igw` (no default), as in UCLA ROMS (ucla-roms PR for the
   `imex_igw` key, branch imex-igw-key): `.true.` the IMEX internal-wave
@@ -854,7 +889,8 @@ v0.1.2-beta, bit for bit.
   face column), and the boundary density is the model's EOS. Lateral mixing is a split step from the
   corrected state (`imex_mix_split = 1`). The reference stratification,
   and with it the operator, is rebuilt every 24 model hours
-  (`imex_bref_hours`). Restarts are exact (`imex_rst_state = 1`). The
+  (`imex_bref_hours`) and earlier where it goes stale
+  (`imex_bref_trigger`). Restarts are exact (`imex_rst_state = 1`). The
   settings are those of UCLA ROMS's namelist template (`imex_verbose`,
   `imex_bref_hours`, `imex_rst_state`, `imex_obc_mode`,
   `imex_obc_tref`); keys removed from UCLA ROMS on

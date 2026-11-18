@@ -232,6 +232,12 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   plain message in its place the build passed, and so did the same code
   with more added elsewhere. It depends on the whole file, not on one
   construct: try small variants of the new code in separate builds.
+  The `imex_bref_trigger` port met it a third time: its first version
+  built, and a rewrite of one routine aborted; of two variants built side
+  by side, the one whose `write` statements were again those of the
+  version that built passed (its arguments `bre_tv(m)` instead of a local
+  copy), the other (the search moved into a new subroutine) aborted. When
+  a working version exists, keep its `write` statements unchanged.
 - nvfortran 25.9 at -O2 (host code) dropped the sign extension of
   `int(x, int32)` for an `integer(int8)` x inside
   `ior(ishft(int(b0, int32), 8), ...)`: shorts read by `cdf_direct` came out

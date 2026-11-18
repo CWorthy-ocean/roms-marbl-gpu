@@ -204,7 +204,9 @@
 #   imex_bref_hours  rebuild interval (model hours) of the reference     [24]
 #                    stratification b_ref, the operator, its
 #                    preconditioner and the 'modal' boundary modes; 12
-#                    for strongly evolving stratification
+#                    for strongly evolving stratification. The longest
+#                    age of b_ref: imex_bref_trigger rebuilds it earlier
+#                    where it goes stale
 #   imex_rst_state   1 the IMEX state in the restart files (exact        [1]
 #                    restart); 0 none (smaller files, inexact restart)
 #   imex_obc_mode    normal velocity at open faces: 'modal' the     ['auto']
@@ -251,6 +253,25 @@
 # with 0. imex_verbose >= 1 prints IMEX_CLIP lines (clipped and active
 # cell-steps since the last line) at each operator build and at the end
 # of the run, as on the CPU.
+# imex_bref_trigger (ucla-roms #456, e62b3b17; a solver
+# setting on both codes, not in the template): b_ref, the operator and
+# its preconditioner are also rebuilt at the next step when the exposure
+# E of some column (not within two cells of an open edge) to the stale
+# b_ref exceeds this and b_ref is at least 1 h old; imex_bref_hours
+# stays the longest age. E: the explicit residual stratification
+# N2(b*) - N2(b_ref) projected on the column's three fastest WKB modes
+# of the operator's N2, against the operator's N2 on the mode, weighted
+# by W^2/(W^2 + 2) (W the mode's grid-scale Courant number), as a
+# fraction of x_inf, the stiff-mode limit of the time-step weights in
+# effect (0.3096 for the default weights; printed at start-up). 0.646
+# (e = 0.2 with the default weights) is the default, 0 rebuilds never on
+# demand (the earlier results), a value < 0 stops the run at start-up.
+# E is computed every step at every imex_verbose: IMEX_BREF_DEMAND lines
+# at each demand, IMEX_BREF_E lines at each rebuild (reason, b_ref age,
+# largest E since the last rebuild), after each IMEX line (imex_verbose
+# >= 1) and at the end of the run, as on the CPU. Restarts stay exact
+# (the age is in the restart file) and the demand steps do not depend on
+# the tiling (one MPI max of one number per step).
 # imex_pc ('modes', the default on both codes since ucla-roms branch
 # imex-pc-modes-default, 8c1d6909; it was 'jacobi' before; 'jacobi'),
 # imex_pc_modes (0 automatic, the

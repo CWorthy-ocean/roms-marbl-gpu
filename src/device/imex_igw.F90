@@ -37,7 +37,7 @@ module imex_igw
   ! fused path only), imex_corr_adv_clip >= 0 (0.1, the default; 0 off),
   ! imex_pc 'modes' (the default)/'jacobi' with imex_pc_modes, imex_pc_cou_on, imex_pc_cou_k, imex_pc_levels,
   ! imex_pc_ncoarse, imex_pc_smoother ('modes' on the fused path only, imex_pc_dump 0; imex_pcm.inc),
-  ! imex_n2_ref, imex_n2_taper, imex_bref_hours, imex_warm 0/1,
+  ! imex_n2_ref, imex_n2_taper, imex_bref_hours, imex_bref_trigger >= 0 (0.646, the default; 0 off), imex_warm 0/1,
   ! imex_setup_lag 0/1, imex_rst_state 0/1, imex_obc_mode 'fixed'/'modal'/'auto'
   ! with imex_obc_nmodes, imex_obc_q0, imex_obc_tref, imex_obc_cmin,
   ! imex_obc_mprint ('modal' needs the fused solve with imex_gpu_stage and
@@ -228,6 +228,40 @@ module imex_igw
   ! (imex_corr_adv = 1 and the key > 0)
   real(rp)    :: imex_corr_adv_clip
   logical     :: clip_on
+  ! CPU e62b3b17 (ucla-roms imex-bref-trigger; IMEX_BREF_TRIGGER.md): b_ref also rebuilt on demand, at the next
+  ! step, when the exposure E of some interior column exceeds this and b_ref is at least imex_bref_minhours old
+  ! (0: never; imex_bref_hours stays the longest age). Between rebuilds the corrector carries the stratification
+  ! that b_ref no longer holds, N2act - N2raw (N2 of b* and of b_ref), explicitly against the operator's N2op;
+  ! under a deepening mixed layer this residual grows, and past a threshold a grid-scale mode of the stiff
+  ! internal waves grows at long steps. Per column and WKB mode m = 1..3 of N2op,
+  !   e_m = [sum (N2act - N2raw) w_m^2 Hz / sum N2op w_m^2 Hz] W^2/(W^2 + 2),  W = c_m dt sqrt(4 pm^2 + 4 pn^2)
+  ! (the (pi, pi) wave), E = max_m e_m/x_inf, x_inf the stiff-mode threshold of the one-mode model of the step
+  ! for the weights in effect and imex_corr_adv (bre_xinf: 0.3096 for the default weights, 0.2695 with theta_c
+  ! 0.7, 1/(2 theta_c) with imex_corr_adv = 0). Columns within two cells of an open edge are left out. 0.646 is
+  ! e = 0.2 for the default weights. The domain maximum is one MPI max of one number per step (exact in any
+  ! order, so the demand steps do not depend on the tiling). E is computed every step and printed (IMEX_BREF_E
+  ! lines) also with 0, which gives the earlier results bit for bit. Default 0.646, set in imex_read_namelist
+  ! (no initial value here, see imex_gpu_timers)
+  real(rp)    :: imex_bref_trigger
+  ! the smallest b_ref age [h] of an on-demand rebuild (a parameter on the CPU too): staleness builds over hours,
+  ! while the b_ref smoothing alone gives E > 0 on a fresh b_ref; at most one rebuild per model hour
+  real(rp), parameter :: imex_bref_minhours = 1.0_rp
+  ! bre_weights (each operator set-up, rst_replay included), imex_bref_exposure (each corrector): bre_c(i,j,k,m)
+  ! the weight of the centred rho1 difference of cell k in E of mode m (-g/rho0 a dza, a = w_m^2 Hz/S_m W^2/(W^2
+  ! + 2)/x_inf), bre_er(i,j,m) the b_ref part, bre_w2 the mode's W^2 (0: an inactive or open-edge column, left
+  ! out), bre_h0 the operator's Hz(nz); from the operator's arrays, so the restart file needs nothing new.
+  ! bre_rm(i,j,:,t): per column, its largest E since tracker t restarted (below), with that E's mode and W^2,
+  ! updated in the measure's kernel, so that the location of a tracker's maximum is looked up only when a line
+  ! prints it (bre_line)
+  real(rp), WORK_ATTR allocatable :: bre_c(:,:,:,:), bre_w2(:,:,:), bre_er(:,:,:), bre_h0(:,:), bre_rm(:,:,:,:)
+  ! host (set in imex_read_namelist): x_inf; the largest E of the domain (the same on every rank) since the last
+  ! IMEX line (1), since the last b_ref rebuild (2) and in the run (3): bre_tv value, bre_ts step, bre_ta b_ref
+  ! age [steps] (-huge: no corrector step since it restarted); bre_rs(t) tracker t (1, 2) restarts at the next
+  ! measure (bre_rm); bre_ndem demands, bre_nreb rebuilds after the run's first (this run only, not in the
+  ! restart file); bre_dem the next rebuild is a demand's, bre_dage its b_ref age [steps]
+  real(rp) :: bre_xinf, bre_tv(3)
+  integer :: bre_ts(3), bre_ta(3), bre_ndem, bre_nreb, bre_dage
+  logical :: bre_dem, bre_rs(2)
   ! The CPU's 'modal' open boundary (keys and defaults as the CPU's): 'auto' selects 'modal' with an
   ! open edge and 3-D boundary data (obm_decide). imex_obc_mode, imex_obc_tref: template keys;
   ! imex_obc_nmodes, imex_obc_q0 (0 off, else 0.2-1), imex_obc_cmin, imex_obc_mprint (OBCM/OBCF
@@ -495,7 +529,8 @@ contains
        imex_am3_crv, imex_tol_pred, imex_tol_corr, imex_maxit, &
        imex_verbose, imex_solver_enabled, imex_allow_explicit, imex_selftest, &
        imex_n2_ref, imex_n2_taper, imex_warm, &
-       imex_bref_hours, imex_setup_lag, imex_pcg_start, imex_pcg_fused, imex_solver_prec, imex_stage_fused, &
+       imex_bref_hours, imex_bref_trigger, imex_setup_lag, imex_pcg_start, imex_pcg_fused, imex_solver_prec, &
+       imex_stage_fused, &
        imex_redu, imex_rst_state, imex_mix_split, imex_corr_adv, imex_corr_adv_clip, &
        imex_obc_mode, imex_obc_nmodes, imex_obc_q0, imex_obc_tref, &
        imex_obc_mprint, imex_obc_cmin, imex_pc, imex_pc_modes, imex_pc_dump, imex_pc_cou_on, imex_pc_cou_k, &
@@ -506,6 +541,9 @@ contains
     imex_gpu_timers = 0                  ! the default (see the declaration)
     imex_corr_adv = 1                    ! the default (see the declaration)
     imex_corr_adv_clip = 0.1_rp          ! the default (see the declaration)
+    imex_bref_trigger = 0.646_rp         ! the default (see the declaration)
+    bre_xinf = 1.0_rp; bre_tv = -huge(1.0_rp); bre_ts = 0; bre_ta = 0
+    bre_ndem = 0; bre_nreb = 0; bre_dage = 0; bre_dem = .false.; bre_rs = .false.
     imex_pc = 'modes'; imex_pc_modes = 0; imex_pc_cou_on = 0.5_rp; imex_pc_cou_k = 0.3_rp   ! the defaults
     imex_pc_levels = 0; imex_pc_ncoarse = 2; imex_pc_smoother = 'rbgs'; imex_pc_dump = 0
     pcm_on = .false.; pcm_big = .false.; pcm_jac = .false.
@@ -745,6 +783,7 @@ contains
     if (imex_mix_split < 0 .or. imex_mix_split > 1) call bad('imex_mix_split must be 0 or 1')
     if (imex_corr_adv < 0 .or. imex_corr_adv > 1) call bad('imex_corr_adv must be 0 or 1')
     if (imex_corr_adv_clip < 0.0_rp) call bad('imex_corr_adv_clip must be >= 0 (0: off)')
+    if (imex_bref_trigger < 0.0_rp) call bad('imex_bref_trigger must be >= 0 (0: no on-demand rebuild)')
     if (imex_warm < 0 .or. imex_warm > 1) call bad('imex_warm must be 0 or 1')
     if (imex_bref_hours <= 0.0_rp) call bad('imex_bref_hours must be positive')
     if (imex_setup_lag < 0 .or. imex_setup_lag > 1) call bad('imex_setup_lag must be 0 or 1')
@@ -832,6 +871,7 @@ contains
          // " imex_gpu_sweep and imex_gpu_redu 1; set imex_pc = 'jacobi' for the unfused path")
     pcm_jac = (trim(imex_pc_smoother) == 'jacobi')
     if (nerr > 0) error stop 'imex_igw: unsupported &imex_igw_settings (see above)'
+    bre_xinf = bre_model_xinf()          ! x_inf of imex_bref_trigger for these weights
   contains
     subroutine bad(what)
       character(len=*), intent(in) :: what
@@ -877,6 +917,9 @@ contains
     write(*,'(3x,a,f7.3,a,i2,a,i2,a,i2,a,i2)') 'imex_bref_hours =', imex_bref_hours, '  imex_setup_lag =', &
          merge(1, 0, lag_on), '  imex_pcg_start =', pcg_start, '  imex_pcg_fused =', merge(1, 0, pf_on), &
          '  imex_solver_prec =', pf_prec
+    write(*,'(3x,A,F7.4,A,F7.4,A,F7.4,A,F5.2,A)') 'imex_bref_trigger =', imex_bref_trigger, ' (0: off): b_ref' &
+         // ' also rebuilt when the exposure E = e/x_inf exceeds it, x_inf =', bre_xinf, ' for these weights (e >', &
+         imex_bref_trigger * bre_xinf, '), at ages >=', imex_bref_minhours, ' h'
     if (imex_solver_prec /= pf_prec) write(*,'(3x,a)') 'imex_solver_prec = 4 needs imex_pcg_fused = 1 in effect:' &
          // ' imex_solver_prec = 8'
     write(*,'(3x,a,i2,a,i2,a,i2,a,i2)') 'imex_gpu_redu =', imex_gpu_redu, &
@@ -936,6 +979,12 @@ contains
       allocate(ad_xc(1, 1, 1), advb_cc(1, 1, 1))
     endif
     ad_xc = huge(1.0_rp); advb_cc = 0.0_rp
+    allocate(bre_c(is:ie, js:je, nz, 3))   ! imex_bref_trigger (bre_weights; inactive columns stay 0)
+    allocate(bre_w2(is:ie, js:je, 3))
+    allocate(bre_er(is:ie, js:je, 3))
+    allocate(bre_h0(is:ie, js:je))
+    allocate(bre_rm(is:ie, js:je, 3, 3))
+    bre_c = 0.0_rp; bre_w2 = 0.0_rp; bre_er = 0.0_rp; bre_h0 = 1.0_rp; bre_rm = -huge(1.0_rp)
     allocate(bw0(is:ie, js:je, nz), bw1(is:ie, js:je, nz), bw2(is:ie, js:je, nz), bw3(is:ie, js:je, nz))
     allocate(bword(is:ie, js:je, nz))
     bw0 = 0.0_rp; bw1 = 0.0_rp; bw2 = 0.0_rp; bw3 = 0.0_rp; bword = 0
@@ -1066,6 +1115,7 @@ contains
     call itw(17, 1)
     call imex_diag_line()
     if (iic == ntstart + ntimes - 1) call pf_sum_stats()
+    if (iic == ntstart + ntimes - 1) call bre_line(3, 0)   ! (IMEX_BREF_E: the run's largest exposure)
     if (iic == ntstart + ntimes - 1 .and. clip_on .and. imex_verbose >= 1) call clip_line()
   end subroutine imex_shift_levels
 
@@ -1131,6 +1181,7 @@ contains
              dble(st_it(1)) / max(st_n(1), 1), '/', st_itmax(1), ' corr', dble(st_it(2)) / max(st_n(2), 1), &
              '/', st_itmax(2), '  max|du| pred, corr', glob(2), glob(4), '  unconverged', st_bad
       endif
+      call bre_line(1, 0)                  ! IMEX_BREF_E: the largest exposure since the last IMEX line
     endif
     st_n = 0; st_it = 0; st_itmax = 0; st_bad = 0; st_dp = 0.0_rp; st_du = 0.0_rp
   end subroutine imex_diag_line
@@ -1425,6 +1476,11 @@ contains
     call itw2(4, 0)
     call imex_step_setup()
     call itw2(4, 1)
+    if (stage == imex_stage_corr) then     ! CPU e62b3b17: the stale-b_ref exposure E; the on-demand rebuild
+      call itw2(36, 0)
+      call imex_bref_exposure()
+      call itw2(36, 1)
+    endif
     if (advb_on) then                      ! CPU 746cb6f7: the step's advective buoyancy change in the corrector rhs
       call itw2(30, 0)
       if (stage == imex_stage_pred) then
@@ -2256,6 +2312,326 @@ contains
     bref_due = .not. (nb > 1 .and. have_bref .and. iic - bref_last < nb .and. iic >= bref_last)
   end function bref_due
 
+  !======================================================================
+  ! imex_bref_trigger (CPU e62b3b17): the exposure of the stale b_ref and the on-demand rebuild
+  !======================================================================
+  real(rp) function bre_model_xinf() result(xinf)
+    ! CPU bre_model_xinf (check_settings): the residual x = r - 1 (the actual N2 = r times the operator's,
+    ! uniform) at which the one-mode model of the IMEX step goes unstable in the stiff limit, for the weights
+    ! in effect. The model is one vertical mode and one horizontal wave with the state (u, b, u^n-1, b^n-1,
+    ! the memory term), the operator response W (= omega dt, here 1e4), the actual response r W and the
+    ! pressure gradient -W: the predictor (theta_p, phi, LF-AM3 with gamma = imex_am3_crv/2) and the corrector
+    ! (theta_c, mu, nu, rho), with imex_corr_adv's X (the residual (r - 1) W and the predictor's non-wave
+    ! change). Its spectral radius from the norm of G^(2^40) (repeated squaring, normalised at each squaring);
+    ! r by bisection on [1, 12] (x_inf = 11 when the model is stable up to 12). Default weights: 0.3096;
+    ! theta_c 0.7: 0.2695; imex_corr_adv = 0: 1/(2 theta_c). Host code, once at start-up.
+    real(rp), parameter :: xmax = 11.0_rp
+    real(rp) :: lo, hi, xm
+    integer :: it
+    if (bre_lrho(1.0_rp + xmax) <= 1.e-10_rp) then
+      xinf = xmax
+      return
+    endif
+    lo = 0.0_rp; hi = xmax
+    do it = 1, 50
+      xm = 0.5_rp * (lo + hi)
+      if (bre_lrho(1.0_rp + xm) > 1.e-10_rp) then
+        hi = xm
+      else
+        lo = xm
+      endif
+    enddo
+    xinf = hi
+  end function bre_model_xinf
+
+  real(rp) function bre_lrho(r)
+    ! (bre_model_xinf) the log of the spectral radius of the one-step matrix at N2 ratio r
+    real(rp), intent(in) :: r
+    real(rp) :: g5(5, 5), a(5, 5), s
+    integer :: i
+    call bre_gmat(r, g5)
+    a = g5; bre_lrho = 0.0_rp
+    do i = 0, 39
+      s = maxval(abs(a))
+      a = a / s; bre_lrho = bre_lrho + log(s) / 2.0_rp**i
+      a = matmul(a, a)
+    enddo
+    bre_lrho = bre_lrho + log(maxval(abs(a))) / 2.0_rp**40
+  end function bre_lrho
+
+  subroutine bre_gmat(r, g5)
+    ! (bre_model_xinf) the one-step matrix: row i the new state variable i as a combination of the old ones
+    real(rp), intent(in) :: r
+    real(rp), intent(out) :: g5(5, 5)
+    real(rp), parameter :: wst = 1.e4_rp
+    real(rp), dimension(5) :: u0, b0, uo, bo, q, fpe, us, fp, dps0, bs, x, d0, u1, fc, b1, q1
+    real(rp) :: gam, dtau, cs, cb, tp, ph, tc, rr, ra, pg, key
+    u0 = 0.0_rp; b0 = 0.0_rp; uo = 0.0_rp; bo = 0.0_rp; q = 0.0_rp
+    u0(1) = 1.0_rp; b0(2) = 1.0_rp; uo(3) = 1.0_rp; bo(4) = 1.0_rp; q(5) = 1.0_rp
+    gam = 0.5_rp * imex_am3_crv
+    dtau = 1.0_rp - 2.0_rp * gam; cs = 0.5_rp + 2.0_rp * gam; cb = 0.5_rp - 2.0_rp * gam
+    tp = imex_theta_p; ph = imex_phi; tc = imex_theta_c
+    rr = wst; ra = r * wst; pg = -wst; key = dble(imex_corr_adv)
+    fpe = ph * u0 + (1.0_rp - tp - ph) * uo                                      ! predictor transport, explicit part
+    us = (cs * u0 + cb * uo + dtau * pg * ((tp + ph) * b0 + (1.0_rp - tp - ph) * bo) &
+          + tp * dtau * pg * (dtau * rr * fpe - cb * q)) / (1.0_rp - tp**2 * dtau**2 * pg * rr)   ! u*
+    fp = tp * us + fpe
+    dps0 = dtau * rr * fp - cb * q                                               ! the predictor's memory term
+    bs = cs * b0 + cb * bo + dtau * ra * fp                                      ! b*
+    x = key * ((ra - rr) * us - (bs - b0 - dps0))                                ! imex_corr_adv's X
+    d0 = rr * (imex_mu * us + imex_nu * u0 + imex_rho * uo) - dps0 + x
+    u1 = (u0 + pg * ((tc + imex_mu) * bs + imex_nu * b0 + imex_rho * bo) + tc * pg * d0) / (1.0_rp - tc**2 * pg * rr)
+    fc = tc * u1 + imex_mu * us + imex_nu * u0 + imex_rho * uo
+    b1 = b0 + ra * fc
+    q1 = dps0 + tc * rr * u1 + d0
+    g5(1, :) = u1; g5(2, :) = b1; g5(3, :) = u0; g5(4, :) = b0; g5(5, :) = q1
+  end subroutine bre_gmat
+
+  subroutine bre_weights()
+    ! CPU bre_weights (adj_setup after eta_setup1: every operator set-up, the b_ref rebuilds and rst_replay
+    ! with the setup lag, every step without it): the weights of the exposure E (imex_bref_exposure). Per
+    ! active column, from the operator's N2op = ad_n2t and Hz: the WKB coordinate zeta(k) = (sum_{k' < k}
+    ! sqrt(N2op) Hz + sqrt(N2op) Hz(k)/2)/T, T = sum_k sqrt(N2op) Hz; for m = 1..3 w_m = sin(m pi zeta),
+    ! c_m = T/(m pi), W_m^2 = (c_m dt)^2 4 (pm^2 + pn^2), S_m = sum_k N2op w_m^2 Hz and
+    !   a(k, m) = w_m^2 Hz/S_m W_m^2/(W_m^2 + 2)/x_inf,   E_m = sum_k a(k, m) (N2act - N2raw)(k),
+    ! N2 centred on the current z_r. The sigma levels stretch uniformly, so the current spacing is the
+    ! operator's (dza) times hz0/Hz(nz), and E_m = (sum_k bre_c(k, m) (rho1(k+1) - rho1(k-1)) - bre_er(m))
+    ! bre_h0/Hz(nz) with bre_c = -g/rho0 a dza, bre_er = sum_k a dza (b_ref(k+1) - b_ref(k-1)), bre_h0 = Hz(nz)
+    ! at the set-up (one-sided differences at k = 1 and nz, as dza). Columns within two cells of an open
+    ! physical edge are left out (bre_w2 = 0): their b* is set within the step by the boundary values (UP3
+    ! advection reaches two cells, the tracer OBC and the sponge act there), so their residual measures the
+    ! boundary data's mismatch, not the staleness of b_ref. One thread per column; the CPU's arithmetic in the
+    ! CPU's order.
+    use gpu_state, only: obc_west, obc_east, obc_south, obc_north
+    integer(ip) :: i, j, k, nx, ny, nz, i0, j0, gnx, gny, ig, jg
+    real(rp) :: pi8, xinf, dtl, grho, tot, cum, sq, zc, hk, n2, c1, c2, c3, so1, so2, so3, p2
+    real(rp) :: wm1, wm2, wm3, fa1, fa2, fa3, er1, er2, er3, db
+    logical :: ow, oe, os, on, skip
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    i0 = decomp%i0; j0 = decomp%j0; gnx = decomp%gnx; gny = decomp%gny
+    ow = decomp%edge_w .and. obc_west; oe = decomp%edge_e .and. obc_east
+    os = decomp%edge_s .and. obc_south; on = decomp%edge_n .and. obc_north
+    pi8 = 3.14159265358979323846_rp; xinf = bre_xinf; dtl = dt; grho = g / rho0
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, ny
+      do i = 1, nx
+        ig = i0 + i - 1; jg = j0 + j - 1
+        skip = act(i, j) <= 0.0_rp
+        if (ow .and. ig <= 2) skip = .true.
+        if (oe .and. ig > gnx - 2) skip = .true.
+        if (os .and. jg <= 2) skip = .true.
+        if (on .and. jg > gny - 2) skip = .true.
+        if (skip) then
+          bre_w2(i, j, 1) = 0.0_rp; bre_w2(i, j, 2) = 0.0_rp; bre_w2(i, j, 3) = 0.0_rp
+        else
+          tot = 0.0_rp
+          do k = 1, nz
+            sq = sqrt(ad_n2t(i, j, k)) * Hz(i, j, k)
+            tot = tot + sq
+          enddo
+          cum = 0.0_rp; so1 = 0.0_rp; so2 = 0.0_rp; so3 = 0.0_rp
+          do k = 1, nz
+            hk = Hz(i, j, k); n2 = ad_n2t(i, j, k)
+            sq = sqrt(n2) * hk
+            zc = cum + 0.5_rp * sq; cum = cum + sq
+            c1 = sin(1.0_rp * pi8 * zc / tot)**2 * hk
+            c2 = sin(2.0_rp * pi8 * zc / tot)**2 * hk
+            c3 = sin(3.0_rp * pi8 * zc / tot)**2 * hk
+            bre_c(i, j, k, 1) = c1; bre_c(i, j, k, 2) = c2; bre_c(i, j, k, 3) = c3
+            so1 = so1 + n2 * c1; so2 = so2 + n2 * c2; so3 = so3 + n2 * c3
+          enddo
+          p2 = pm(i, j)**2 + pn(i, j)**2
+          wm1 = (tot / (1.0_rp * pi8) * dtl)**2 * 4.0_rp * p2
+          wm2 = (tot / (2.0_rp * pi8) * dtl)**2 * 4.0_rp * p2
+          wm3 = (tot / (3.0_rp * pi8) * dtl)**2 * 4.0_rp * p2
+          fa1 = wm1 / ((wm1 + 2.0_rp) * so1 * xinf)
+          fa2 = wm2 / ((wm2 + 2.0_rp) * so2 * xinf)
+          fa3 = wm3 / ((wm3 + 2.0_rp) * so3 * xinf)
+          er1 = 0.0_rp; er2 = 0.0_rp; er3 = 0.0_rp
+          do k = 1, nz
+            db = ad_bb(i, j, min(k + 1, nz)) - ad_bb(i, j, max(k - 1, 1_ip))
+            c1 = bre_c(i, j, k, 1) * fa1 * dza(i, j, k)
+            c2 = bre_c(i, j, k, 2) * fa2 * dza(i, j, k)
+            c3 = bre_c(i, j, k, 3) * fa3 * dza(i, j, k)
+            er1 = er1 + c1 * db; er2 = er2 + c2 * db; er3 = er3 + c3 * db
+            bre_c(i, j, k, 1) = -(grho * c1); bre_c(i, j, k, 2) = -(grho * c2); bre_c(i, j, k, 3) = -(grho * c3)
+          enddo
+          bre_er(i, j, 1) = er1; bre_er(i, j, 2) = er2; bre_er(i, j, 3) = er3
+          bre_w2(i, j, 1) = wm1; bre_w2(i, j, 2) = wm2; bre_w2(i, j, 3) = wm3
+          bre_h0(i, j) = Hz(i, j, nz)
+        endif
+      enddo
+    enddo
+  end subroutine bre_weights
+
+  subroutine imex_bref_exposure()
+    ! CPU imex_bref_exposure (corrector, after imex_step_setup; every step and every setting): the exposure
+    ! E = max_m sum_k a(k, m) [N2(b*) - N2(b_ref)](k) of each interior column (bre_weights), b* = -g rho1/rho0
+    ! (rho_eos after set_HUV1, as advb_rhs reads it), b_ref = ad_bb: one thread per column, each column's sum
+    ! over k ascending (the CPU's order); the domain maximum by one MPI max of one number (the same on every
+    ! rank and independent of the tiling). With imex_bref_trigger > 0, a value above it at a b_ref age of at
+    ! least imex_bref_minhours (and not due at the next step anyway) ages b_ref so that the next step rebuilds
+    ! it (bref_due): the age is in the restart file, so an exact restart repeats the rebuild. Rank 0 prints an
+    ! IMEX_BREF_DEMAND line. The same kernel keeps each column's largest E per tracker (bre_rm), from which
+    ! bre_line takes the location of a tracker's maximum: no further kernel or synchronisation per step.
+    integer(ip) :: i, j, k, nx, ny, nz
+    integer :: m, age, nb
+    real(rp) :: el, s1, s2, s3, dr, f, e1, e2, e3, em, mm, wm, rv
+    real(8) :: lo(1), gl(1)
+    logical :: r1, r2
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    r1 = bre_rs(1); r2 = bre_rs(2); bre_rs = .false.
+    el = -huge(1.0_rp)
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, ny
+      do i = 1, nx
+        em = -huge(1.0_rp); mm = 0.0_rp; wm = 0.0_rp
+        if (bre_w2(i, j, 1) > 0.0_rp) then
+          s1 = 0.0_rp; s2 = 0.0_rp; s3 = 0.0_rp
+          do k = 1, nz
+            dr = rho1(i, j, min(k + 1, nz)) - rho1(i, j, max(k - 1, 1_ip))
+            s1 = s1 + bre_c(i, j, k, 1) * dr
+            s2 = s2 + bre_c(i, j, k, 2) * dr
+            s3 = s3 + bre_c(i, j, k, 3) * dr
+          enddo
+          f = bre_h0(i, j) / Hz(i, j, nz)            ! the operator's level spacing over the current one
+          e1 = (s1 - bre_er(i, j, 1)) * f
+          e2 = (s2 - bre_er(i, j, 2)) * f
+          e3 = (s3 - bre_er(i, j, 3)) * f
+          em = e1; mm = 1.0_rp; wm = bre_w2(i, j, 1)
+          if (e2 > em) then
+            em = e2; mm = 2.0_rp; wm = bre_w2(i, j, 2)
+          endif
+          if (e3 > em) then
+            em = e3; mm = 3.0_rp; wm = bre_w2(i, j, 3)
+          endif
+        endif
+        ! the trackers' column maxima (1: since the last IMEX line, 2: since the last rebuild, 3: the run)
+        rv = bre_rm(i, j, 1, 1)
+        if (r1) rv = -huge(1.0_rp)
+        if (em > rv) then
+          bre_rm(i, j, 1, 1) = em; bre_rm(i, j, 2, 1) = mm; bre_rm(i, j, 3, 1) = wm
+        else
+          bre_rm(i, j, 1, 1) = rv
+        endif
+        rv = bre_rm(i, j, 1, 2)
+        if (r2) rv = -huge(1.0_rp)
+        if (em > rv) then
+          bre_rm(i, j, 1, 2) = em; bre_rm(i, j, 2, 2) = mm; bre_rm(i, j, 3, 2) = wm
+        else
+          bre_rm(i, j, 1, 2) = rv
+        endif
+        if (em > bre_rm(i, j, 1, 3)) then
+          bre_rm(i, j, 1, 3) = em; bre_rm(i, j, 2, 3) = mm; bre_rm(i, j, 3, 3) = wm
+        endif
+        el = max(el, em)
+      enddo
+    enddo
+    lo(1) = real(el, 8)
+    call comm_allreduce_max(1, lo, gl)
+    age = int(iic - bref_last)
+    do m = 1, 3                                      ! the trackers (IMEX line, rebuild, run)
+      if (gl(1) > bre_tv(m)) then
+        bre_tv(m) = gl(1); bre_ts(m) = int(iic); bre_ta(m) = age
+      endif
+    enddo
+    if (imex_bref_trigger <= 0.0_rp) return
+    nb = imex_nbref()
+    if (gl(1) > imex_bref_trigger .and. dble(age) * dt >= 3600.0_rp * imex_bref_minhours .and. age + 1 < nb) then
+      bref_last = iic + 1 - nb                       ! due at the next step
+      bre_ndem = bre_ndem + 1; bre_dem = .true.; bre_dage = age + 1
+      if (talk) write(*,'(1x,A,I8,A,F8.4,A,F8.4,A,F7.2,A,I6)') 'IMEX_BREF_DEMAND', iic, ' E', gl(1), &
+           ' > imex_bref_trigger', imex_bref_trigger, ' at b_ref age', dble(age) * dt / 3600.0_rp, &
+           ' h: b_ref rebuilt at the next step; demands', bre_ndem
+    endif
+  end subroutine imex_bref_exposure
+
+  subroutine bre_rebuild_line()
+    ! CPU bre_rebuild_line (adj_setup, at a b_ref rebuild, not at rst_replay): the IMEX_BREF_E line (rank 0,
+    ! every imex_verbose) of the largest exposure since the last rebuild, with the reason of this one (cadence:
+    ! imex_bref_hours; demand: imex_bref_trigger; after a restart a demand of the restart step shows as
+    ! cadence) and the age of b_ref. Nothing at the run's first build. Collective.
+    integer :: age
+    if (have_bref) then
+      bre_nreb = bre_nreb + 1
+      age = int(iic - bref_last)
+      if (bre_dem) age = bre_dage
+      call bre_line(2, age)
+    endif
+    bre_dem = .false.; bre_tv(2) = -huge(1.0_rp); bre_rs(2) = .true.
+  end subroutine bre_rebuild_line
+
+  subroutine bre_line(m, rage)
+    ! CPU bre_line: the IMEX_BREF_E line (rank 0) of the largest exposure E since the last IMEX line (m = 1),
+    ! since the last b_ref rebuild (2, rage: the age of b_ref at this rebuild [steps]) or in the run (3, with
+    ! the rebuild and demand counts): E, e = E x_inf, the step and the b_ref age, the column (global i, j) and
+    ! mode, the mode's residual x_m (e = x_m W^2/(W^2 + 2)) and W; the CPU's text and formats (written in
+    ! pieces, without an internal write: AGENTS.md, fort2). Trackers 1 and 2 then restart. Collective: the
+    ! column is the first in the CPU's order (j, then i) of the lowest compute rank whose tracker maximum
+    ! (bre_rm) equals the domain's.
+    integer, intent(in) :: m, rage
+    integer(ip) :: i, j, k, nx, ny, il, jl
+    integer :: mt
+    real(rp) :: tv, key, gi0, gj0, gw, mv, wv
+    real(8) :: c(1), cg(1), lc(4), lg(4)
+    if (.not. imex_solver_enabled) return
+    nx = decomp%nx; ny = decomp%ny; mt = m
+    gi0 = real(decomp%i0 - 1, rp); gj0 = real(decomp%j0 - 1, rp); gw = real(decomp%gnx + 2, rp)
+    tv = bre_tv(m); key = huge(1.0_rp)
+    if (tv > -huge(1.0_rp)) then
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = 1, ny
+        do i = 1, nx
+          key = min(key, merge((gj0 + real(j, rp)) * gw + gi0 + real(i, rp), huge(1.0_rp), bre_rm(i, j, 1, mt) == tv))
+        enddo
+      enddo
+    endif
+    c(1) = huge(1.0_8)
+    if (key < huge(1.0_rp)) c(1) = dble(decomp%rank)
+    call comm_allreduce_min(1, c, cg)
+    lc = 0.0_8
+    if (cg(1) == dble(decomp%rank)) then
+      jl = int(key / gw) - int(gj0); il = int(mod(key, gw)) - int(gi0)
+      mv = -huge(1.0_rp); wv = -huge(1.0_rp)
+#ifdef USE_CUDA
+      !$cuf kernel do(1) <<<*,*>>>
+#endif
+      do k = 1, 1
+        mv = max(mv, bre_rm(il, jl, 2, mt))
+        wv = max(wv, bre_rm(il, jl, 3, mt))
+      enddo
+      lc = [real(gi0, 8) + il, real(gj0, 8) + jl, real(mv, 8), real(wv, 8)]
+    endif
+    call comm_allreduce_sum(4, lc, lg)
+    if (talk) then
+      if (m == 1) write(*,'(1x,A,I8,1x,A)', advance='no') 'IMEX_BREF_E', iic, 'line'
+      if (m == 2) write(*,'(1x,A,I8,1x,A,A,A,F7.2,A)', advance='no') 'IMEX_BREF_E', iic, 'rebuild (', &
+           trim(merge('demand ', 'cadence', bre_dem)), ') at b_ref age', dble(rage) * dt / 3600.0_rp, &
+           ' h; since the last rebuild'
+      if (m == 3) write(*,'(1x,A,I8,1x,A)', advance='no') 'IMEX_BREF_E', iic, 'run'
+      if (bre_tv(m) > -huge(1.0_rp)) then
+        write(*,'(A,F8.4,A,F8.4,A,I8,A,F7.2,A,2I5,A,I2,A,F8.4,A,F7.2)') ': max E', bre_tv(m), ' (e', &
+             bre_tv(m) * bre_xinf, ') at step', bre_ts(m), ', b_ref age', dble(bre_ta(m)) * dt / 3600.0_rp, &
+             ' h, (i,j)', nint(lg(1:2)), ' mode', nint(lg(3)), ', x_m', &
+             bre_tv(m) * bre_xinf * (lg(4) + 2.0_8) / max(lg(4), 1.e-300_8), ' W', sqrt(lg(4))
+      else
+        write(*,'(A)') ': no corrector step'
+      endif
+      if (m == 3) write(*,'(1x,A,I8,A,I6,A,I6,A,F8.4,A,F8.4,A)') 'IMEX_BREF_E', iic, ' run: b_ref rebuilds', &
+           bre_nreb, ' after the first,', bre_ndem, ' on demand (imex_bref_trigger', imex_bref_trigger, ', e', &
+           imex_bref_trigger * bre_xinf, '; 0 off)'
+    endif
+    if (m < 3) then
+      bre_tv(m) = -huge(1.0_rp); bre_rs(m) = .true.
+    endif
+  end subroutine bre_line
+
   subroutine setup_geometry()
     ! CPU imex_setup_geometry_tile: cx = umask dn_u/dm_u, cy = vmask
     ! dm_v/dn_v on the tile's faces (open edges keep their faces; closed
@@ -2326,6 +2702,7 @@ contains
     if (rst_on .or. (nbref > 1 .and. have_bref .and. iic - bref_last < nbref .and. iic >= bref_last)) then
       call copy3(bref_sav, ad_bb)          ! (rst_on: rst_replay, b_ref from the restart file)
     else
+      call bre_rebuild_line()              ! (IMEX_BREF_E: the exposure since the last rebuild)
       ! bb relative to its domain mean over the active cells
       s1 = 0.0_rp; s2 = 0.0_rp
       if (redu_on) then                    ! column partials, deterministic sum (imex_red)
@@ -2384,6 +2761,7 @@ contains
       bref_last = iic
     endif
     call eta_setup1()
+    call bre_weights()                     ! the weights of the exposure E (from the operator's N2 and Hz)
     call bcoef()
     call cz_split()
     call adj_diag_coef()                   ! (and the cap ad_xc of imex_corr_adv_clip)
