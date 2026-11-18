@@ -246,6 +246,20 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   at the end of its section (variables after the last variable, a new
   `public` line after the last one, procedures before `end module`)
   built. Append to `comm_mod`; do not insert.
+- `io_server.F90`: moving every internal procedure of `io_server_run`
+  (`announce`, `open_for`) out to module level made `fort2` abort with
+  "munmap_chunk(): invalid pointer" in `imex_igw.F90` of the full `make
+  gpu` (five builds; module variables appended at the end of their
+  section, the new module procedures and a new `write_direct` each built
+  on their own). Keeping `open_for`, `write_ready` and `evict` internal
+  to `io_server_run` built. Bisect such aborts with throwaway branches
+  built in parallel from `git archive` copies.
+- The writers take in later records while they write one (`io_progress`,
+  `ROMS_GPU_IO_PROGRESS=0` turns it off): a command handled there may only
+  queue a completed record (`ready_q`), never write one, and only when a
+  record slot is free; the main loop writes the queue in order and is the
+  only place that evicts. Keep it that way: a write started from inside
+  another write would break the group's barrier order.
 - CDF5 output is written by the writer ranks with `O_DIRECT`, each 4-KiB
   page by one writer (`cdf_direct`, `io_server` `write_direct`). Rules
   that the benchmarks behind it gave (do not relax them without measuring
