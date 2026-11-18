@@ -217,7 +217,12 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
 - **Namelist:** the same groups and keys as UCLA ROMS, plus `np_xi` and
   `np_eta` (GPU tiles), `nt_bgc` (32 with MARBL) and `nt_passive`. Paths are
   relative to the namelist file. A group with a key the GPU model does not
-  know stops the run at start-up, naming the group.
+  know stops the run at start-up, naming the group. Every namelist needs
+  `&imex_igw_settings` with its switch `imex_igw` (no default):
+  `imex_igw = .false.` for the stock step (`&imex_igw_settings imex_igw =
+  .false. /` is enough), `.true.` for the IMEX internal-wave step. The
+  start-up log states it (`IMEX_IGW: on (imex_igw = .true.)` or `IMEX_IGW:
+  off (imex_igw = .false.)`).
 - **Surface forcing:** bulk (COARE 3.0) when the forcing files hold
   `uwnd`, `vwnd`, `Tair` and `qair`, otherwise flux forcing (`sustr`,
   `svstr`, `shflux`, `swflux`, `swrad`). Each field is read either on the
@@ -295,6 +300,20 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- Every namelist needs `&imex_igw_settings` with the new required key
+  `imex_igw` (no default), as in UCLA ROMS (ucla-roms PR for the
+  `imex_igw` key, branch imex-igw-key): `.true.` the IMEX internal-wave
+  step, `.false.` the stock step. Before, the group's presence switched
+  IMEX on, and a namelist without it ran the stock step without a word
+  (a cost template without the group ran the stock step at three times its
+  stable step and blew up). A namelist without the group or without the
+  key now stops at start-up, naming the key and its two values. Add
+  `&imex_igw_settings imex_igw = .false. /` to a namelist without IMEX,
+  and `imex_igw = .true.` to the group of an IMEX run. With `.false.` the
+  group's other keys are read and ignored, with a start-up note that lists
+  them. The start-up log states the setting (`IMEX_IGW: on (imex_igw =
+  .true.)` or `IMEX_IGW: off (imex_igw = .false.)`). Results are unchanged,
+  bit for bit.
 - The netCDF-4 output writer is gone: `ROMS_GPU_OUT_FORMAT` no longer
   exists (output is always CDF5; `nccopy -k nc4` converts a file for
   HDF5-only tools), and neither does `ROMS_GPU_PAR_READ=mpiio` (the
@@ -818,8 +837,8 @@ v0.1.2-beta, bit for bit.
   at single points up to 3.6 times). A
   solve that meets a NaN or Inf stops the run with a message (the same
   test and message as the implicit free surface of UCLA ROMS).
-- IMEX internal-wave step (`&imex_igw_settings`; without the group the
-  model is unchanged): the port of UCLA ROMS's IMEX_IGW (ucla-roms
+- IMEX internal-wave step (`&imex_igw_settings` with `imex_igw =
+  .true.`; with `.false.` the model is unchanged): the port of UCLA ROMS's IMEX_IGW (ucla-roms
   #433, with the 'modal' open boundary of #434), which treats the
   internal-wave terms of the
   LF-AM3 baroclinic step implicitly (an elliptic solve per stage, PCG

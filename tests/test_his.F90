@@ -127,6 +127,7 @@ contains
     write(unit,'(a)') '    wrt_temp = .true.'
     write(unit,'(a)') '    wrt_salt = .true.'
     write(unit,'(a)') '/'
+    write(unit,'(a)') '&imex_igw_settings imex_igw = .false. /'   ! required in every namelist
     close(unit)
   end subroutine write_nml
 end program test_his

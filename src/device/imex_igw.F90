@@ -111,7 +111,7 @@ module imex_igw
   public :: pgu, pgv, ipg_nm1, dpw, hs1, hs2, hsol, pf_mq, bref_sav, ad_n2raw, hz_op, dza, ad_n2o
   integer, parameter, public :: imex_nsc = 17
 
-  logical, public, protected :: imex_on = .false.     ! &imex_igw_settings present
+  logical, public, protected :: imex_on = .false.     ! imex_igw = .true. in &imex_igw_settings (required)
 
   integer(ip), parameter, public :: imex_stage_pred = 1, imex_stage_corr = 2
 
@@ -255,17 +255,9 @@ module imex_igw
        'imex_sponge_eq', 'imex_trim3d', 'imex_obc_eig', 'imex_obc_dcols', 'imex_obc_scrit', 'imex_obc_sband', &
        'imex_obc_fref', 'imex_obc_trelax', 'imex_obc_cslow', 'imex_obc_supercrit']
 
-  namelist /imex_igw_settings/ &
-       imex_theta_p, imex_phi, imex_theta_c, imex_mu, imex_nu, imex_rho, &
-       imex_am3_crv, imex_tol_pred, imex_tol_corr, imex_maxit, &
-       imex_verbose, imex_solver_enabled, imex_allow_explicit, imex_selftest, &
-       imex_n2_ref, imex_n2_taper, imex_warm, &
-       imex_bref_hours, imex_setup_lag, imex_pcg_start, imex_pcg_fused, imex_solver_prec, imex_stage_fused, &
-       imex_redu, imex_rst_state, imex_mix_split, imex_corr_adv, imex_corr_adv_clip, &
-       imex_obc_mode, imex_obc_nmodes, imex_obc_q0, imex_obc_tref, &
-       imex_obc_mprint, imex_obc_cmin, imex_pc, imex_pc_modes, imex_pc_dump, imex_pc_cou_on, imex_pc_cou_k, &
-       imex_pc_smoother, imex_pc_levels, imex_pc_ncoarse, &
-       imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep, imex_gpu_timers
+  ! The namelist statement of &imex_igw_settings is in imex_read_namelist: its switch imex_igw
+  ! (required, no default; UCLA ROMS's key of the same name) is a local there, since a module
+  ! variable cannot share the module's name
 
   ! Weights (set_derived_weights): regular step and first step of a run
   real(rp) :: wpg_pred(2), wflx_pred(3), wpg_corr(3), wrhs_corr(4)
@@ -487,13 +479,28 @@ contains
   ! Namelist, settings
   !======================================================================
   subroutine imex_read_namelist(unit)
-    ! &imex_igw_settings present: IMEX on. Absent: stock model. A group the
-    ! namelist read rejects (unknown key) stops the run, as every group; when
-    ! it sets keys removed on 2026-11-13 the message lists them (the CPU's)
+    ! &imex_igw_settings is required, and so is its switch imex_igw (no default), as in UCLA ROMS:
+    ! imex_igw = .true. IMEX on, .false. the stock step (the other keys are then read and ignored,
+    ! with a start-up note listing them). A missing group or key stops the run. A group the
+    ! namelist read rejects (unknown key) stops the run, as every group; when it sets keys
+    ! removed on 2026-11-13 the message lists them (the CPU's)
     integer, intent(in) :: unit
     integer :: ios, p
     character(len=512) :: msg
     character(len=1024) :: found
+    logical :: imex_igw    ! the switch: .true. the IMEX step, .false. the stock step
+    logical :: first, has_key
+    namelist /imex_igw_settings/ imex_igw, &
+       imex_theta_p, imex_phi, imex_theta_c, imex_mu, imex_nu, imex_rho, &
+       imex_am3_crv, imex_tol_pred, imex_tol_corr, imex_maxit, &
+       imex_verbose, imex_solver_enabled, imex_allow_explicit, imex_selftest, &
+       imex_n2_ref, imex_n2_taper, imex_warm, &
+       imex_bref_hours, imex_setup_lag, imex_pcg_start, imex_pcg_fused, imex_solver_prec, imex_stage_fused, &
+       imex_redu, imex_rst_state, imex_mix_split, imex_corr_adv, imex_corr_adv_clip, &
+       imex_obc_mode, imex_obc_nmodes, imex_obc_q0, imex_obc_tref, &
+       imex_obc_mprint, imex_obc_cmin, imex_pc, imex_pc_modes, imex_pc_dump, imex_pc_cou_on, imex_pc_cou_k, &
+       imex_pc_smoother, imex_pc_levels, imex_pc_ncoarse, &
+       imex_gpu_redu, imex_gpu_stage, imex_gpu_sweep, imex_gpu_timers
     talk = (comm_world_rank() == 0)
     imex_bref_hours = 24.0_rp            ! the default (see the declaration)
     imex_gpu_timers = 0                  ! the default (see the declaration)
@@ -510,10 +517,24 @@ contains
     shm_set = .false.; shm_use = .false.
     rewind(unit)
     msg = ''
+    imex_igw = .false.
     read(unit, nml=imex_igw_settings, iostat=ios, iomsg=msg)
+    has_key = .true.
+    if (ios == 0) then
+      ! imex_igw has no default: read the group again from the other start value; a key left out
+      ! keeps the start value, so the two reads differ only then
+      first = imex_igw
+      imex_igw = .true.
+      rewind(unit)
+      read(unit, nml=imex_igw_settings, iostat=ios, iomsg=msg)
+      has_key = (imex_igw .eqv. first)
+    endif
+    imex_on = .false.
     if (ios < 0) then
-      imex_on = .false.
-      return
+      if (talk) write(*,'(a)') 'ERROR: the namelist file has no &imex_igw_settings group, which every' // &
+           ' namelist needs (as in UCLA ROMS): add &imex_igw_settings imex_igw = .false. / for the stock' // &
+           ' step, or the group with imex_igw = .true. for the IMEX internal-wave step (NAMELIST_COMPAT)'
+      error stop 'read_namelist: &imex_igw_settings missing (see above)'
     endif
     if (ios > 0) then
       do p = 1, len(msg)                   ! (the compiler pads iomsg with NUL characters)
@@ -533,7 +554,21 @@ contains
       endif
       error stop 'read_namelist: unreadable namelist group (see above)'
     endif
+    if (.not. has_key) then
+      if (talk) write(*,'(a)') 'ERROR: &imex_igw_settings has no imex_igw, which is required (no default):' // &
+           ' set imex_igw = .true. (IMEX internal-wave step) or imex_igw = .false. (stock step)'
+      error stop 'read_namelist: imex_igw missing in &imex_igw_settings (see above)'
+    endif
+    if (.not. imex_igw) then
+      if (talk) then
+        write(*,'(a)') 'IMEX_IGW: off (imex_igw = .false.)'
+        call other_keys_set(unit, found)
+        if (len_trim(found) > 0) write(*,'(a)') '  the other keys of &imex_igw_settings are ignored: ' // trim(found)
+      endif
+      return
+    endif
     imex_on = .true.
+    if (talk) write(*,'(a)') 'IMEX_IGW: on (imex_igw = .true.)'
     call check_settings()
     call it_set(imex_gpu_timers)
     call set_derived_weights()
@@ -595,6 +630,94 @@ contains
       endif
     enddo
   end subroutine removed_keys_set
+
+  subroutine other_keys_set(unit, found)
+    ! (CPU other_keys_set) The keys other than imex_igw that the namelist file's
+    ! &imex_igw_settings group sets, as a comma-separated list (empty if none; for the note that
+    ! imex_igw = .false. ignores them). A key is the name before an '=' (and its subscript, if
+    ! any) outside quoted strings; comments after '!' are skipped
+    integer, intent(in) :: unit
+    character(len=*), intent(out) :: found
+    character(len=1024) :: ln
+    character(len=64) :: key
+    character(len=1) :: q
+    integer :: ios, p, c, e, b, depth
+    logical :: ingrp, last
+    found = ''; ingrp = .false.
+    rewind(unit)
+    do
+      read(unit, '(A)', iostat=ios) ln
+      if (ios /= 0) exit
+      q = ' '
+      do p = 1, len_trim(ln)                    ! blank quoted strings, cut the comment, lower case
+        if (q /= ' ') then
+          if (ln(p:p) == q) q = ' '
+          ln(p:p) = ' '
+        else if (ln(p:p) == "'" .or. ln(p:p) == '"') then
+          q = ln(p:p)
+          ln(p:p) = ' '
+        else if (ln(p:p) == '!') then
+          ln(p:) = ' '
+          exit
+        else
+          c = iachar(ln(p:p))
+          if (c >= iachar('A') .and. c <= iachar('Z')) ln(p:p) = achar(c + 32)
+        endif
+      enddo
+      if (.not. ingrp) then                     ! the group starts (entries may follow on the line)
+        p = index(ln, '&imex_igw_settings')
+        if (p == 0) cycle
+        ingrp = .true.
+        ln = ln(p+18:)
+      endif
+      last = index(ln, '/') > 0                 ! the group ends on this line
+      if (last) ln(index(ln, '/'):) = ' '
+      e = 0
+      do
+        p = index(ln(e+1:), '=')
+        if (p == 0) exit
+        e = e + p                               ! an '=' at e: the key ends before it
+        b = e - 1
+        do while (b > 0)                        ! blanks
+          if (ln(b:b) /= ' ') exit
+          b = b - 1
+        enddo
+        if (b > 0) then                         ! a subscript
+          if (ln(b:b) == ')') then
+            depth = 0
+            do while (b > 0)
+              if (ln(b:b) == ')') depth = depth + 1
+              if (ln(b:b) == '(') depth = depth - 1
+              b = b - 1
+              if (depth == 0) exit
+            enddo
+            do while (b > 0)
+              if (ln(b:b) /= ' ') exit
+              b = b - 1
+            enddo
+          endif
+        endif
+        p = b                                   ! the name ends at b
+        do while (p > 0)
+          c = iachar(ln(p:p))
+          if (.not. (ln(p:p) == '_' .or. (c >= iachar('a') .and. c <= iachar('z')) &
+                     .or. (c >= iachar('0') .and. c <= iachar('9')))) exit
+          p = p - 1
+        enddo
+        if (p == b) cycle
+        key = ln(p+1:b)
+        if (trim(key) == 'imex_igw') cycle
+        if (index(', ' // trim(found) // ',', ', ' // trim(key) // ',') > 0) cycle
+        if (len_trim(found) + len_trim(key) + 2 > len(found)) cycle
+        if (len_trim(found) > 0) then
+          found = trim(found) // ', ' // trim(key)
+        else
+          found = trim(key)
+        endif
+      enddo
+      if (last) exit
+    enddo
+  end subroutine other_keys_set
 
   subroutine check_settings()
     ! The CPU's constraint checks (check_settings), then the values this
