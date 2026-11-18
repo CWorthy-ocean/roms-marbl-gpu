@@ -2,9 +2,8 @@
 ranks from the history record size, and the PBS select line to launch it.
 
 usage: python gpu_layout.py <namelist> [--gpus-per-node 4] [--target-seconds 15]
-                                       [--rate-gbps R] [--max-writers 64] [--groups G]
-                                       [--per-node | --last-node] [--reader]
-                                       [--format cdf5|nc4] [--wide-gb 4]
+                                       [--rate-gbps R] [--max-writers 64]
+                                       [--per-node | --last-node] [--reader] [--wide-gb 4]
        python gpu_layout.py <namelist> --stripe [--wide-gb 4]
 Prints:  NTILE NWRITERS NRANKS SELECT NWPN   per-node layout (NWPN = writers per node)
          NTILE NWRITERS NRANKS SELECT        last-node layout
@@ -15,7 +14,7 @@ is at least --wide-gb GiB, the Lustre layout for it: `<dir> -c 48 -S 16M`
 (tools/submit_gpu.sh passes it to `lfs setstripe`); smaller runs keep the
 directory's default layout (only `<dir>` is printed).
 
-Rule, CDF5 output (--format cdf5, the model's default, ROMS_GPU_OUT_FORMAT):
+Rule (CDF5 output):
 - The writers write each shared file with O_DIRECT, one group of all
   writers. A writer streams about 1.3 GB/s (--rate-gbps default); one
   writer per node when one writes a history record within --target-seconds,
@@ -25,27 +24,9 @@ Rule, CDF5 output (--format cdf5, the model's default, ROMS_GPU_OUT_FORMAT):
 - Large records need a wide stripe (--stripe above); on Derecho's default
   progressive layout the first 16 GiB of a file sit on 4 OSTs and a shared
   file takes 6-8 GB/s however many writers write it.
-
-Rule, netCDF-4 output (--format nc4):
-- Writers per file (one writer group), last-node layout: one writer streams
-  about 0.6 GB/s (measured, Derecho Lustre). Take the smallest number that
-  writes one history record within --target-seconds, at most 4 (one node's
-  buffered Lustre client writes one shared file at about 1.3 GB/s from 4
-  writers on; more writers on one node do not help).
-- Per-node layout: 1 writer per node per file when one writer writes a
-  history record within --target-seconds, else 4 per node per file (the
-  most a node's Lustre client gains from). Pacific basin (31-GB history and
-  63-GB restart records, Derecho A100 nodes): 4 per node per file wrote
-  1.7-1.9 GB/s per file on 2 nodes and 2.9-3.8 GB/s on 4; 2 per node per
-  file 1.1-1.5 GB/s on 2 nodes, no better than 4 writers on one node
-  (1.3-1.5); 8 per node per file 1.9-2.4 GB/s on 2 nodes (one run), at
-  twice the writer ranks.
-- Groups: 2 when the run writes more than one file at a time (history and
-  restart, or history split over files by nrpf_his), else 1; --groups
-  overrides.
-- The model's io_server writes different files with different groups at
-  the same time. Its default group size, min(4 x writer nodes,
-  nwriters/2), matches this layout.
+- The model's io_server writes every file with one group of all writers
+  (ROMS_GPU_IO_GROUP splits them into groups that write different files at
+  the same time).
 
 Layouts:
 - per-node (the default on more than one node, when np_xi x np_eta divides
@@ -69,8 +50,7 @@ import re
 import sys
 
 args = sys.argv[1:]
-opts = {'--gpus-per-node': 4, '--target-seconds': 15.0, '--rate-gbps': 0.0, '--max-writers': 64, '--groups': 0,
-        '--format': 'cdf5', '--wide-gb': 4.0}
+opts = {'--gpus-per-node': 4, '--target-seconds': 15.0, '--rate-gbps': 1.3, '--max-writers': 64, '--wide-gb': 4.0}
 path = None
 layout = None          # None: automatic; 'per-node' or 'last-node'
 reader = 0
@@ -126,9 +106,6 @@ his = val('wrt_file_his', True)
 rst = val('wrt_file_rst', True)
 # a restart record (double): u, v, T, S and the BGC tracers at least
 rst_gb = 8.0 * cells * ((4 + nt_bgc) * nz + 10) / 1e9 if rst else 0.0
-cdf5 = opts['--format'] != 'nc4'
-if opts['--rate-gbps'] <= 0:
-    opts['--rate-gbps'] = 1.3 if cdf5 else 0.6
 if stripe:
     import os
     m = re.search(r'(?<![\w])output_root_name\s*=\s*[\'"]([^\'"]*)[\'"]', txt)
@@ -154,21 +131,9 @@ wnodes = nodes if layout == 'per-node' else 1    # nodes that hold writers
 per_group = 1
 if his:
     need = math.ceil(record_gb / (opts['--rate-gbps'] * opts['--target-seconds']))   # writers at --rate-gbps each
-    if cdf5:                     # one group of all writers, O_DIRECT
-        per_group = max(1, min(8, need)) if wnodes == 1 else wnodes * (1 if need <= 1 else 8)
-    elif wnodes == 1:
-        per_group = max(1, min(4, need))
-    else:
-        per_group = wnodes * (1 if need <= 1 else 4)
-# files in flight at once: history + restart, or several history files
-dt = float(val('dt', 1.0)); ntimes = int(val('ntimes', 1))
-period = float(val('output_period_his', 0.0) or 0.0)
-nrec_his = int(ntimes * dt / period) + 1 if (his and period > 0) else (1 if his else 0)
-split_his = his and int(val('nrpf_his', 20)) < nrec_his
-if cdf5:
-    groups = 1                   # the model's default with CDF5 output: one group of all writers
-else:
-    groups = opts['--groups'] if opts['--groups'] > 0 else (2 if (his and (rst or split_his)) else 1)
+    # one group of all writers, O_DIRECT
+    per_group = max(1, min(8, need)) if wnodes == 1 else wnodes * (1 if need <= 1 else 8)
+groups = 1                       # the model's default: one group of all writers
 nw = max(1, min(opts['--max-writers'], groups * per_group))
 if layout == 'per-node':
     wpn = math.ceil(nw / nodes)

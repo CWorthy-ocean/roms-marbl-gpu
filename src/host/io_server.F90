@@ -28,20 +28,18 @@ module io_server
   ! switches files only when a record of the next file is written.
   !
   ! Writer groups: the writer ranks are split into groups of
-  ! ROMS_GPU_IO_GROUP writers (default min(4 x writer nodes, max(1,
-  ! nwriters/2)); writer_groups). Writers are numbered round-robin over the
+  ! ROMS_GPU_IO_GROUP writers (default: one group of all writers, at most
+  ! MAXW; writer_groups). Writers are numbered round-robin over the
   ! nodes (comm_mod), so a group spans the nodes that hold writers. File
   ! nfile of kind fkind belongs to group mod(nfile-1 + fkind-1, ngroups)
   ! (CDR_LITE files: offset 1 with fewer than 3 groups; file_group),
-  ! so a restart and the history file of the same number, and consecutive
-  ! history files, are written by different groups at the same time. A
-  ! file's bandwidth is limited per node (a node's buffered Lustre client
-  ! writes one shared file at ~1.3 GB/s from 4 writers on; more writers on
-  ! one node do not help, more nodes do). Records are dispatched in
-  ! staging order on every compute rank (seq), so each group's writers
-  ! complete its records in one order, as their collective file calls need.
+  ! so with several groups a restart and the history file of the same
+  ! number, and consecutive history files, are written by different groups
+  ! at the same time. Records are dispatched in staging order on every
+  ! compute rank (seq), so each group's writers complete its records in one
+  ! order, as their group calls need.
   !
-  ! CDF5 output (ROMS_GPU_OUT_FORMAT=cdf5, the default; nc_io): the writers
+  ! Output is CDF5 (nc_io): the writers
   ! write the variable data of the shared file themselves with O_DIRECT
   ! (cdf_direct), not through netCDF: compute rank 0 creates the file
   ! (header only, nc_io); every writer of the group opens it at its first
@@ -62,8 +60,7 @@ module io_server
   ! (GPU_IO_STEP4_PLAN.md). ROMS_GPU_IO_DIRECT=0: the same byte ranges
   ! through buffered descriptors; ROMS_GPU_IO_PIECE_MB: pwrite size (1024);
   ! ROMS_GPU_IO_WATCHDOG: seconds before a pwrite that has not returned is
-  ! reported on stderr (60; 0 off). nc4: netCDF-4 through parallel HDF5 as
-  ! before (write_assembled).
+  ! reported on stderr (60; 0 off).
   use kinds
   use decomp_mod, only: decomp
   use gpu_state
@@ -131,7 +128,7 @@ module io_server
   end type rec_t
 
   type(rec_t) :: pend(NSET)
-  real :: t_ext = 0.0, t_asm = 0.0, t_put = 0.0   ! writer timing of the last write_assembled
+  real :: t_ext = 0.0, t_asm = 0.0, t_put = 0.0   ! writer timing of the last record (write_direct)
   integer :: cur = 0                 ! set being filled
   integer :: stage_seq = 0           ! records staged so far (compute side)
   integer :: wgroup_size = 0, wgroups = 1   ! writers per group, number of groups (both sides)
@@ -176,8 +173,7 @@ module io_server
   character(len=PATHLEN) :: fname_sync(NKIND) = ''
   ! Server side.
   real(4), allocatable :: rbuf(:)
-  integer :: ncid_open(NKIND) = -1
-  integer :: nfile_open(NKIND) = -1                 ! file number open per kind (-1: none)
+  integer :: nfile_open(NKIND) = -1                ! file number open per kind (-1: none)
   ! Announced files not yet opened: (kind, nfile) and path. A kind has at
   ! most a few files announced ahead of its writes (each compute rank holds
   ! at most NSET staged records).
@@ -188,7 +184,7 @@ module io_server
   ! path, the aligned page buffer, the heads of shared pages (sent and
   ! received), the options and the timing of the last record.
   integer, parameter :: MAXSEG = MAXV + 8
-  logical :: use_cdf5 = .false., io_direct = .true.
+  logical :: io_direct = .true.
   type(cdf_file_t) :: dfile(NKIND)
   character(len=PATHLEN) :: opath(NKIND) = ''
   type(cdf_buf_t) :: pbuf, hsend(MAXSEG), hrecv(MAXSEG)
@@ -568,21 +564,15 @@ contains
 
   subroutine writer_groups(nw, gs, ng)
     ! Writers per group and number of groups for nw writers (the same on
-    ! the compute and the writer ranks): ROMS_GPU_IO_GROUP, default with
-    ! CDF5 output one group of all writers (at most MAXW: direct writes of
-    ! one shared file take every writer's bandwidth, two files at once as
-    ! much in total as one); with nc4 output min(4 x the nodes that hold
-    ! writers, max(1, nw/2)) (4 writers per node saturate a node's buffered
-    ! writes to one file). Lowered until it divides nw.
+    ! the compute and the writer ranks): ROMS_GPU_IO_GROUP, default one
+    ! group of all writers (at most MAXW: direct writes of one shared file
+    ! take every writer's bandwidth, two files at once as much in total as
+    ! one). Lowered until it divides nw.
     integer, intent(in) :: nw
     integer, intent(out) :: gs, ng
     character(len=16) :: val
     integer :: stat, gdef
-    if (nc_out_cdf5()) then
-      gdef = min(max(nw, 1), MAXW)
-    else
-      gdef = min(4 * max(1, comm_writer_nodes()), max(1, nw / 2))
-    endif
+    gdef = min(max(nw, 1), MAXW)
     gs = gdef
     call get_environment_variable('ROMS_GPU_IO_GROUP', val, status=stat)
     if (stat == 0 .and. len_trim(val) > 0) then
@@ -804,120 +794,12 @@ contains
     mine = (mod(iv - 1, wgroup_size) == me_g)
   end function mine
 
-  subroutine write_assembled(ncid, isl)
-    ! Assemble each variable of record slot isl from the tiles' slabs into
-    ! one global array and write it once; global extents from the slabs.
-    integer, intent(in) :: ncid, isl
-    integer :: iv, t, gx, gy, n3, i, j, k, n1, n2, i0, j0, off, ntile, ierr
-    real(4) :: zero1(1, 1, 1)
-    type(rec_t) :: r0
-    real(8) :: ca, cb
-    zero1 = 0.0
-    t_ext = 0.0; t_asm = 0.0; t_put = 0.0
-    ca = wall_time()
-    ntile = size(tbuf, 1)
-    r0 = tmeta(0, isl)
-    if (wgroup_size > 1) then
-      ! Parallel NetCDF: a record variable may only be extended collectively,
-      ! so every writer first extends every variable of this record with a
-      ! one-element put at its own position (overwritten below), then the
-      ! owners write their variables independently and in parallel.
-      call nc_set_par_access(ncid, .true.)
-      call nc_put_1d_rec(ncid, 'ocean_time', r0%time, r0%rec)
-      call put_time_step(ncid, r0)
-      call put_avg_times(ncid, r0)
-      do iv = 1, r0%nvars
-        if (r0%nrank(iv) == 1) then
-          call nc_put_vec_rec_d(ncid, trim(r0%names(iv)), (/0.0d0/), r0%rec, min(me_w + 1, r0%n1(iv)))
-        else if (r0%nrank(iv) == 2) then
-          call nc_put_2d_rec_f(ncid, trim(r0%names(iv)), zero1, 1, 1, r0%rec, me_w + 1, 1)
-        else
-          call nc_put_3d_rec_f(ncid, trim(r0%names(iv)), zero1, 1, 1, 1, r0%rec, me_w + 1, 1)
-        endif
-      enddo
-      call MPI_Barrier(gcomm, ierr)
-      call nc_set_par_access(ncid, .false.)
-    else
-      call nc_put_1d_rec(ncid, 'ocean_time', r0%time, r0%rec)
-      call put_time_step(ncid, r0)
-      call put_avg_times(ncid, r0)
-    endif
-    cb = wall_time()
-    t_ext = (cb - ca)
-    do iv = 1, r0%nvars
-      if (.not. mine(iv)) cycle
-      cb = wall_time()
-      gx = 0; gy = 0; n3 = r0%n3(iv)
-      do t = 0, ntile - 1
-        if (trim(tmeta(t, isl)%names(iv)) /= trim(r0%names(iv))) error stop 'io_server: tiles disagree on the variable list'
-        gx = max(gx, tmeta(t, isl)%i0f(iv) + tmeta(t, isl)%n1(iv) - 1)
-        gy = max(gy, tmeta(t, isl)%j0f(iv) + tmeta(t, isl)%n2(iv) - 1)
-      enddo
-      if (r0%dbl) then
-        if (allocated(gbuf8)) then
-          if (size(gbuf8) < gx * gy * n3) deallocate(gbuf8)
-        endif
-        if (.not. allocated(gbuf8)) allocate(gbuf8(gx * gy * n3))
-        do t = 0, ntile - 1
-          n1 = tmeta(t, isl)%n1(iv); n2 = tmeta(t, isl)%n2(iv)
-          i0 = tmeta(t, isl)%i0f(iv); j0 = tmeta(t, isl)%j0f(iv); off = tmeta(t, isl)%off(iv)
-          do k = 1, n3
-            do j = 1, n2
-              do i = 1, n1
-                gbuf8((k - 1) * gx * gy + (j0 + j - 2) * gx + (i0 + i - 1)) = &
-                     tbuf(t, isl)%b8(off + (k - 1) * n1 * n2 + (j - 1) * n1 + (i - 1))
-              enddo
-            enddo
-          enddo
-        enddo
-        ca = wall_time()
-        t_asm = t_asm + (ca - cb)
-        if (r0%nrank(iv) == 1) then
-          call nc_put_vec_rec_d(ncid, trim(r0%names(iv)), gbuf8(1:gx), r0%rec)
-        else if (r0%nrank(iv) == 2) then
-          call nc_put_2d_rec_d(ncid, trim(r0%names(iv)), gbuf8, gx, gy, r0%rec)
-        else
-          call nc_put_3d_rec_d(ncid, trim(r0%names(iv)), gbuf8, gx, gy, n3, r0%rec)
-        endif
-        cb = wall_time()
-        t_put = t_put + (cb - ca)
-        cycle
-      endif
-      if (allocated(gbuf)) then
-        if (size(gbuf) < gx * gy * n3) deallocate(gbuf)
-      endif
-      if (.not. allocated(gbuf)) allocate(gbuf(gx * gy * n3))
-      do t = 0, ntile - 1
-        n1 = tmeta(t, isl)%n1(iv); n2 = tmeta(t, isl)%n2(iv)
-        i0 = tmeta(t, isl)%i0f(iv); j0 = tmeta(t, isl)%j0f(iv); off = tmeta(t, isl)%off(iv)
-        do k = 1, n3
-          do j = 1, n2
-            do i = 1, n1
-              gbuf((k - 1) * gx * gy + (j0 + j - 2) * gx + (i0 + i - 1)) = &
-                   tbuf(t, isl)%b(off + (k - 1) * n1 * n2 + (j - 1) * n1 + (i - 1))
-            enddo
-          enddo
-        enddo
-      enddo
-      ca = wall_time()
-      t_asm = t_asm + (ca - cb)
-      if (r0%nrank(iv) == 2) then
-        call nc_put_2d_rec_f(ncid, trim(r0%names(iv)), gbuf, gx, gy, r0%rec)
-      else
-        call nc_put_3d_rec_f(ncid, trim(r0%names(iv)), gbuf, gx, gy, n3, r0%rec)
-      endif
-      cb = wall_time()
-      t_put = t_put + (cb - ca)
-    enddo
-  end subroutine write_assembled
-
   ! ------------------------- CDF5 output: direct writes -------------------------
 
   subroutine direct_options()
-    ! writer side: format, O_DIRECT, piece size, watchdog, record slots (environment)
+    ! writer side: O_DIRECT, piece size, watchdog, record slots (environment)
     character(len=32) :: val
     integer :: stat, n
-    use_cdf5 = nc_out_cdf5()
     io_direct = nc_io_direct()
     call get_environment_variable('ROMS_GPU_IO_PIECE_MB', val, status=stat)
     if (stat == 0 .and. len_trim(val) > 0) then
@@ -970,7 +852,7 @@ contains
   end subroutine var_extent
 
   subroutine assemble_var(isl, iv, gx, gy, n3, dbl)
-    ! variable iv of slot isl from the tiles' slabs into gbuf (gbuf8: dbl), as write_assembled does
+    ! variable iv of slot isl from the tiles' slabs into gbuf (gbuf8: dbl)
     integer, intent(in) :: isl, iv, gx, gy, n3
     logical, intent(in) :: dbl
     integer :: t, i, j, k, n1, n2, i0, j0, off
@@ -1361,21 +1243,16 @@ contains
 
   subroutine flush_slot_partial(isl)
     ! Write whatever tiles of slot isl have arrived, slab by slab, and free it.
-    ! CDF5 (one writer only; several stop before): the direct descriptor is
+    ! One writer only (several stop before): the direct descriptor is
     ! closed first (no direct write in flight), the slabs go through serial
     ! netCDF, and the next record of the file reopens it for direct writes.
     integer, intent(in) :: isl
     integer :: t, k, ncid
     k = slot_key(1, isl)
-    if (use_cdf5) then
-      if (dfile(k)%fd >= 0) call direct_close(k)
-      call nc_open_write(trim(opath(k)), ncid)
-      write(*,'(3a)') 'io_server: (CDF5: the partial record goes through serial netCDF; ', trim(opath(k)), &
-           ' is closed for direct writes meanwhile)'
-    else
-      if (ncid_open(k) < 0) error stop 'io_server: record before file open'
-      ncid = ncid_open(k)
-    endif
+    if (dfile(k)%fd >= 0) call direct_close(k)
+    call nc_open_write(trim(opath(k)), ncid)
+    write(*,'(3a)') 'io_server: (CDF5: the partial record goes through serial netCDF; ', trim(opath(k)), &
+         ' is closed for direct writes meanwhile)'
     do t = 0, size(tbuf, 1) - 1
       if (.not. tfill(t, isl)) cycle
       if (tmeta(t, isl)%dbl) then
@@ -1384,7 +1261,7 @@ contains
         call write_record(ncid, tmeta(t, isl), tbuf(t, isl)%b)
       endif
     enddo
-    if (use_cdf5) call nc_close(ncid)
+    call nc_close(ncid)
     tfill(:, isl) = .false.; slot_n(isl) = 0; slot_key(:, isl) = -1
   end subroutine flush_slot_partial
 
@@ -1685,14 +1562,10 @@ contains
     write(*,'(a,i0,a,i0,a,i0,a,i0,a,i0)') 'io_server: ready on world rank ', comm_world_rank(), '  writer ', me_w, ' of ', nserv, &
          '  group ', my_group, ' of ', wgroups
     if (me_w == 0) then
-      if (use_cdf5) then
-        write(*,'(a,a,a,i0,a,i0,a,i0,a)') 'io_server: CDF5 output, ', merge('O_DIRECT', 'buffered', io_direct), &
-             ' writes in pieces of ', io_piece / 1048576_8, ' MiB, ', wgroups, ' group(s) of ', wgroup_size, &
-             ' writers'
-        if (.not. srv_progress) write(*,'(a)') 'io_server: records received between writes only (ROMS_GPU_IO_PROGRESS=0)'
-      else
-        write(*,'(a)') 'io_server: netCDF-4 output (ROMS_GPU_OUT_FORMAT=nc4)'
-      endif
+      write(*,'(a,a,a,i0,a,i0,a,i0,a)') 'io_server: CDF5 output, ', merge('O_DIRECT', 'buffered', io_direct), &
+           ' writes in pieces of ', io_piece / 1048576_8, ' MiB, ', wgroups, ' group(s) of ', wgroup_size, &
+           ' writers'
+      if (.not. srv_progress) write(*,'(a)') 'io_server: records received between writes only (ROMS_GPU_IO_PROGRESS=0)'
       if (nslot_use < NSLOT) write(*,'(a,i0,a)') 'io_server: ', nslot_use, ' record slots (ROMS_GPU_IO_NSLOT, a test setting)'
     endif
     flush(6)
@@ -1723,12 +1596,7 @@ contains
       endif
     enddo
     do k = 1, NKIND
-      if (use_cdf5) then
-        if (dfile(k)%fd >= 0) call direct_close(k)
-      elseif (ncid_open(k) >= 0) then
-        call nc_close(ncid_open(k))
-      endif
-      ncid_open(k) = -1
+      if (dfile(k)%fd >= 0) call direct_close(k)
       nfile_open(k) = -1
     enddo
     c_end = wall_time()
@@ -1750,24 +1618,16 @@ contains
       k = r%fkind
       call open_for(k, r%nfile)
       c1 = wall_time()
-      if (use_cdf5) then
-        call write_direct(k, isl)
-        c3 = wall_time()
-        c2 = c3
-        c3 = c3 - t_sync
-      else
-        call write_assembled(ncid_open(k), isl)
-        c3 = wall_time()
-        call nc_sync(ncid_open(k))
-        c2 = wall_time()
-      endif
+      call write_direct(k, isl)
+      c2 = wall_time()
+      c3 = c2 - t_sync
       write(*,'(a,i0,a,i0,a,i0,a,f7.2,a,f7.2,a,f7.2,a,f7.2,a)') 'io_server: writer ', me_w, ' kind ', k, &
            ' rec ', r%rec, ': extend ', t_ext, ' s  assemble ', t_asm, ' s  put ', t_put, &
            ' s  sync ', (c2 - c3), ' s'
-      if (use_cdf5) write(*,'(a,i0,a,f8.3,a,f7.2,a,f7.2,a,i0,a,i0)') 'io_server: writer ', me_w, ' direct ', &
+      write(*,'(a,i0,a,f8.3,a,f7.2,a,f7.2,a,i0,a,i0)') 'io_server: writer ', me_w, ' direct ', &
            real(d_bytes, 8) / 1.0d9, ' GB  pack ', t_pack, ' s  pwrite ', t_wr, ' s  rmw pages ', d_rmw, &
            '  heads ', d_heads
-      if (use_cdf5) write(*,'(a,i0,a,f7.2,a)') 'io_server: writer ', me_w, ' took in later records for ', t_prog, ' s'
+      write(*,'(a,i0,a,f7.2,a)') 'io_server: writer ', me_w, ' took in later records for ', t_prog, ' s'
       call report_written(r)
       write(*,'(a,i0,a,f7.2,a,f7.2,a)') 'io_server:   parts ', srv_ncompute, '  recv ', trecv(isl), &
            ' s  write ', (c2 - c1), ' s'
@@ -1795,17 +1655,14 @@ contains
     subroutine open_for(kind, nfile)
       ! Make file nfile of this kind the open one before a record of it is
       ! written: close the previous file and open the announced path.
-      ! CDF5: every writer of the group opens it for direct writes on its
-      ! own (no netCDF handle, no collective call); a file closed for a
-      ! partial record (flush_slot_partial) is reopened here.
+      ! Every writer of the group opens it for direct writes on its own (no
+      ! netCDF handle, no collective call); a file closed for a partial
+      ! record (flush_slot_partial) is reopened here.
       integer, intent(in) :: kind, nfile
       integer :: a, hit
       character(len=256) :: msg
-      if (nfile_open(kind) == nfile) then
-        if (use_cdf5 .and. dfile(kind)%fd >= 0) return
-        if (.not. use_cdf5 .and. ncid_open(kind) >= 0) return
-      endif
-      if (nfile_open(kind) /= nfile .or. .not. use_cdf5) then
+      if (nfile_open(kind) == nfile .and. dfile(kind)%fd >= 0) return
+      if (nfile_open(kind) /= nfile) then
         hit = 0
         do a = 1, NANN
           if (ann_key(1, a) == kind .and. ann_key(2, a) == nfile) hit = a
@@ -1815,35 +1672,25 @@ contains
                ' for file ', nfile, ' before its open; file open: ', nfile_open(kind)
           error stop 'io_server: record before file open'
         endif
-        if (use_cdf5) then
-          if (dfile(kind)%fd >= 0) call direct_close(kind)
-        elseif (ncid_open(kind) >= 0) then
-          call nc_close(ncid_open(kind))
-        endif
+        if (dfile(kind)%fd >= 0) call direct_close(kind)
         opath(kind) = ann_path(hit)
         nfile_open(kind) = nfile
         ann_key(:, hit) = -1
         ann_path(hit) = ''
       endif
-      if (use_cdf5) then
-        if (.not. cdf_open_w(trim(opath(kind)), dfile(kind), io_direct, msg)) then
-          if (io_direct) then
-            write(*,'(5a)') 'io_server: ', trim(opath(kind)), ': no O_DIRECT open (', trim(msg), &
-                 '); buffered descriptors from now on (ROMS_GPU_IO_DIRECT=0)'
-            io_direct = .false.
-            if (.not. cdf_open_w(trim(opath(kind)), dfile(kind), io_direct, msg)) then
-              write(*,'(4a)') 'io_server: ', trim(opath(kind)), ': ', trim(msg)
-              error stop 'io_server: CDF5 open for writing'
-            endif
-          else
+      if (.not. cdf_open_w(trim(opath(kind)), dfile(kind), io_direct, msg)) then
+        if (io_direct) then
+          write(*,'(5a)') 'io_server: ', trim(opath(kind)), ': no O_DIRECT open (', trim(msg), &
+               '); buffered descriptors from now on (ROMS_GPU_IO_DIRECT=0)'
+          io_direct = .false.
+          if (.not. cdf_open_w(trim(opath(kind)), dfile(kind), io_direct, msg)) then
             write(*,'(4a)') 'io_server: ', trim(opath(kind)), ': ', trim(msg)
             error stop 'io_server: CDF5 open for writing'
           endif
+        else
+          write(*,'(4a)') 'io_server: ', trim(opath(kind)), ': ', trim(msg)
+          error stop 'io_server: CDF5 open for writing'
         endif
-      elseif (wgroup_size > 1) then
-        call nc_open_write_par(trim(opath(kind)), ncid_open(kind), gcomm)
-      else
-        call nc_open_write(trim(opath(kind)), ncid_open(kind))
       endif
       write(*,'(a,i0,a,a)') 'io_server: writer ', me_w, ' opened ', trim(opath(kind))
       flush(6)
