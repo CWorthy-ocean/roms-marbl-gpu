@@ -5,15 +5,22 @@ module io_server
   ! Compute rank: each output field is gathered on the GPU (on the work
   ! stream, so it is ordered after the step that produced it) into a
   ! float32 device buffer and copied asynchronously into one of two
-  ! pinned host record buffers; a CUDA event marks the record complete.
+  ! pinned host record buffers (double records: two pageable ones; four
+  ! staging sets, two per type, so a history and a restart record never
+  ! wait for each other's buffer); a CUDA event marks the record complete.
   ! io_poll (called every step) sends completed records to the I/O
   ! server rank with non-blocking MPI, or, without a server, writes them
   ! itself. The host never reads managed memory here, so no page
   ! migrations happen and the next step starts at once.
   !
   ! I/O rank: io_server_run loops on commands (OPEN file, PUT record,
-  ! QUIT) and writes with netCDF. File creation (metadata) stays on the
-  ! compute rank; the server only opens, appends records and closes.
+  ! QUIT) and writes complete records in completion order (ready_q).
+  ! While it writes one, io_progress (between variables, between pwrite
+  ! pieces, at the group's closing barrier) takes in the commands that
+  ! have arrived, so the compute ranks' sends of later records complete
+  ! during the write (ROMS_GPU_IO_PROGRESS=0: only between writes). File
+  ! creation (metadata) stays on the compute rank; the server only opens,
+  ! appends records and closes.
   ! Commands from one compute rank arrive in order, but those of different
   ! ranks interleave freely: a fast rank's OPEN of file n+1 can arrive
   ! while a slow rank's part of the last record of file n is still on its
@@ -93,7 +100,10 @@ module io_server
   integer, parameter :: MAXV = 256, NAMELEN = 32, PATHLEN = 512   ! variables per record: up to ~240 tracers
   integer, parameter :: MAXW = 64                                 ! max writer ranks per group
   integer, parameter :: NHDR = 8 + 6 * MAXV
-  integer, parameter :: NSET = 2
+  ! Staged records in flight: sets 1-2 hold float records (host buffers
+  ! hpin1, hpin2), sets 3-4 double records (hpin8_1, hpin8_2), so a
+  ! history record and a restart record never wait for each other's buffer.
+  integer, parameter :: NSET = 4
 
   type rec_t
     logical :: used = .false., sent = .false.
@@ -202,6 +212,15 @@ module io_server
   public :: io_finalize
   public :: io_server_run
 
+  ! Server side, the main loop (io_server_run) and what io_progress takes in
+  ! while a record is written: complete records queued in completion order,
+  ! quits counted, receive time per slot. ROMS_GPU_IO_PROGRESS=0: commands
+  ! only between writes (the former behaviour; a test setting).
+  integer :: srv_comm = 0, srv_ncompute = 0, srv_nquit = 0
+  integer :: ready_q(NSLOT) = 0, nready = 0
+  real :: trecv(NSLOT) = 0.0, t_prog = 0.0
+  logical :: in_progress = .false., srv_progress = .true.
+  integer :: n_early = 0
 contains
 
   subroutine io_init(cap_record, cap_field)
@@ -243,15 +262,24 @@ contains
     if (hcap == 0) error stop 'io_stage_begin: io_init not called'
     is_dbl = .false.
     if (present(dbl)) is_dbl = dbl
-    idx = mod(cur, NSET) + 1
-    if (idx == 2 .and. .not. allocated(hpin2)) then
-      ! Reuse set 1 when it is already free (the usual case for daily
-      ! output); otherwise a float record pins set 2 now. Double records
-      ! stage into hpin8_2 and do not need hpin2.
-      if (set_free(1)) then
-        idx = 1
-      elseif (.not. is_dbl) then
-        allocate(hpin2(hcap))
+    ! The older of the record type's two sets (an unused one first): float
+    ! records in sets 1-2, double records in sets 3-4 (their own buffers,
+    ! so a restart record still sending does not hold up the next history
+    ! record, nor the other way round).
+    if (is_dbl) then
+      idx = 3
+      if (pend(4)%seq < pend(3)%seq) idx = 4
+    else
+      idx = 1
+      if (pend(2)%seq < pend(1)%seq) idx = 2
+      if (idx == 2 .and. .not. allocated(hpin2)) then
+        ! Reuse set 1 when it is already free (the usual case for daily
+        ! output); otherwise pin set 2 now.
+        if (set_free(1)) then
+          idx = 1
+        else
+          allocate(hpin2(hcap))
+        endif
       endif
     endif
     ! The set must be free: dispatched (with every older record, in staging
@@ -325,7 +353,7 @@ contains
     integer, intent(in) :: off, n
 #ifdef USE_CUDA
     integer :: ierr
-    if (cur == 1) then
+    if (mod(cur, 2) == 1) then
       ierr = cudaMemcpyAsync(hpin1(off:off+n-1), dstage(1:n), n, cudaMemcpyDeviceToHost, work_stream)
     else
       ierr = cudaMemcpyAsync(hpin2(off:off+n-1), dstage(1:n), n, cudaMemcpyDeviceToHost, work_stream)
@@ -335,7 +363,7 @@ contains
       error stop 'io_stage'
     endif
 #else
-    if (cur == 1) then
+    if (mod(cur, 2) == 1) then
       hpin1(off:off+n-1) = dstage(1:n)
     else
       hpin2(off:off+n-1) = dstage(1:n)
@@ -724,14 +752,14 @@ contains
       dest = comm_writer_world(base + mod(iv - 1, wgroup_size))
       n = pend(idx)%n1(iv) * pend(idx)%n2(iv) * pend(idx)%n3(iv)
       if (pend(idx)%dbl) then
-        if (idx == 1) then
+        if (mod(idx, 2) == 1) then
           call MPI_Isend(hpin8_1(pend(idx)%off(iv)), n, MPI_REAL8, dest, TAG_DATA + iv, comm, &
                          pend(idx)%reqs(iv), ierr)
         else
           call MPI_Isend(hpin8_2(pend(idx)%off(iv)), n, MPI_REAL8, dest, TAG_DATA + iv, comm, &
                          pend(idx)%reqs(iv), ierr)
         endif
-      elseif (idx == 1) then
+      elseif (mod(idx, 2) == 1) then
         call MPI_Isend(hpin1(pend(idx)%off(iv)), n, MPI_REAL4, dest, TAG_DATA + iv, comm, &
                        pend(idx)%reqs(iv), ierr)
       else
@@ -1049,8 +1077,9 @@ contains
     integer :: reqs(2 * MAXSEG)
     integer :: tsv(6)
     real(8) :: c0, c1, c2, vals(1)
-    logical :: rmw1, lok
-    t_ext = 0.0; t_asm = 0.0; t_put = 0.0; t_sync = 0.0; t_pack = 0.0; t_wr = 0.0
+    logical :: rmw1, lok, bdone
+    integer :: breq
+    t_ext = 0.0; t_asm = 0.0; t_put = 0.0; t_sync = 0.0; t_pack = 0.0; t_wr = 0.0; t_prog = 0.0
     d_bytes = 0; d_rmw = 0; d_heads = 0
     c0 = wall_time()
     r0 = tmeta(0, isl)
@@ -1135,6 +1164,7 @@ contains
     ! ---- my pages
     do s = 1, ns
       if (own(s) /= me_g .or. wp1(s) > wp2(s)) cycle
+      call io_progress()                         ! later records' parts, between variables
       fp = soff(s) / a
       base = fp * a
       nbuf = (wp2(s) - fp + 1) * a
@@ -1180,10 +1210,18 @@ contains
       enddo
       c2 = wall_time()
       t_pack = t_pack + real(c2 - c1)
-      if (.not. cdf_write(dfile(k), pbuf, (wp1(s) - fp) * a, wp1(s) * a, (wp2(s) - wp1(s) + 1) * a, io_piece)) then
-        write(*,'(3a)') 'io_server: direct write to ', trim(opath(k)), ' failed'
-        error stop 'io_server: direct write'
-      endif
+      ! in pieces of io_piece, taking in later records between them
+      tmpo = 0
+      tmpn = (wp2(s) - wp1(s) + 1) * a
+      do while (tmpo < tmpn)
+        if (tmpo > 0) call io_progress()
+        if (.not. cdf_write(dfile(k), pbuf, (wp1(s) - fp) * a + tmpo, wp1(s) * a + tmpo, min(io_piece, tmpn - tmpo), &
+                            io_piece)) then
+          write(*,'(3a)') 'io_server: direct write to ', trim(opath(k)), ' failed'
+          error stop 'io_server: direct write'
+        endif
+        tmpo = tmpo + min(io_piece, tmpn - tmpo)
+      enddo
       c1 = wall_time()
       t_wr = t_wr + real(c1 - c2)
       d_bytes = d_bytes + (wp2(s) - wp1(s) + 1) * a
@@ -1192,7 +1230,15 @@ contains
     ! ---- every head sent and received, the group done, then the record count
     c1 = wall_time()
     if (nreq > 0) call MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE, ierr)
-    if (wgroup_size > 1) call MPI_Barrier(gcomm, ierr)
+    if (wgroup_size > 1) then
+      ! the group's barrier, taking in later records while the others finish
+      call MPI_Ibarrier(gcomm, breq, ierr)
+      do
+        call MPI_Test(breq, bdone, MPI_STATUS_IGNORE, ierr)
+        if (bdone) exit
+        call io_progress()
+      enddo
+    endif
     if (me_g == 0 .and. dfile(k)%begin_rec >= 0 .and. int(r0%rec, 8) > dfile(k)%numrecs) then
       if (.not. cdf_set_numrecs(dfile(k), int(r0%rec, 8))) error stop 'io_server: record count write'
     endif
@@ -1400,14 +1446,14 @@ contains
     integer, intent(in) :: off, n
 #ifdef USE_CUDA
     integer :: ierr
-    if (cur == 1) then
+    if (mod(cur, 2) == 1) then
       ierr = cudaMemcpyAsync(hpin8_1(off:off+n-1), dstage8(1:n), n, cudaMemcpyDeviceToHost, work_stream)
     else
       ierr = cudaMemcpyAsync(hpin8_2(off:off+n-1), dstage8(1:n), n, cudaMemcpyDeviceToHost, work_stream)
     endif
     if (ierr /= 0) error stop 'io_stage8: cudaMemcpyAsync failed'
 #else
-    if (cur == 1) then
+    if (mod(cur, 2) == 1) then
       hpin8_1(off:off+n-1) = dstage8(1:n)
     else
       hpin8_2(off:off+n-1) = dstage8(1:n)
@@ -1434,7 +1480,7 @@ contains
     call add_var8(name, n, 1, 1, 1, off)
     iv = pend(cur)%nvars
     pend(cur)%i0f(iv) = 1; pend(cur)%j0f(iv) = 1
-    if (cur == 1) then
+    if (mod(cur, 2) == 1) then
       hpin8_1(off:off+n-1) = vals
     else
       hpin8_2(off:off+n-1) = vals
@@ -1562,12 +1608,12 @@ contains
     if (len_trim(fname_sync(k)) == 0) error stop 'io: record without a file'
     call nc_open_write(trim(fname_sync(k)), ncid)
     if (pend(idx)%dbl) then
-      if (idx == 1) then
+      if (mod(idx, 2) == 1) then
         call write_record8(ncid, pend(idx), hpin8_1)
       else
         call write_record8(ncid, pend(idx), hpin8_2)
       endif
-    elseif (idx == 1) then
+    elseif (mod(idx, 2) == 1) then
       call write_record(ncid, pend(idx), hpin1)
     else
       call write_record(ncid, pend(idx), hpin2)
@@ -1607,28 +1653,35 @@ contains
   end subroutine report_written
 
   subroutine io_server_run()
-    ! I/O rank main loop. Returns after CMD_QUIT.
+    ! I/O rank main loop. Returns after CMD_QUIT from every compute rank.
+    ! Complete records wait in ready_q (completion order, which is the
+    ! staging order on every writer of a group: each compute rank sends its
+    ! records in that order) and are written one by one; while one is
+    ! written, io_progress (between variables, between pwrite pieces, at the
+    ! group's closing barrier) takes in the commands that have arrived, so
+    ! the compute ranks' staging buffers free up during the write instead of
+    ! after it. Completed records are only queued there, never written.
 #ifdef USE_MPI
-    integer :: hdr(NHDR), ierr, stat(MPI_STATUS_SIZE), src, sc, comm, iv, off, n, b, k, ntot, nquit, ncompute, isl
-    real :: trecv(NSLOT)
+    integer :: hdr(NHDR), ierr, stat(MPI_STATUS_SIZE), k
     real(8) :: c_start, c_end
-    real(8) :: c0, c1, c2, c3
-    character(len=PATHLEN) :: path
-    character(len=NAMELEN * MAXV) :: namebuf
-    type(rec_t) :: r
-    comm = comm_world()
+    character(len=8) :: val
+    srv_comm = comm_world()
     nserv = io_server_count()
     me_w = io_server_index()
-    ncompute = comm_ncompute()   ! every compute rank sends its own slabs and its own quit (not the readers)
+    srv_ncompute = comm_ncompute()   ! every compute rank sends its own slabs and its own quit (not the readers)
     call writer_groups(nserv, wgroup_size, wgroups)
     my_group = me_w / wgroup_size
     me_g = mod(me_w, wgroup_size)
     call MPI_Comm_split(comm_writers(), my_group, me_w, gcomm, ierr)
     if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Comm_split groups'
     call direct_options()
+    call get_environment_variable('ROMS_GPU_IO_PROGRESS', val, status=k)
+    srv_progress = .not. (k == 0 .and. len_trim(val) > 0 .and. val(1:1) == '0')
     c_start = wall_time()
     trecv = 0.0
-    nquit = 0
+    srv_nquit = 0
+    nready = 0
+    n_early = 0
     write(*,'(a,i0,a,i0,a,i0,a,i0,a,i0)') 'io_server: ready on world rank ', comm_world_rank(), '  writer ', me_w, ' of ', nserv, &
          '  group ', my_group, ' of ', wgroups
     if (me_w == 0) then
@@ -1636,6 +1689,7 @@ contains
         write(*,'(a,a,a,i0,a,i0,a,i0,a)') 'io_server: CDF5 output, ', merge('O_DIRECT', 'buffered', io_direct), &
              ' writes in pieces of ', io_piece / 1048576_8, ' MiB, ', wgroups, ' group(s) of ', wgroup_size, &
              ' writers'
+        if (.not. srv_progress) write(*,'(a)') 'io_server: records received between writes only (ROMS_GPU_IO_PROGRESS=0)'
       else
         write(*,'(a)') 'io_server: netCDF-4 output (ROMS_GPU_OUT_FORMAT=nc4)'
       endif
@@ -1643,194 +1697,100 @@ contains
     endif
     flush(6)
     do
-      call MPI_Recv(hdr, NHDR, MPI_INTEGER, MPI_ANY_SOURCE, TAG_CMD, comm, stat, ierr)
+      if (nready > 0) then
+        call write_ready()
+        cycle
+      endif
+      if (srv_nquit >= srv_ncompute) exit
+      call MPI_Recv(hdr, NHDR, MPI_INTEGER, MPI_ANY_SOURCE, TAG_CMD, srv_comm, stat, ierr)
       if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Recv cmd'
-      src = stat(MPI_SOURCE)       ! the rest of this message comes from the same rank
-      sc = comm_compute_index(src) ! its compute rank: the tile buffers' index
-      select case (hdr(1))
-      case (CMD_OPEN)
-        call MPI_Recv(path, PATHLEN, MPI_CHARACTER, src, TAG_STR, comm, stat, ierr)
-        ! Only remember the path, under its (kind, file number): the
-        ! (collective) open happens when the first record of that file is
-        ! written, so that several writers reach it in the same order as the
-        ! records (an eager open could pair with another writer's record
-        ! write and deadlock), and a record still due in the previous file
-        ! is written there (the OPEN may arrive from a faster rank before a
-        ! slower rank's part of that record).
-        call announce(hdr(2), hdr(3), path)
-      case (CMD_PUT)
-        if (.not. allocated(tbuf)) then
-          allocate(tbuf(0:ncompute - 1, NSLOT), tmeta(0:ncompute - 1, NSLOT), tfill(0:ncompute - 1, NSLOT))
-          tfill = .false.
-        endif
-        ! slot for this (fkind, nfile, rec); a free slot if it is a new record
-        isl = 0
-        do k = 1, nslot_use
-          if (slot_key(1, k) == hdr(2) .and. slot_key(2, k) == hdr(6) .and. slot_key(3, k) == hdr(3)) isl = k
-        enddo
-        if (isl == 0) then
-          do k = 1, nslot_use
-            if (isl == 0 .and. slot_n(k) == 0) isl = k
-          enddo
-        endif
-        if (isl == 0) then
-          ! No free slot: write the oldest incomplete record's arrived tiles
-          ! slab by slab (old path) and reuse its slot. Records arrive out
-          ! of source order only when output is faster than the writer, so
-          ! say so: a partially assembled record costs partial-chunk writes.
-          isl = 1
-          do k = 2, nslot_use
-            if (slot_key(2, k) < slot_key(2, isl) .or. &
-                (slot_key(2, k) == slot_key(2, isl) .and. slot_key(3, k) < slot_key(3, isl))) isl = k
-          enddo
-          write(*,'(a,i0,a,i0,a,i0,a)') 'io_server: WARNING all ', nslot_use, ' record slots busy; writing record ', &
-               slot_key(3, isl), ' with ', slot_n(isl), ' of its tiles present (output faster than the writer)'
-          if (wgroup_size > 1) error stop 'io_server: record slots overrun with several writers (output faster than the writers): raise NSLOT or lower the output frequency'
-          call open_for(slot_key(1, isl), slot_key(2, isl))
-          call flush_slot_partial(isl)
-        endif
-        slot_key(:, isl) = (/hdr(2), hdr(6), hdr(3)/)
-        r = rec_t()
-        r%fkind = hdr(2)
-        r%rec = hdr(3)
-        r%nvars = hdr(4)
-        r%tstep = hdr(5)
-        r%nfile = hdr(6)
-        call MPI_Recv(namebuf, NAMELEN * MAXV, MPI_CHARACTER, src, TAG_STR, comm, stat, ierr)
-        call MPI_Recv(r%tmsg, 4, MPI_DOUBLE_PRECISION, src, TAG_TIME, comm, stat, ierr)
-        r%time = r%tmsg(1)
-        r%has_tavg = (iand(hdr(8), 1) /= 0)
-        r%has_tforce = (iand(hdr(8), 2) /= 0)
-        r%tavg = r%tmsg(2:3)
-        r%tforce = r%tmsg(4)
-        ntot = 0
-        do iv = 1, r%nvars
-          b = 8 + 6 * (iv - 1)
-          r%n1(iv) = hdr(b + 1); r%n2(iv) = hdr(b + 2); r%n3(iv) = hdr(b + 3)
-          r%nrank(iv) = hdr(b + 4)
-          r%i0f(iv) = hdr(b + 5); r%j0f(iv) = hdr(b + 6)
-          r%names(iv) = namebuf((iv - 1) * NAMELEN + 1:iv * NAMELEN)
-          r%off(iv) = 0                       ! not this writer's variable
-          if (mine(iv)) then
-            r%off(iv) = ntot + 1
-            ntot = ntot + r%n1(iv) * r%n2(iv) * r%n3(iv)
-          endif
-        enddo
-        ntot = max(ntot, 1)
-        r%dbl = (hdr(7) == 1)
-        c0 = wall_time()
-        if (r%dbl) then
-          if (allocated(tbuf(sc, isl)%b8)) then
-            if (size(tbuf(sc, isl)%b8) < ntot) deallocate(tbuf(sc, isl)%b8)
-          endif
-          if (.not. allocated(tbuf(sc, isl)%b8)) allocate(tbuf(sc, isl)%b8(ntot))
-          do iv = 1, r%nvars
-            if (.not. mine(iv)) cycle
-            off = r%off(iv)
-            n = r%n1(iv) * r%n2(iv) * r%n3(iv)
-            call MPI_Recv(tbuf(sc, isl)%b8(off), n, MPI_REAL8, src, TAG_DATA + iv, comm, stat, ierr)
-            if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Recv data (double)'
-          enddo
-        else
-          if (allocated(tbuf(sc, isl)%b)) then
-            if (size(tbuf(sc, isl)%b) < ntot) deallocate(tbuf(sc, isl)%b)
-          endif
-          if (.not. allocated(tbuf(sc, isl)%b)) allocate(tbuf(sc, isl)%b(ntot))
-          do iv = 1, r%nvars
-            if (.not. mine(iv)) cycle
-            off = r%off(iv)
-            n = r%n1(iv) * r%n2(iv) * r%n3(iv)
-            call MPI_Recv(tbuf(sc, isl)%b(off), n, MPI_REAL4, src, TAG_DATA + iv, comm, stat, ierr)
-            if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Recv data'
-          enddo
-        endif
-        c1 = wall_time()
-        tmeta(sc, isl) = r
-        if (.not. tfill(sc, isl)) slot_n(isl) = slot_n(isl) + 1
-        tfill(sc, isl) = .true.
-        trecv(isl) = trecv(isl) + (c1 - c0)
-        if (slot_n(isl) == ncompute) then
-          k = r%fkind
-          write(*,'(a,i0,a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' record complete: kind ', k, ' rec ', r%rec, ' file ', r%nfile
-          flush(6)
-          call open_for(k, r%nfile)
-          c1 = wall_time()
-          if (use_cdf5) then
-            call write_direct(k, isl)
-            c3 = wall_time()
-            c2 = c3
-            c3 = c3 - t_sync
-          else
-            call write_assembled(ncid_open(k), isl)
-            c3 = wall_time()
-            call nc_sync(ncid_open(k))
-            c2 = wall_time()
-          endif
-          write(*,'(a,i0,a,i0,a,i0,a,f7.2,a,f7.2,a,f7.2,a,f7.2,a)') 'io_server: writer ', me_w, ' kind ', k, &
-               ' rec ', r%rec, ': extend ', t_ext, ' s  assemble ', t_asm, ' s  put ', t_put, &
-               ' s  sync ', (c2 - c3), ' s'
-          if (use_cdf5) write(*,'(a,i0,a,f8.3,a,f7.2,a,f7.2,a,i0,a,i0)') 'io_server: writer ', me_w, ' direct ', &
-               real(d_bytes, 8) / 1.0d9, ' GB  pack ', t_pack, ' s  pwrite ', t_wr, ' s  rmw pages ', d_rmw, &
-               '  heads ', d_heads
-          call report_written(r)
-          write(*,'(a,i0,a,f7.2,a,f7.2,a)') 'io_server:   parts ', ncompute, '  recv ', trecv(isl), &
-               ' s  write ', (c2 - c1), ' s'
-          tfill(:, isl) = .false.; slot_n(isl) = 0; slot_key(:, isl) = -1; trecv(isl) = 0.0
-        endif
-      case (CMD_QUIT)
-        nquit = nquit + 1
-        write(*,'(a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' quit ', nquit, ' of ', ncompute
-        flush(6)
-        if (nquit < ncompute) cycle
-        ! records still assembling: write their arrived tiles before closing
-        do k = 1, nslot_use
-          if (slot_n(k) > 0) then
-            write(*,'(a,i0,a,i0,a)') 'io_server: WARNING record ', slot_key(3, k), ' incomplete at quit (', &
-                 slot_n(k), ' tiles); writing what arrived'
-            if (wgroup_size > 1) then
-              write(*,'(a)') 'io_server: (several writers: the incomplete record is dropped to keep the collective order)'
-            else
-              call open_for(slot_key(1, k), slot_key(2, k))
-              call flush_slot_partial(k)
-            endif
-          endif
-        enddo
-        do k = 1, NKIND
-          if (use_cdf5) then
-            if (dfile(k)%fd >= 0) call direct_close(k)
-          elseif (ncid_open(k) >= 0) then
-            call nc_close(ncid_open(k))
-          endif
-          ncid_open(k) = -1
-          nfile_open(k) = -1
-        enddo
-        c_end = wall_time()
-        write(*,'(a,i0,a,f10.2,a)') 'io_server: writer ', me_w, ' done  t = ', &
-             (c_end - c_start), ' s since the server started'
-        flush(6)
-        exit
-      case default
-        error stop 'io_server: unknown command'
-      end select
+      if (hdr(1) == CMD_PUT) then
+        if (find_slot(hdr) == 0) call evict()
+      endif
+      call serve_cmd(hdr, stat(MPI_SOURCE), .true.)
     enddo
+    ! records still assembling: write their arrived tiles before closing
+    do k = 1, nslot_use
+      if (slot_n(k) > 0) then
+        write(*,'(a,i0,a,i0,a)') 'io_server: WARNING record ', slot_key(3, k), ' incomplete at quit (', &
+             slot_n(k), ' tiles); writing what arrived'
+        if (wgroup_size > 1) then
+          write(*,'(a)') 'io_server: (several writers: the incomplete record is dropped to keep the collective order)'
+        else
+          call open_for(slot_key(1, k), slot_key(2, k))
+          call flush_slot_partial(k)
+        endif
+      endif
+    enddo
+    do k = 1, NKIND
+      if (use_cdf5) then
+        if (dfile(k)%fd >= 0) call direct_close(k)
+      elseif (ncid_open(k) >= 0) then
+        call nc_close(ncid_open(k))
+      endif
+      ncid_open(k) = -1
+      nfile_open(k) = -1
+    enddo
+    c_end = wall_time()
+    write(*,'(a,i0,a,f10.2,a,i0,a)') 'io_server: writer ', me_w, ' done  t = ', &
+         (c_end - c_start), ' s since the server started; ', n_early, ' record parts taken in while writing'
+    flush(6)
 #endif
   contains
-    subroutine announce(kind, nfile, fpath)
-      ! Remember the path of file nfile of this kind (every compute rank
-      ! announces it; keep one entry).
-      integer, intent(in) :: kind, nfile
-      character(len=*), intent(in) :: fpath
-      integer :: a, free
-      if (nfile_open(kind) == nfile) return
-      free = 0
-      do a = 1, NANN
-        if (ann_key(1, a) == kind .and. ann_key(2, a) == nfile) return
-        if (free == 0 .and. ann_key(1, a) < 0) free = a
+
+    subroutine write_ready()
+      ! Write the oldest complete record of the ready queue and free its slot.
+      integer :: isl, k
+      real(8) :: c1, c2, c3
+      type(rec_t) :: r
+      isl = ready_q(1)
+      ready_q(1:nready - 1) = ready_q(2:nready)
+      nready = nready - 1
+      r = tmeta(0, isl)
+      k = r%fkind
+      call open_for(k, r%nfile)
+      c1 = wall_time()
+      if (use_cdf5) then
+        call write_direct(k, isl)
+        c3 = wall_time()
+        c2 = c3
+        c3 = c3 - t_sync
+      else
+        call write_assembled(ncid_open(k), isl)
+        c3 = wall_time()
+        call nc_sync(ncid_open(k))
+        c2 = wall_time()
+      endif
+      write(*,'(a,i0,a,i0,a,i0,a,f7.2,a,f7.2,a,f7.2,a,f7.2,a)') 'io_server: writer ', me_w, ' kind ', k, &
+           ' rec ', r%rec, ': extend ', t_ext, ' s  assemble ', t_asm, ' s  put ', t_put, &
+           ' s  sync ', (c2 - c3), ' s'
+      if (use_cdf5) write(*,'(a,i0,a,f8.3,a,f7.2,a,f7.2,a,i0,a,i0)') 'io_server: writer ', me_w, ' direct ', &
+           real(d_bytes, 8) / 1.0d9, ' GB  pack ', t_pack, ' s  pwrite ', t_wr, ' s  rmw pages ', d_rmw, &
+           '  heads ', d_heads
+      if (use_cdf5) write(*,'(a,i0,a,f7.2,a)') 'io_server: writer ', me_w, ' took in later records for ', t_prog, ' s'
+      call report_written(r)
+      write(*,'(a,i0,a,f7.2,a,f7.2,a)') 'io_server:   parts ', srv_ncompute, '  recv ', trecv(isl), &
+           ' s  write ', (c2 - c1), ' s'
+      tfill(:, isl) = .false.; slot_n(isl) = 0; slot_key(:, isl) = -1; trecv(isl) = 0.0
+    end subroutine write_ready
+
+    subroutine evict()
+      ! No free slot: write the oldest incomplete record's arrived tiles
+      ! slab by slab (old path) and free its slot. Records arrive out of
+      ! source order only when output is faster than the writer, so say so:
+      ! a partially assembled record costs partial-chunk writes.
+      integer :: isl, k
+      isl = 1
+      do k = 2, nslot_use
+        if (slot_key(2, k) < slot_key(2, isl) .or. &
+            (slot_key(2, k) == slot_key(2, isl) .and. slot_key(3, k) < slot_key(3, isl))) isl = k
       enddo
-      if (free == 0) error stop 'io_server: too many files announced ahead of their records (raise NANN)'
-      ann_key(:, free) = (/kind, nfile/)
-      ann_path(free) = fpath
-    end subroutine announce
+      write(*,'(a,i0,a,i0,a,i0,a)') 'io_server: WARNING all ', nslot_use, ' record slots busy; writing record ', &
+           slot_key(3, isl), ' with ', slot_n(isl), ' of its tiles present (output faster than the writer)'
+      if (wgroup_size > 1) error stop 'io_server: record slots overrun with several writers (output faster than the writers): raise NSLOT or lower the output frequency'
+      call open_for(slot_key(1, isl), slot_key(2, isl))
+      call flush_slot_partial(isl)
+    end subroutine evict
 
     subroutine open_for(kind, nfile)
       ! Make file nfile of this kind the open one before a record of it is
@@ -1851,7 +1811,7 @@ contains
           if (ann_key(1, a) == kind .and. ann_key(2, a) == nfile) hit = a
         enddo
         if (hit == 0) then
-          write(*,'(a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' record of kind ', kind, &
+          write(*,'(a,i0,a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' record of kind ', kind, &
                ' for file ', nfile, ' before its open; file open: ', nfile_open(kind)
           error stop 'io_server: record before file open'
         endif
@@ -1889,5 +1849,183 @@ contains
       flush(6)
     end subroutine open_for
   end subroutine io_server_run
+
+  subroutine serve_cmd(hdr, src, main)
+    ! One command (header hdr from world rank src; the rest of its messages
+    ! follow from src). A record part needs a slot (find_slot): the main loop
+    ! evicts first when there is none, io_progress calls this only while a
+    ! slot is free. A record completed here is queued (ready_q), not written.
+    ! main: called by the main loop (else by io_progress, while writing).
+    integer, intent(in) :: hdr(NHDR), src
+    logical, intent(in) :: main
+#ifdef USE_MPI
+    integer :: ierr, stat(MPI_STATUS_SIZE), sc, iv, off, n, b, k, ntot, isl
+    real(8) :: c0, c1
+    character(len=PATHLEN) :: path
+    character(len=NAMELEN * MAXV) :: namebuf
+    type(rec_t) :: r
+    sc = comm_compute_index(src) ! its compute rank: the tile buffers' index
+    select case (hdr(1))
+    case (CMD_OPEN)
+      call MPI_Recv(path, PATHLEN, MPI_CHARACTER, src, TAG_STR, srv_comm, stat, ierr)
+      ! Only remember the path, under its (kind, file number): the open
+      ! happens when the first record of that file is written, so that
+      ! several writers reach it in the same order as the records (an eager
+      ! open could pair with another writer's record write and deadlock),
+      ! and a record still due in the previous file is written there (the
+      ! OPEN may arrive from a faster rank before a slower rank's part of
+      ! that record).
+      call announce(hdr(2), hdr(3), path)
+    case (CMD_PUT)
+      if (.not. allocated(tbuf)) then
+        allocate(tbuf(0:srv_ncompute - 1, NSLOT), tmeta(0:srv_ncompute - 1, NSLOT), tfill(0:srv_ncompute - 1, NSLOT))
+        tfill = .false.
+      endif
+      ! slot for this (fkind, nfile, rec); a free slot if it is a new record (the main loop
+      ! makes one free first when there is none: evict)
+      isl = find_slot(hdr)
+      if (isl == 0) error stop 'io_server: no free record slot (serve_cmd)'
+      slot_key(:, isl) = (/hdr(2), hdr(6), hdr(3)/)
+      r = rec_t()
+      r%fkind = hdr(2)
+      r%rec = hdr(3)
+      r%nvars = hdr(4)
+      r%tstep = hdr(5)
+      r%nfile = hdr(6)
+      call MPI_Recv(namebuf, NAMELEN * MAXV, MPI_CHARACTER, src, TAG_STR, srv_comm, stat, ierr)
+      call MPI_Recv(r%tmsg, 4, MPI_DOUBLE_PRECISION, src, TAG_TIME, srv_comm, stat, ierr)
+      r%time = r%tmsg(1)
+      r%has_tavg = (iand(hdr(8), 1) /= 0)
+      r%has_tforce = (iand(hdr(8), 2) /= 0)
+      r%tavg = r%tmsg(2:3)
+      r%tforce = r%tmsg(4)
+      ntot = 0
+      do iv = 1, r%nvars
+        b = 8 + 6 * (iv - 1)
+        r%n1(iv) = hdr(b + 1); r%n2(iv) = hdr(b + 2); r%n3(iv) = hdr(b + 3)
+        r%nrank(iv) = hdr(b + 4)
+        r%i0f(iv) = hdr(b + 5); r%j0f(iv) = hdr(b + 6)
+        r%names(iv) = namebuf((iv - 1) * NAMELEN + 1:iv * NAMELEN)
+        r%off(iv) = 0                       ! not this writer's variable
+        if (mine(iv)) then
+          r%off(iv) = ntot + 1
+          ntot = ntot + r%n1(iv) * r%n2(iv) * r%n3(iv)
+        endif
+      enddo
+      ntot = max(ntot, 1)
+      r%dbl = (hdr(7) == 1)
+      c0 = wall_time()
+      if (r%dbl) then
+        if (allocated(tbuf(sc, isl)%b8)) then
+          if (size(tbuf(sc, isl)%b8) < ntot) deallocate(tbuf(sc, isl)%b8)
+        endif
+        if (.not. allocated(tbuf(sc, isl)%b8)) allocate(tbuf(sc, isl)%b8(ntot))
+        do iv = 1, r%nvars
+          if (.not. mine(iv)) cycle
+          off = r%off(iv)
+          n = r%n1(iv) * r%n2(iv) * r%n3(iv)
+          call MPI_Recv(tbuf(sc, isl)%b8(off), n, MPI_REAL8, src, TAG_DATA + iv, srv_comm, stat, ierr)
+          if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Recv data (double)'
+        enddo
+      else
+        if (allocated(tbuf(sc, isl)%b)) then
+          if (size(tbuf(sc, isl)%b) < ntot) deallocate(tbuf(sc, isl)%b)
+        endif
+        if (.not. allocated(tbuf(sc, isl)%b)) allocate(tbuf(sc, isl)%b(ntot))
+        do iv = 1, r%nvars
+          if (.not. mine(iv)) cycle
+          off = r%off(iv)
+          n = r%n1(iv) * r%n2(iv) * r%n3(iv)
+          call MPI_Recv(tbuf(sc, isl)%b(off), n, MPI_REAL4, src, TAG_DATA + iv, srv_comm, stat, ierr)
+          if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Recv data'
+        enddo
+      endif
+      c1 = wall_time()
+      tmeta(sc, isl) = r
+      if (.not. tfill(sc, isl)) slot_n(isl) = slot_n(isl) + 1
+      tfill(sc, isl) = .true.
+      trecv(isl) = trecv(isl) + real(c1 - c0)
+      if (.not. main) n_early = n_early + 1
+      if (slot_n(isl) == srv_ncompute) then
+        write(*,'(a,i0,a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' record complete: kind ', r%fkind, ' rec ', &
+             r%rec, ' file ', r%nfile
+        if (.not. main) write(*,'(a,i0,a)') 'io_server: writer ', me_w, ' (record taken in while writing)'
+        flush(6)
+        if (nready >= NSLOT) error stop 'io_server: ready queue overflow'
+        nready = nready + 1
+        ready_q(nready) = isl
+      endif
+    case (CMD_QUIT)
+      srv_nquit = srv_nquit + 1
+      write(*,'(a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' quit ', srv_nquit, ' of ', srv_ncompute
+      flush(6)
+    case default
+      error stop 'io_server: unknown command'
+    end select
+#endif
+  end subroutine serve_cmd
+
+
+  integer function find_slot(hdr) result(isl)
+    ! The slot of the record that header hdr (a CMD_PUT) belongs to, else a
+    ! free one, else 0.
+    integer, intent(in) :: hdr(NHDR)
+    integer :: k
+    isl = 0
+    do k = 1, nslot_use
+      if (slot_key(1, k) == hdr(2) .and. slot_key(2, k) == hdr(6) .and. slot_key(3, k) == hdr(3)) isl = k
+    enddo
+    if (isl > 0) return
+    do k = 1, nslot_use
+      if (isl == 0 .and. slot_n(k) == 0) isl = k
+    enddo
+  end function find_slot
+
+  subroutine io_progress()
+    ! While a record is written: take in every command that has arrived, as
+    ! long as a record slot is free (a part of a new record needs one; with
+    ! none free the commands wait for the main loop, which may evict).
+    ! Completed records are queued (serve_cmd), never written from here.
+#ifdef USE_MPI
+    integer :: hdr(NHDR), ierr, stat(MPI_STATUS_SIZE), k
+    logical :: flag, free
+    real(8) :: c0
+    if (in_progress .or. .not. srv_progress) return
+    in_progress = .true.
+    c0 = wall_time()
+    do
+      free = .false.
+      do k = 1, nslot_use
+        if (slot_n(k) == 0) free = .true.
+      enddo
+      if (.not. free) exit
+      call MPI_Iprobe(MPI_ANY_SOURCE, TAG_CMD, srv_comm, flag, stat, ierr)
+      if (.not. flag) exit
+      call MPI_Recv(hdr, NHDR, MPI_INTEGER, stat(MPI_SOURCE), TAG_CMD, srv_comm, stat, ierr)
+      if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Recv cmd (progress)'
+      call serve_cmd(hdr, stat(MPI_SOURCE), .false.)
+    enddo
+    t_prog = t_prog + real(wall_time() - c0)
+    in_progress = .false.
+#endif
+  end subroutine io_progress
+
+  subroutine announce(kind, nfile, fpath)
+    ! Remember the path of file nfile of this kind (every compute rank
+    ! announces it; keep one entry).
+    integer, intent(in) :: kind, nfile
+    character(len=*), intent(in) :: fpath
+    integer :: a, free
+    if (nfile_open(kind) == nfile) return
+    free = 0
+    do a = 1, NANN
+      if (ann_key(1, a) == kind .and. ann_key(2, a) == nfile) return
+      if (free == 0 .and. ann_key(1, a) < 0) free = a
+    enddo
+    if (free == 0) error stop 'io_server: too many files announced ahead of their records (raise NANN)'
+    ann_key(:, free) = (/kind, nfile/)
+    ann_path(free) = fpath
+  end subroutine announce
+
 
 end module io_server

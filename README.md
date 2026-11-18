@@ -213,7 +213,8 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   returned is reported on stderr with its file, offset and node (default
   60, 0 off); `ROMS_GPU_IO_GROUP` the writers per group (default: all);
   `ROMS_GPU_IO_NSLOT` (1-8) fewer record slots per writer, for testing
-  the overrun path only. Files the compute ranks write themselves (no
+  the overrun path only; `ROMS_GPU_IO_PROGRESS=0` makes the writers take in
+  new records only between their writes (default: also during them). Files the compute ranks write themselves (no
   writer ranks, boundary extraction, upscaling, sponge tuning) are CDF5
   through serial netCDF with a 64-MiB buffer.
 - **Namelist:** the same groups and keys as UCLA ROMS, plus `np_xi` and
@@ -297,6 +298,15 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- Shorter output stalls when a restart is written: history and restart
+  records no longer share the compute ranks' staging buffers (a history
+  record staged right after a restart record pinned a second buffer of
+  several GB in the time loop), and the writer ranks take in new records
+  while they write one (`ROMS_GPU_IO_PROGRESS`). Pacific basin (8 A100s
+  on 2 nodes, 12 h with 6-hourly history and a 2-record restart): stalls
+  in the loop 4.8-5.4 s instead of 6.9 s; the time from the end of the
+  loop to exit is unchanged (23 s: the last records' writes). Output is
+  unchanged.
 - Faster cold start with many forcing files: while the grid and restart
   files are read, a few threads per compute rank read ahead the bytes of
   the forcing files that start-up reads next (their headers, every value
