@@ -74,7 +74,11 @@ first, on the smallest case that exercises it.
   O_DIRECT reader `src/host/cdf_direct.F90` against `nf90_get_var` bit for
   bit on files it writes; run it after any change to that module
   (`build_gpu/test_cdf_direct <scratch dir>`). With `--file <path> <vars>` it
-  checks a real file.
+  checks a real file. Likewise `build_gpu/test_cdf_write <dir on Lustre>`
+  (about 15 s) for the direct writes of the same module: header copy,
+  page ownership of 1-4 writers, packing, record count, length, layout
+  read-back, all against `nf90_get_var`; run it in a default-layout
+  directory and in one with `lfs setstripe -c 48 -S 16M`.
 - **Bit identity.** With a new feature off, the run must be bit-identical to
   the base binary: `python3 tools/cmp_nc.py A B`. Compare restart files with a
   record every step (history is float32, restarts are double). In split mode
@@ -242,6 +246,38 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   at the end of its section (variables after the last variable, a new
   `public` line after the last one, procedures before `end module`)
   built. Append to `comm_mod`; do not insert.
+- CDF5 output is written by the writer ranks with `O_DIRECT`, each 4-KiB
+  page by one writer (`cdf_direct`, `io_server` `write_direct`). Rules
+  that the benchmarks behind it gave (do not relax them without measuring
+  on Lustre with several writers per node on two nodes):
+  1. While the writers write a file nothing else touches it: no netCDF
+     handle (its classic layer rewrites whole blocks and takes client
+     locks), no buffered `pwrite`/`pread`, no `stat` or `lseek` to the
+     end, no `ftruncate`, no Lustre group lock. Direct writes on Lustre
+     take no client lock; anything that does stalls them. Buffered edge
+     pages next to direct writes hung a benchmark; a truncate while a
+     writer held a group lock deadlocked; a group lock turned the lockless
+     path off (half the rate). The header comes from netCDF through a
+     scratch file `<file>.hdr` that `nc_close` copies with `O_DIRECT`; the
+     length is set by writer 0 after every writer has closed.
+  2. Shared files need a wide stripe: 32-48 OSTs of 4-16 MiB. 1-MiB
+     stripes (what `lfs setstripe -c N` gives without `-S`) cut every
+     write into 1-MiB RPCs (a third of the rate); Derecho's default
+     progressive layout puts a file's first 16 GiB on 4 OSTs.
+  3. No fill, and the header is never redefined: unwritten bytes read as 0.
+  4. Every page has exactly one writer and is written whole; a page
+     partly covered by a record (the previous record's tail, a variable
+     the record does not write) is read with `O_DIRECT` first. A change to
+     the segment or ownership logic needs `test_cdf_write` and a
+     comparison by value with `ROMS_GPU_OUT_FORMAT=nc4` output.
+  A `cdf_direct: WATCHDOG` line on stderr means a `pwrite` had not returned
+  after `ROMS_GPU_IO_WATCHDOG` seconds (60): keep the log and the node
+  names; one benchmark run was 60 times slower on one node for a reason
+  not found.
+- `nc_io`'s `nc_close` chooses between the header copy and a rename by
+  whether data were put through `nc_io`'s put routines after `nc_create`:
+  a creation routine that wrote data with `nf90_put_var` directly would
+  lose it. Use the `nc_io` routines.
 - Start-up reads use `O_DIRECT` (`ROMS_GPU_PAR_READ`, README "Run"). When a
   start-up read misbehaves, compare with `ROMS_GPU_PAR_READ=whole`, and run
   with `ROMS_GPU_PAR_READ_VERIFY=1`, which re-reads every variable through
