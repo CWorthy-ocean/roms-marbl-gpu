@@ -50,7 +50,16 @@ make gpu FC_GPU=nvfortran \
   compute ranks: writers (`src/host/io_server.F90`) and, with
   `ROMS_GPU_FRC_READER=1`, one forcing reader per node
   (`src/host/frc_reader.F90`, the last rank of each node); roles are set in
-  `comm.F90` `init_comm`.
+  `comm.F90` `init_comm`. On more than one node the default layout puts
+  writers on every node (`ROMS_GPU_NWRITERS`), and `init_comm` numbers them
+  round-robin over the nodes so that each file's writer group spans all
+  nodes (a node's buffered Lustre client is the limit for one shared
+  file). Keep that order if you touch the writer tables: `io_server` builds
+  its groups from consecutive writer indices. Writer and reader ranks hold
+  a CUDA context (~0.4 GB, from `MPI_Init` with GPU support) on their first
+  visible GPU; `tools/numa_bind.sh` shows each one GPU so they spread. A
+  multi-node timing that slows down with more writers per node is most
+  likely this (check the `gpumem` lines of the compute ranks).
 
 ## Testing
 
@@ -225,6 +234,14 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   65536 too large. `cdf_unpack` builds the unsigned value and subtracts
   65536; keep byte-level integer code under a bit-for-bit unit test.
   nvfortran 25.9 also has no `c_ssize_t` (use `c_long` on LP64 Linux).
+- `comm.F90` (compiled on its own; the main command reads `comm_mod.mod`):
+  adding module variables, a `public` name and two procedures in the middle
+  of the module broke the full `make gpu` in `imex_igw.F90` (LLVM `opt`:
+  "expected function name" on a `declare` with a garbage name; three
+  builds, with and without `findloc`). The same code with every addition
+  at the end of its section (variables after the last variable, a new
+  `public` line after the last one, procedures before `end module`)
+  built. Append to `comm_mod`; do not insert.
 - Start-up reads use `O_DIRECT` (`ROMS_GPU_PAR_READ`, README "Run"). When a
   start-up read misbehaves, compare with `ROMS_GPU_PAR_READ=whole`, and run
   with `ROMS_GPU_PAR_READ_VERIFY=1`, which re-reads every variable through

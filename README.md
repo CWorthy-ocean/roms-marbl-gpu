@@ -123,10 +123,18 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
     ranks are writers and the others compute ranks, so every node gets the
     same number of ranks (SLURM `--nodes=N --ntasks-per-node=g+w
     --gpus-per-node=g`, PBS `select=N:...:mpiprocs=g+w:ngpus=g`) and the
-    writers are spread over the nodes. If the compute ranks do not number
-    `np_xi x np_eta` the run stops and prints the layout it expected.
+    writers are spread over the nodes. The writers are numbered
+    round-robin over the nodes, so each output file's writer group spans
+    all of them: a node's Lustre client writes one shared file at about
+    1.3 GB/s however many writers it has, so a file written from two nodes
+    is written about twice as fast. If the compute ranks do not number
+    `np_xi x np_eta` the run stops and prints the layout it expected. This
+    is the layout to use on more than one node.
   - `ROMS_GPU_NWRITERS` unset: the first `np_xi x np_eta` ranks compute and
     every extra rank is a writer, so the writers sit on the last node.
+  - Writer groups: each file is written by one group of writers;
+    `ROMS_GPU_IO_GROUP` sets the writers per group (default: 4 per node
+    that holds writers, at most half the writers).
   - Forcing reader (optional, `ROMS_GPU_FRC_READER=1`): the last rank of
     every node reads the surface forcing and boundary records ahead of the
     model, each record whole and in file order, so that the compute ranks'
@@ -135,16 +143,26 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
     ranks read as before). Launch one more rank on every node; the other
     ranks follow the two rules above. Without a spare rank on every node
     the run has no reader and says so.
-  `python3 tools/gpu_layout.py namelist.nml [--per-node] [--reader]` prints
-  the suggested numbers (compute ranks, writers, total, a PBS select line,
-  and with `--per-node` the writers per node); `tools/submit_gpu.sh <job
-  script> [PERNODE=1] [READER=0]` does the same and submits a PBS job with
-  them, with the forcing reader unless `READER=0`.
+  `python3 tools/gpu_layout.py namelist.nml [--per-node | --last-node]
+  [--reader]` prints the suggested numbers (compute ranks, writers, total,
+  a PBS select line, and for the per-node layout the writers per node). On
+  more than one node it picks the per-node layout when `np_xi x np_eta`
+  divides over the nodes, else the last-node one; on one node the two
+  place the same ranks. `tools/submit_gpu.sh <job script> [PERNODE=0|1]
+  [READER=0]` does the same and submits a PBS job with them, with the
+  forcing reader unless `READER=0`; `PERNODE` forces a layout.
 - **GPUs:** a compute rank uses GPU (its rank on the node mod the number of
   visible GPUs), so place ranks node by node and make all of a node's GPUs
   visible to every rank. `tools/numa_bind.sh` (launch with `mpiexec
   --cpu-bind none ... tools/numa_bind.sh <exe> run <namelist>`) pins each
-  GPU rank to the CPU cores next to its GPU.
+  GPU rank to the CPU cores next to its GPU. It also shows each writer and
+  forcing-reader rank a single GPU (its rank on the node mod the GPUs):
+  with `MPICH_GPU_SUPPORT_ENABLED=1` every rank gets a CUDA context
+  (about 0.4 GB) on its first visible GPU at `MPI_Init`, and with writers
+  on every node these would all sit on GPU 0, next to compute rank 0. On
+  the Pacific basin 9 such contexts pushed the largest tile into managed-
+  memory paging (steps 9x slower). Launch with `numa_bind.sh`, or give
+  those ranks one GPU each yourself.
 - **Environment:** set `MPICH_GPU_SUPPORT_ENABLED=1` to use GPU-to-GPU halo
   exchange (CUDA-aware MPI required); leave it unset otherwise.
 - **Start-up reads:** the grid and initial (restart) files are read by the
@@ -241,6 +259,25 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- Output files are written through all the job's nodes. On more than one
+  node `tools/gpu_layout.py` and `tools/submit_gpu.sh` now put writers on
+  every node (`ROMS_GPU_NWRITERS`), and the model numbers the writers
+  round-robin over the nodes, so each file's writer group spans all of
+  them (before, the writers sat on the last node, and in the
+  `ROMS_GPU_NWRITERS` mode each group still sat on one node). A node's
+  Lustre client writes one shared file at about 1.3 GB/s however many
+  writers it has, so the rule is now 4 writers per node per file for large
+  records (1 for small ones), and `ROMS_GPU_IO_GROUP` defaults to 4 per
+  node that holds writers. `tools/numa_bind.sh` shows each writer and
+  forcing-reader rank one GPU, so that their CUDA contexts no longer pile
+  up on GPU 0 (see Run, "GPUs"). Pacific basin, 8 A100s on 2 nodes, IMEX
+  1800 s, 12 h with 6-hourly history (31 GB per record) and a restart
+  (2 records of 63 GB): history records written in 16-18 s instead of
+  21-24 s (1.7-1.9 against 1.3-1.5 GB/s per file), restart records in
+  33-41 s instead of 47-69 s, output stalls during the run 9 s instead of
+  20-26 s, wall time after start-up 124-126 s instead of 174-194 s. On 4
+  nodes (16 A100s) the history file is written at 3.6-3.8 GB/s. Results are
+  unchanged, bit for bit. One-node layouts are unchanged.
 - Faster start-up from classic-format (CDF-1, CDF-2, CDF-5) restart and
   initial files: they are now read with `O_DIRECT` (`ROMS_GPU_PAR_READ`,
   default `direct`; see Run). On Derecho the Pacific basin's 118-GB CDF5
