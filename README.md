@@ -125,16 +125,19 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
     --gpus-per-node=g`, PBS `select=N:...:mpiprocs=g+w:ngpus=g`) and the
     writers are spread over the nodes. The writers are numbered
     round-robin over the nodes, so each output file's writer group spans
-    all of them: a node's Lustre client writes one shared file at about
-    1.3 GB/s however many writers it has, so a file written from two nodes
-    is written about twice as fast. If the compute ranks do not number
+    all of them: the Pacific basin's records were written at 9-13 GB/s
+    with 8 writers on each of 2 nodes (CDF5 output; with netCDF-4 a node
+    writes one shared file at about 1.3 GB/s however many writers it
+    has), so a file written from more nodes is written faster. If the
+    compute ranks do not number
     `np_xi x np_eta` the run stops and prints the layout it expected. This
     is the layout to use on more than one node.
   - `ROMS_GPU_NWRITERS` unset: the first `np_xi x np_eta` ranks compute and
     every extra rank is a writer, so the writers sit on the last node.
   - Writer groups: each file is written by one group of writers;
-    `ROMS_GPU_IO_GROUP` sets the writers per group (default: 4 per node
-    that holds writers, at most half the writers).
+    `ROMS_GPU_IO_GROUP` sets the writers per group (default: all writers,
+    at most 64, with CDF5 output; with `ROMS_GPU_OUT_FORMAT=nc4` 4 per
+    node that holds writers, at most half the writers).
   - Forcing reader (optional, `ROMS_GPU_FRC_READER=1`): the last rank of
     every node reads the surface forcing and boundary records ahead of the
     model, each record whole and in file order, so that the compute ranks'
@@ -179,6 +182,35 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   every variable a second time through netCDF and reports any difference
   (a check; slower). `ROMS_GPU_DIRECT_PIECE_MB` sets the size of each read
   (default 1024).
+- **Output format and writes:** output files are CDF5 (netCDF's 64-bit
+  data format, `ncdump -k` says `cdf5`), written without fill values: a
+  value the model never wrote reads as 0, not as the netCDF fill value
+  (for example a restart's time-less IMEX fields before its second
+  record, or a record cut short by a crash). netCDF-C, NCO, CDO,
+  netCDF4-python and xarray (`engine="netcdf4"`) read them; HDF5-only
+  tools (`h5py`, xarray's `engine="h5netcdf"`) and xarray's `scipy`
+  engine (CDF-1 and CDF-2 only) cannot, and `nccopy -k nc4` converts a
+  file for them. Compute rank 0 defines each file with netCDF under the scratch
+  name `<file>.hdr` and copies its header into the file; the writer ranks
+  then write the variables with `O_DIRECT` (one group of all writers,
+  each writer its own variables, every 4-KiB page whole and once), and
+  writer 0 updates the record count after each record. A shared file
+  written this way needs a wide Lustre stripe: with a record of 4 GiB or
+  more `tools/submit_gpu.sh` sets `lfs setstripe -c 48 -S 16M` on the
+  output directory, and the model prints a WARNING when such a file lies
+  on fewer than 16 OSTs or on stripes under 4 MiB (`ROMS_GPU_IO_WIDE_GB`
+  sets the record size, default 4). Settings: `ROMS_GPU_OUT_FORMAT=nc4`
+  writes netCDF-4 as before (parallel HDF5, two groups); `ROMS_GPU_IO_DIRECT=0`
+  writes the same byte ranges through the page cache (taken by itself, with
+  a line in the log, when the file system refuses `O_DIRECT`);
+  `ROMS_GPU_IO_PIECE_MB` sets the size of one write (default 1024);
+  `ROMS_GPU_IO_WATCHDOG` the seconds after which a write that has not
+  returned is reported on stderr with its file, offset and node (default
+  60, 0 off); `ROMS_GPU_IO_GROUP` the writers per group (default: all);
+  `ROMS_GPU_IO_NSLOT` (1-8) fewer record slots per writer, for testing
+  the overrun path only. Files the compute ranks write themselves (no
+  writer ranks, boundary extraction, upscaling, sponge tuning) are CDF5
+  through serial netCDF with a 64-MiB buffer.
 - **Namelist:** the same groups and keys as UCLA ROMS, plus `np_xi` and
   `np_eta` (GPU tiles), `nt_bgc` (32 with MARBL) and `nt_passive`. Paths are
   relative to the namelist file. A group with a key the GPU model does not
@@ -210,7 +242,8 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   `<extract_root_name>_bry`), where the date is the model date at which the
   file is started, counted from `&reference_date_settings reference_date`
   (default 2000/1/1). `ocean_time` is in seconds, with `long_name = "Time
-  since YYYY/MM/DD"`. Files are whole (not split by rank) NetCDF-4.
+  since YYYY/MM/DD"`. Files are whole (not split by rank) CDF5 (see
+  "Output format and writes").
 
 `examples/minipac/` is a complete small case (namelist, MARBL settings, PBS
 script): 3 days of MiniPac, a small coarse Pacific test domain, with MARBL on one 4-GPU node. The input data are
@@ -259,6 +292,26 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- Output files are CDF5 instead of netCDF-4, and the writer ranks write
+  them with `O_DIRECT`, each page by one writer, instead of through
+  parallel HDF5 (see Run, "Output format and writes"). Names, variables,
+  attributes and values are unchanged (compared by value with the
+  netCDF-4 output). Values never written read as 0 instead of the fill
+  value. HDF5-only readers (`h5py`, xarray's `h5netcdf` engine) cannot
+  open CDF5; `ROMS_GPU_OUT_FORMAT=nc4` gives netCDF-4 output as before.
+  Restarts written by the model are read at the next start with the
+  `O_DIRECT` reader. `tools/submit_gpu.sh` puts the output directory of
+  runs with records of 4 GiB or more on a wide Lustre stripe. Pacific
+  basin, 8 A100s on 2 nodes, IMEX 1800 s, 12 h with 6-hourly history (31 GB
+  per record) and a restart (2 records of 63 GB), 8 writers per node: history
+  records written in 2.7-3.5 s instead of 15-17 s (28-30 s for the one
+  staged with the restart), restart records in 4.8-6.4 s instead of
+  32-43 s, the end of the run (loop end to exit) 21-22 s instead of
+  98-100 s, wall time after start-up 45-46 s instead of 124-126 s.
+  The next run reads such a restart (both records and the IMEX state,
+  126 GB) in 15.5-16.7 s instead of 190 s. The output stalls during the
+  run are unchanged (7-9 s, at the restart steps: the writers do not
+  receive while they write).
 - Output files are written through all the job's nodes. On more than one
   node `tools/gpu_layout.py` and `tools/submit_gpu.sh` now put writers on
   every node (`ROMS_GPU_NWRITERS`), and the model numbers the writers
