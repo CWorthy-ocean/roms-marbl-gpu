@@ -2,10 +2,15 @@
 # Submit a roms_gpu case with the rank layout derived from its namelist:
 # compute ranks = np_xi x np_eta, writer ranks from the history record size
 # (tools/gpu_layout.py), PBS select line and mpiexec count set accordingly.
-#   tools/submit_gpu.sh <submit_script> [NWRITERS=n] [PERNODE=1] [READER=0] [extra qsub -v settings, e.g. EXE=...]
-# PERNODE=1: the same ranks on every node with writers on each node
-# (gpu_layout.py --per-node; the model's ROMS_GPU_NWRITERS mode). NWRITERS
-# is then the total, rounded up to a multiple of the node count.
+#   tools/submit_gpu.sh <submit_script> [NWRITERS=n] [PERNODE=0|1] [READER=0] [extra qsub -v settings, e.g. EXE=...]
+# Layout (gpu_layout.py): on more than one node, by default the same ranks on
+# every node with writers on each node (the model's ROMS_GPU_NWRITERS mode),
+# so every output file is written through all the nodes; on one node, or
+# when np_xi x np_eta does not divide over the nodes, the writers are the
+# extra ranks on the last node. PERNODE=1 forces the per-node layout
+# (gpu_layout.py --per-node), PERNODE=0 the last-node layout (--last-node).
+# With the per-node layout NWRITERS is the total, rounded up to a multiple
+# of the node count.
 # READER=1 (the default): one more rank on every node, the forcing reader
 # (gpu_layout.py --reader; the model's ROMS_GPU_FRC_READER=1 mode), which
 # reads the forcing records ahead into the node's page cache; same results,
@@ -35,6 +40,7 @@ for a in "$@"; do
   case $a in
     NWRITERS=*) NWOPT="--max-writers ${a#NWRITERS=} --target-seconds 0.001" ;;
     PERNODE=1) PNOPT="--per-node" ;;
+    PERNODE=0) PNOPT="--last-node" ;;
     READER=[01]) READER=${a#READER=} ;;
     *) EXTRA="${EXTRA},${a}" ;;
   esac
