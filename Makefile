@@ -176,6 +176,9 @@ SRC_SHARED_NOCOMM = $(filter-out src/shared/comm.F90,$(SRC_SHARED))
 # The forcing reader (src/host/frc_reader.F90: MPI and netCDF calls, plain
 # host code, used by frc_io and bry_io) is compiled on its own too, after
 # comm.F90.
+# The O_DIRECT reader of classic netCDF files (src/host/cdf_direct.F90: POSIX
+# calls through ISO_C_BINDING, plain host code, used by par_read) is compiled
+# on its own too, like the forcing reader.
 # The host part of the implicit free surface's multigrid (implicit_fs_host.F90,
 # MPI calls, plain host code) is compiled on its own like comm.F90, at -O1
 # (nvfortran -O2 host code was miscompiled twice in this code base).
@@ -224,6 +227,7 @@ $(GPUDIR)/marbl_host.o: $(SRC_MARBL_HOST) $(GPUDIR)/kinds_pre.o $(MARBL_OBJS)
 gpu: $(GPUDIR)/kinds_pre.o $(GPUDIR)/marbl_host.o | $(GPUDIR)
 	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/shared/comm.F90 -o $(GPUDIR)/comm.o
 	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/host/frc_reader.F90 -o $(GPUDIR)/frc_reader.o
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/host/cdf_direct.F90 -o $(GPUDIR)/cdf_direct.o
 	$(FC_GPU) $(filter-out -O2 -O3,$(FFLAGS_GPU)) -O2 -Mnovect -module $(GPUDIR) -c src/device/implicit_fs_chol.F90 \
 	  -o $(GPUDIR)/implicit_fs_chol.o
 	$(FC_GPU) $(filter-out -O2 -O3,$(FFLAGS_GPU)) -O1 -module $(GPUDIR) -c src/device/implicit_fs_host.F90 \
@@ -231,7 +235,14 @@ gpu: $(GPUDIR)/kinds_pre.o $(GPUDIR)/marbl_host.o | $(GPUDIR)
 	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/device/implicit_fs_ipc.F90 -o $(GPUDIR)/implicit_fs_ipc.o
 	$(FC_GPU) $(FFLAGS_GPU) $(VERSION_DEF) -module $(GPUDIR) -o $(GPUDIR)/roms_gpu_cuda \
 	  $(SRC_SHARED_NOCOMM) $(SRC_DEV_GPU) $(SRC_MARBL_DEV) $(SRC_IO) $(SRC_HOST) src/host/main.F90 \
-	  $(GPUDIR)/comm.o $(GPUDIR)/frc_reader.o $(GPUDIR)/implicit_fs_chol.o $(GPUDIR)/implicit_fs_host.o $(GPUDIR)/implicit_fs_ipc.o $(GPUDIR)/marbl_host.o $(MARBL_OBJS) $(LIBS)
+	  $(GPUDIR)/comm.o $(GPUDIR)/frc_reader.o $(GPUDIR)/cdf_direct.o $(GPUDIR)/implicit_fs_chol.o $(GPUDIR)/implicit_fs_host.o $(GPUDIR)/implicit_fs_ipc.o $(GPUDIR)/marbl_host.o $(MARBL_OBJS) $(LIBS)
+
+# The O_DIRECT reader against nf90_get_var, bit for bit, on CDF-1/2/5 files it
+# writes (and a netCDF-4 file it must refuse): needs netCDF only, no GPU.
+#   make build_gpu/test_cdf_direct FFLAGS_GPU=... LIBS=...; build_gpu/test_cdf_direct <scratch dir>
+$(GPUDIR)/test_cdf_direct: src/host/cdf_direct.F90 tests/test_cdf_direct.F90 | $(GPUDIR)
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/host/cdf_direct.F90 -o $(GPUDIR)/cdf_direct.o
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -o $@ tests/test_cdf_direct.F90 $(GPUDIR)/cdf_direct.o $(LIBS)
 
 # Column-by-column check of the device MARBL interior kernels against the
 # unchanged MARBL code (host).
