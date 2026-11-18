@@ -181,7 +181,12 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   same bit for bit with every reader. `ROMS_GPU_PAR_READ_VERIFY=1` reads
   every variable a second time through netCDF and reports any difference
   (a check; slower). `ROMS_GPU_DIRECT_PIECE_MB` sets the size of each read
-  (default 1024).
+  (default 1024). The forcing files are read through netCDF, but their
+  start-up bytes (headers, the time axes, the tide file, the first
+  records: many small reads) are first read ahead into each node's page
+  cache by `ROMS_GPU_FRC_WARM` threads per compute rank (default 8; `0`
+  turns it off), in the background while the grid and restart files are
+  read. The model's own reads and its results are the same either way.
 - **Output format and writes:** output files are CDF5 (netCDF's 64-bit
   data format, `ncdump -k` says `cdf5`), written without fill values: a
   value the model never wrote reads as 0, not as the netCDF fill value
@@ -292,6 +297,17 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- Faster cold start with many forcing files: while the grid and restart
+  files are read, a few threads per compute rank read ahead the bytes of
+  the forcing files that start-up reads next (their headers, every value
+  of their time axes, the tide file, the first records), so these small
+  reads come from the node's memory (`ROMS_GPU_FRC_WARM`, see Run). On
+  Derecho the Pacific basin (8 A100s on 2 nodes, 30 forcing files with
+  12 monthly 37-GB surface files, inputs not cached on the nodes) spent
+  19-20 s in its forcing set-up and now 3 s; start-up fell from 32-33 s to
+  17 s (three runs each). The N2 nest (1 node, 50 forcing files) starts in
+  3.4 s instead of 8.8 s. Results are unchanged, bit for bit; netCDF-4
+  forcing files are read as before.
 - Output files are CDF5 instead of netCDF-4, and the writer ranks write
   them with `O_DIRECT`, each page by one writer, instead of through
   parallel HDF5 (see Run, "Output format and writes"). Names, variables,

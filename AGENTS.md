@@ -282,6 +282,17 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   start-up read misbehaves, compare with `ROMS_GPU_PAR_READ=whole`, and run
   with `ROMS_GPU_PAR_READ_VERIFY=1`, which re-reads every variable through
   netCDF and names any that differ.
+- Forcing start-up (`frc_io` `frc_warm_*`): the cost on cold nodes is the
+  latency of many small reads (a time axis of a classic file is one value
+  per record, a record apart), not bandwidth. Measured on Derecho: buffered
+  8-KiB reads 0.3-0.5 ms each on a CPU node, 6-8 ms inside the model;
+  `O_DIRECT` 4-KiB reads 18-20 ms each (do not use `O_DIRECT` for small
+  reads); `posix_fadvise(WILLNEED)` is ignored by the Lustre client
+  (nothing becomes resident). Hence the read-ahead threads (cdf_direct
+  `cdf_warm_*`, plain `pread`s, data discarded). `wall:` stamps name each
+  start-up stage (first forcing, river, boundary and tide records, the
+  initial diagnostics, the output set-up); `ROMS_GPU_FRC_WARM=0` gives the
+  old start-up for an A/B.
 - If a run differs from its own bit-identical repeats, rerun it on other nodes
   before you debug: a faulty GPU node has given silently wrong results. Wrap
   job runs in `timeout`.
