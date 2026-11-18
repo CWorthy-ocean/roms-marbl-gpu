@@ -33,12 +33,39 @@ module io_server
   ! one node do not help, more nodes do). Records are dispatched in
   ! staging order on every compute rank (seq), so each group's writers
   ! complete its records in one order, as their collective file calls need.
+  !
+  ! CDF5 output (ROMS_GPU_OUT_FORMAT=cdf5, the default; nc_io): the writers
+  ! write the variable data of the shared file themselves with O_DIRECT
+  ! (cdf_direct), not through netCDF: compute rank 0 creates the file
+  ! (header only, nc_io); every writer of the group opens it at its first
+  ! record (open_for: no netCDF handle, no collective call). Per record
+  ! (write_direct) each writer assembles its variables, packs them
+  ! big-endian into page-aligned buffers and writes whole 4-KiB pages; a
+  ! page shared by two variables is written by the owner of its first
+  ! variable, the other owners send it their bytes (heads, one small
+  ! message per shared page); then a barrier of the group and writer 0
+  ! rewrites the record count in the header. Nothing but these O_DIRECT
+  ! calls touches the file while it is written (AGENTS.md: buffered bytes,
+  ! netCDF handles, truncates or group locks next to lockless direct writes
+  ! slowed or hung the benchmark). At a file switch and at quit the writers
+  ! fsync and close, and writer 0 sets the length netCDF computes. Default:
+  ! one group of all writers (ROMS_GPU_IO_GROUP overrides); a shared file
+  ! written with O_DIRECT on a wide Lustre stripe takes 18-22 GB/s from 16
+  ! writers on 2 nodes, two files at once the same in total
+  ! (GPU_IO_STEP4_PLAN.md). ROMS_GPU_IO_DIRECT=0: the same byte ranges
+  ! through buffered descriptors; ROMS_GPU_IO_PIECE_MB: pwrite size (1024);
+  ! ROMS_GPU_IO_WATCHDOG: seconds before a pwrite that has not returned is
+  ! reported on stderr (60; 0 off). nc4: netCDF-4 through parallel HDF5 as
+  ! before (write_assembled).
   use kinds
   use decomp_mod, only: decomp
   use gpu_state
   use nc_io
   use comm_mod
   use run_timers, only: wall_time
+  use cdf_direct, only: cdf_file_t, cdf_buf_t, cdf_open_w, cdf_close_w, cdf_var_index, cdf_calcsize, &
+                        cdf_set_numrecs, cdf_write, cdf_read_page, cdf_pack_r4, cdf_pack_r8, cdf_pack_i4, cdf_plan, &
+                        cdf_truncate, cdf_buf_reserve, cdf_buf_free, cdf_watchdog_set, CDF_INT
 #ifdef USE_CUDA
   use cudafor
   use arch_mod, only: work_stream
@@ -111,6 +138,7 @@ module io_server
   ! writers an overrun stops the run. A slot's buffers grow to the largest
   ! record it has held, so idle slots cost little.
   integer, parameter :: NSLOT = 8                  ! records assembled at once (per-tile buffers)
+  integer :: nslot_use = NSLOT                     ! ROMS_GPU_IO_NSLOT (1..NSLOT): fewer, to test the overrun path
   type :: tile_buf_t
     real(4), allocatable :: b(:)
     real(8), allocatable :: b8(:)
@@ -146,6 +174,18 @@ module io_server
   integer, parameter :: NANN = 16
   integer :: ann_key(2, NANN) = -1
   character(len=PATHLEN) :: ann_path(NANN) = ''
+  ! Server side, CDF5 output (write_direct): the open file per kind, its
+  ! path, the aligned page buffer, the heads of shared pages (sent and
+  ! received), the options and the timing of the last record.
+  integer, parameter :: MAXSEG = MAXV + 8
+  logical :: use_cdf5 = .false., io_direct = .true.
+  type(cdf_file_t) :: dfile(NKIND)
+  character(len=PATHLEN) :: opath(NKIND) = ''
+  type(cdf_buf_t) :: pbuf, hsend(MAXSEG), hrecv(MAXSEG)
+  integer(8) :: io_piece = 1073741824_8
+  real :: t_sync = 0.0, t_pack = 0.0, t_wr = 0.0
+  integer(8) :: d_bytes = 0
+  integer :: d_rmw = 0, d_heads = 0
 
   public :: io_init
   public :: io_stage_begin
@@ -500,14 +540,21 @@ contains
 
   subroutine writer_groups(nw, gs, ng)
     ! Writers per group and number of groups for nw writers (the same on
-    ! the compute and the writer ranks): ROMS_GPU_IO_GROUP, default
-    ! min(4 x the nodes that hold writers, max(1, nw/2)) (4 writers per node
-    ! saturate a node's writes to one file), lowered until it divides nw.
+    ! the compute and the writer ranks): ROMS_GPU_IO_GROUP, default with
+    ! CDF5 output one group of all writers (at most MAXW: direct writes of
+    ! one shared file take every writer's bandwidth, two files at once as
+    ! much in total as one); with nc4 output min(4 x the nodes that hold
+    ! writers, max(1, nw/2)) (4 writers per node saturate a node's buffered
+    ! writes to one file). Lowered until it divides nw.
     integer, intent(in) :: nw
     integer, intent(out) :: gs, ng
     character(len=16) :: val
     integer :: stat, gdef
-    gdef = min(4 * max(1, comm_writer_nodes()), max(1, nw / 2))
+    if (nc_out_cdf5()) then
+      gdef = min(max(nw, 1), MAXW)
+    else
+      gdef = min(4 * max(1, comm_writer_nodes()), max(1, nw / 2))
+    endif
     gs = gdef
     call get_environment_variable('ROMS_GPU_IO_GROUP', val, status=stat)
     if (stat == 0 .and. len_trim(val) > 0) then
@@ -836,20 +883,422 @@ contains
     enddo
   end subroutine write_assembled
 
-  subroutine flush_slot_partial(isl)
-    ! Write whatever tiles of slot isl have arrived, slab by slab, and free it.
-    integer, intent(in) :: isl
-    integer :: t, k
+  ! ------------------------- CDF5 output: direct writes -------------------------
+
+  subroutine direct_options()
+    ! writer side: format, O_DIRECT, piece size, watchdog, record slots (environment)
+    character(len=32) :: val
+    integer :: stat, n
+    use_cdf5 = nc_out_cdf5()
+    io_direct = nc_io_direct()
+    call get_environment_variable('ROMS_GPU_IO_PIECE_MB', val, status=stat)
+    if (stat == 0 .and. len_trim(val) > 0) then
+      read(val, *, iostat=stat) n
+      if (stat == 0 .and. n > 0) io_piece = int(n, 8) * 1048576_8
+    endif
+    n = 60
+    call get_environment_variable('ROMS_GPU_IO_WATCHDOG', val, status=stat)
+    if (stat == 0 .and. len_trim(val) > 0) then
+      read(val, *, iostat=stat) n
+      if (stat /= 0) n = 60
+    endif
+    call cdf_watchdog_set(n)
+    call get_environment_variable('ROMS_GPU_IO_NSLOT', val, status=stat)
+    if (stat == 0 .and. len_trim(val) > 0) then
+      read(val, *, iostat=stat) n
+      if (stat == 0) nslot_use = max(1, min(NSLOT, n))
+    endif
+  end subroutine direct_options
+
+  subroutine direct_close(k)
+    ! Close the direct descriptor of kind k's file on every writer of the
+    ! group (fsync, close), then writer 0 sets the length netCDF computes
+    ! (the last record's page was written whole). Collective over the group.
+    integer, intent(in) :: k
+    integer(8) :: csz
+    integer :: ierr
+    csz = cdf_calcsize(dfile(k))
+    if (.not. cdf_close_w(dfile(k), .true.)) &
+         write(*,'(3a)') 'io_server: WARNING fsync or close of ', trim(opath(k)), ' failed'
+    if (wgroup_size > 1) call MPI_Barrier(gcomm, ierr)
+    if (me_g == 0) then
+      if (.not. cdf_truncate(trim(opath(k)), csz)) &
+           write(*,'(3a)') 'io_server: WARNING setting the length of ', trim(opath(k)), ' failed'
+    endif
+  end subroutine direct_close
+
+  subroutine var_extent(isl, iv, gx, gy)
+    ! global extents of variable iv of slot isl from the tiles' slabs
+    integer, intent(in) :: isl, iv
+    integer, intent(out) :: gx, gy
+    integer :: t
+    gx = 0; gy = 0
     do t = 0, size(tbuf, 1) - 1
-      if (.not. tfill(t, isl)) cycle
-      k = tmeta(t, isl)%fkind
-      if (ncid_open(k) < 0) error stop 'io_server: record before file open'
-      if (tmeta(t, isl)%dbl) then
-        call write_record8(ncid_open(k), tmeta(t, isl), tbuf(t, isl)%b8)
+      if (trim(tmeta(t, isl)%names(iv)) /= trim(tmeta(0, isl)%names(iv))) &
+           error stop 'io_server: tiles disagree on the variable list'
+      gx = max(gx, tmeta(t, isl)%i0f(iv) + tmeta(t, isl)%n1(iv) - 1)
+      gy = max(gy, tmeta(t, isl)%j0f(iv) + tmeta(t, isl)%n2(iv) - 1)
+    enddo
+  end subroutine var_extent
+
+  subroutine assemble_var(isl, iv, gx, gy, n3, dbl)
+    ! variable iv of slot isl from the tiles' slabs into gbuf (gbuf8: dbl), as write_assembled does
+    integer, intent(in) :: isl, iv, gx, gy, n3
+    logical, intent(in) :: dbl
+    integer :: t, i, j, k, n1, n2, i0, j0, off
+    integer(8) :: ng
+    ng = int(gx, 8) * gy * n3
+    if (dbl) then
+      if (allocated(gbuf8)) then
+        if (size(gbuf8, kind=8) < ng) deallocate(gbuf8)
+      endif
+      if (.not. allocated(gbuf8)) allocate(gbuf8(max(ng, 1_8)))
+    else
+      if (allocated(gbuf)) then
+        if (size(gbuf, kind=8) < ng) deallocate(gbuf)
+      endif
+      if (.not. allocated(gbuf)) allocate(gbuf(max(ng, 1_8)))
+    endif
+    do t = 0, size(tbuf, 1) - 1
+      n1 = tmeta(t, isl)%n1(iv); n2 = tmeta(t, isl)%n2(iv)
+      i0 = tmeta(t, isl)%i0f(iv); j0 = tmeta(t, isl)%j0f(iv); off = tmeta(t, isl)%off(iv)
+      if (dbl) then
+        do k = 1, n3
+          do j = 1, n2
+            do i = 1, n1
+              gbuf8((k - 1) * gx * gy + (j0 + j - 2) * gx + (i0 + i - 1)) = &
+                   tbuf(t, isl)%b8(off + (k - 1) * n1 * n2 + (j - 1) * n1 + (i - 1))
+            enddo
+          enddo
+        enddo
       else
-        call write_record(ncid_open(k), tmeta(t, isl), tbuf(t, isl)%b)
+        do k = 1, n3
+          do j = 1, n2
+            do i = 1, n1
+              gbuf((k - 1) * gx * gy + (j0 + j - 2) * gx + (i0 + i - 1)) = &
+                   tbuf(t, isl)%b(off + (k - 1) * n1 * n2 + (j - 1) * n1 + (i - 1))
+            enddo
+          enddo
+        enddo
       endif
     enddo
+  end subroutine assemble_var
+
+  subroutine pack_head(isl, iv, gx, gy, dbl, xtype, ne, b)
+    ! The first ne elements (file order) of variable iv of slot isl, taken
+    ! from the tiles' slabs (the last tile that holds an element wins, as in
+    ! assemble_var; none: 0), packed as the file's type into b at byte 0:
+    ! the bytes of a shared page that the page's writer gets from this owner.
+    integer, intent(in) :: isl, iv, gx, gy, xtype
+    integer(8), intent(in) :: ne
+    logical, intent(in) :: dbl
+    type(cdf_buf_t), intent(inout) :: b
+    real(4) :: h4(ne)
+    real(8) :: h8(ne)
+    integer(8) :: e, kk, rem
+    integer :: t, ii, jj, n1, n2, i0, j0
+    if (dbl) then
+      h8 = 0.0d0
+    else
+      h4 = 0.0
+    endif
+    do e = 0, ne - 1
+      kk = e / (int(gx, 8) * gy)
+      rem = e - kk * gx * gy
+      jj = int(rem / gx) + 1
+      ii = int(rem - (jj - 1) * int(gx, 8)) + 1
+      do t = size(tbuf, 1) - 1, 0, -1
+        n1 = tmeta(t, isl)%n1(iv); n2 = tmeta(t, isl)%n2(iv)
+        i0 = tmeta(t, isl)%i0f(iv); j0 = tmeta(t, isl)%j0f(iv)
+        if (ii < i0 .or. ii > i0 + n1 - 1 .or. jj < j0 .or. jj > j0 + n2 - 1) cycle
+        if (dbl) then
+          h8(e + 1) = tbuf(t, isl)%b8(tmeta(t, isl)%off(iv) + kk * n1 * n2 + (jj - j0) * n1 + (ii - i0))
+        else
+          h4(e + 1) = tbuf(t, isl)%b(tmeta(t, isl)%off(iv) + kk * n1 * n2 + (jj - j0) * n1 + (ii - i0))
+        endif
+        exit
+      enddo
+    enddo
+    if (dbl) then
+      call cdf_pack_r8(h8, ne, xtype, b, 0_8)
+    else
+      call cdf_pack_r4(h4, ne, xtype, b, 0_8)
+    endif
+  end subroutine pack_head
+
+  subroutine write_direct(k, isl)
+    ! Write record slot isl into the open CDF5 file of kind k (this writer's
+    ! part). Segments: the record's variables (owner: the writer that
+    ! received them, mine()) and the small ones writer 0 fills (ocean_time,
+    ! time_step, the averaging / forcing times), at their byte ranges for
+    ! this record (time-less variables in the fixed-size section). Every
+    ! page is written whole, once, by its writing segment's owner
+    ! (cdf_plan); bytes of a later segment in that page arrive as a head
+    ! (MPI on the group, all sent before any write); a page partly covered
+    ! by this record (the previous record's tail, unwritten variables) is
+    ! read first (O_DIRECT). Then the group's barrier and writer 0's record
+    ! count. Timing: t_ext plan + heads, t_asm assembly, t_put pack + pwrite,
+    ! t_sync barrier + record count.
+    integer, intent(in) :: k, isl
+    type(rec_t) :: r0
+    integer :: ns, iv, vi, s, t, i, j, gx, gy, n3, nreq, ierr, w, xt
+    integer :: sk(MAXSEG), sv(MAXSEG), own(MAXSEG), wseg(MAXSEG), ord(MAXSEG), rq(MAXSEG)
+    integer :: sgx(MAXSEG), sgy(MAXSEG), sn3(MAXSEG)
+    integer(8) :: soff(MAXSEG), snb(MAXSEG), wp1(MAXSEG), wp2(MAXSEG)
+    integer(8) :: a, fp, base, nbuf, cov, hb, ne, xsz, tmpo, tmpn
+    integer :: reqs(2 * MAXSEG)
+    integer :: tsv(6)
+    real(8) :: c0, c1, c2, vals(1)
+    logical :: rmw1, lok
+    t_ext = 0.0; t_asm = 0.0; t_put = 0.0; t_sync = 0.0; t_pack = 0.0; t_wr = 0.0
+    d_bytes = 0; d_rmw = 0; d_heads = 0
+    c0 = wall_time()
+    r0 = tmeta(0, isl)
+    a = dfile(k)%align
+    ! ---- segments
+    ns = 0
+    call add_small('ocean_time', -1)
+    if (r0%fkind == IO_KIND_RST .and. r0%tstep > 0) call add_small('time_step', -2)
+    if (r0%has_tavg) then
+      call add_small('avg_begin_time', -3)
+      call add_small('avg_end_time', -4)
+    endif
+    if (r0%has_tforce) then
+      call add_small('ddic_dco2_time', -5)
+      call add_small('ddic_dalk_time', -5)
+    endif
+    do iv = 1, r0%nvars
+      vi = cdf_var_index(dfile(k), trim(r0%names(iv)))
+      if (vi == 0) then
+        write(*,'(4a)') 'io_server: variable ', trim(r0%names(iv)), ' is not in ', trim(opath(k))
+        error stop 'io_server: staged variable not in the CDF5 file'
+      endif
+      call var_extent(isl, iv, gx, gy)
+      n3 = r0%n3(iv)
+      if (int(gx, 8) * gy * n3 * dfile(k)%v(vi)%xsz /= dfile(k)%v(vi)%vraw) then
+        write(*,'(3a,i0,a,i0,a,i0,a,i0)') 'io_server: variable ', trim(r0%names(iv)), ': staged ', gx, ' x ', gy, &
+             ' x ', n3, ', file bytes ', dfile(k)%v(vi)%vraw
+        error stop 'io_server: staged extent differs from the CDF5 variable'
+      endif
+      ns = ns + 1
+      if (ns > MAXSEG) error stop 'io_server: too many segments (raise MAXSEG)'
+      sk(ns) = iv; sv(ns) = vi; own(ns) = mod(iv - 1, wgroup_size)
+      sgx(ns) = gx; sgy(ns) = gy; sn3(ns) = n3
+      soff(ns) = dfile(k)%v(vi)%begin
+      if (dfile(k)%v(vi)%isrec) soff(ns) = soff(ns) + int(r0%rec - 1, 8) * dfile(k)%recsize
+      snb(ns) = dfile(k)%v(vi)%vraw
+    enddo
+    ! sorted by offset (insertion sort of the order, then the arrays in that order)
+    do i = 1, ns
+      ord(i) = i
+    enddo
+    do i = 2, ns
+      j = i
+      do while (j > 1)
+        if (soff(ord(j - 1)) <= soff(ord(j))) exit
+        t = ord(j); ord(j) = ord(j - 1); ord(j - 1) = t
+        j = j - 1
+      enddo
+    enddo
+    sk(1:ns) = sk(ord(1:ns)); sv(1:ns) = sv(ord(1:ns)); own(1:ns) = own(ord(1:ns))
+    sgx(1:ns) = sgx(ord(1:ns)); sgy(1:ns) = sgy(ord(1:ns)); sn3(1:ns) = sn3(ord(1:ns))
+    soff(1:ns) = soff(ord(1:ns)); snb(1:ns) = snb(ord(1:ns))
+    if (.not. cdf_plan(ns, soff, snb, a, wseg, wp1, wp2)) then
+      write(*,'(2a)') 'io_server: overlapping or empty variables in ', trim(opath(k))
+      error stop 'io_server: cdf_plan'
+    endif
+    ! ---- heads: a segment that does not write its first page sends those bytes to that page's writer
+    nreq = 0
+    rq = 0
+    do s = 1, ns
+      if (wp1(s) == soff(s) / a) cycle
+      w = own(wseg(s))
+      hb = min(snb(s), (soff(s) / a + 1) * a - soff(s))
+      if (own(s) == me_g) then
+        if (w == me_g) then
+          call head_bytes(s, hb, hrecv(s))          ! my own later segment in my page
+        else
+          call head_bytes(s, hb, hsend(s))
+          nreq = nreq + 1
+          call MPI_Isend(hsend(s)%u8(1), int(hb), MPI_BYTE, w, 100 + s, gcomm, reqs(nreq), ierr)
+          d_heads = d_heads + 1
+        endif
+      elseif (w == me_g) then
+        if (.not. cdf_buf_reserve(hrecv(s), 8192_8)) error stop 'io_server: head buffer'
+        nreq = nreq + 1
+        call MPI_Irecv(hrecv(s)%u8(1), int(hb), MPI_BYTE, own(s), 100 + s, gcomm, reqs(nreq), ierr)
+        rq(s) = nreq
+      endif
+    enddo
+    c1 = wall_time()
+    t_ext = real(c1 - c0)
+    ! ---- my pages
+    do s = 1, ns
+      if (own(s) /= me_g .or. wp1(s) > wp2(s)) cycle
+      fp = soff(s) / a
+      base = fp * a
+      nbuf = (wp2(s) - fp + 1) * a
+      if (.not. cdf_buf_reserve(pbuf, nbuf)) error stop 'io_server: page buffer'
+      rmw1 = (wp1(s) == fp .and. soff(s) > base)
+      if (rmw1) then
+        if (.not. cdf_read_page(dfile(k), pbuf, 0_8, base, a)) error stop 'io_server: page read'
+        d_rmw = d_rmw + 1
+      endif
+      cov = min(soff(s) + snb(s), (wp2(s) + 1) * a) - max(soff(s), wp2(s) * a)
+      do t = s + 1, ns
+        if (soff(t) >= (wp2(s) + 1) * a) exit
+        if (wseg(t) == s) cov = cov + min(snb(t), (soff(t) / a + 1) * a - soff(t))
+      enddo
+      if (cov < a .and. .not. (rmw1 .and. wp2(s) == fp)) then
+        if (.not. cdf_read_page(dfile(k), pbuf, (wp2(s) - fp) * a, wp2(s) * a, a)) error stop 'io_server: page read'
+        d_rmw = d_rmw + 1
+      endif
+      c1 = wall_time()
+      if (sk(s) > 0) then
+        call assemble_var(isl, sk(s), sgx(s), sgy(s), sn3(s), r0%dbl)
+        c2 = wall_time()
+        t_asm = t_asm + real(c2 - c1)
+        c1 = c2
+        call pack_seg(s, pbuf, soff(s) - base)
+      else
+        call pack_seg(s, pbuf, soff(s) - base)
+      endif
+      do t = s + 1, ns
+        if (soff(t) >= (wp2(s) + 1) * a) exit
+        if (wseg(t) /= s) cycle
+        hb = min(snb(t), (soff(t) / a + 1) * a - soff(t))
+        if (rq(t) > 0) call MPI_Wait(reqs(rq(t)), MPI_STATUS_IGNORE, ierr)
+        pbuf%u8(soff(t) - base + 1:soff(t) - base + hb) = hrecv(t)%u8(1:hb)
+      enddo
+      c2 = wall_time()
+      t_pack = t_pack + real(c2 - c1)
+      if (.not. cdf_write(dfile(k), pbuf, (wp1(s) - fp) * a, wp1(s) * a, (wp2(s) - wp1(s) + 1) * a, io_piece)) then
+        write(*,'(3a)') 'io_server: direct write to ', trim(opath(k)), ' failed'
+        error stop 'io_server: direct write'
+      endif
+      c1 = wall_time()
+      t_wr = t_wr + real(c1 - c2)
+      d_bytes = d_bytes + (wp2(s) - wp1(s) + 1) * a
+    enddo
+    t_put = t_pack + t_wr
+    ! ---- every head sent and received, the group done, then the record count
+    c1 = wall_time()
+    if (nreq > 0) call MPI_Waitall(nreq, reqs, MPI_STATUSES_IGNORE, ierr)
+    if (wgroup_size > 1) call MPI_Barrier(gcomm, ierr)
+    if (me_g == 0 .and. dfile(k)%begin_rec >= 0 .and. int(r0%rec, 8) > dfile(k)%numrecs) then
+      if (.not. cdf_set_numrecs(dfile(k), int(r0%rec, 8))) error stop 'io_server: record count write'
+    endif
+    t_sync = real(wall_time() - c1)
+  contains
+    subroutine add_small(name, code)
+      ! a small variable writer 0 fills, if the file has it
+      character(len=*), intent(in) :: name
+      integer, intent(in) :: code
+      integer :: v
+      v = cdf_var_index(dfile(k), name)
+      if (v == 0) return
+      ns = ns + 1
+      sk(ns) = code; sv(ns) = v; own(ns) = 0
+      sgx(ns) = 0; sgy(ns) = 0; sn3(ns) = 0
+      soff(ns) = dfile(k)%v(v)%begin
+      if (dfile(k)%v(v)%isrec) soff(ns) = soff(ns) + int(r0%rec - 1, 8) * dfile(k)%recsize
+      snb(ns) = dfile(k)%v(v)%vraw
+      if (name == 'ddic_dalk_time') sk(ns) = -6
+    end subroutine add_small
+
+    subroutine small_vals(code, n, v8, vi4)
+      ! the values of a small segment: real(8) (v8) or, for time_step, integers (vi4)
+      integer, intent(in) :: code
+      integer(8), intent(in) :: n
+      real(8), intent(out) :: v8(n)
+      integer, intent(out) :: vi4(n)
+      v8 = 0.0d0
+      vi4 = 0
+      select case (code)
+      case (-1)
+        v8 = real(r0%time, 8)
+      case (-2)
+        tsv = (/r0%tstep, r0%rec, r0%rec, 0, 0, 0/)
+        vi4(1:min(n, 6_8)) = tsv(1:min(n, 6_8))
+      case (-3)
+        v8 = real(r0%tavg(1), 8)
+      case (-4)
+        v8 = real(r0%tavg(2), 8)
+      case default
+        v8 = real(r0%tforce, 8)
+      end select
+    end subroutine small_vals
+
+    subroutine pack_seg(s, b, boff)
+      ! the whole segment s into b at byte boff, as the file's type
+      integer, intent(in) :: s
+      type(cdf_buf_t), intent(inout) :: b
+      integer(8), intent(in) :: boff
+      integer(8) :: n
+      real(8), allocatable :: v8(:)
+      integer, allocatable :: vi4(:)
+      xt = dfile(k)%v(sv(s))%xtype
+      n = snb(s) / dfile(k)%v(sv(s))%xsz
+      if (sk(s) > 0) then
+        if (r0%dbl) then
+          call cdf_pack_r8(gbuf8, n, xt, b, boff)
+        else
+          call cdf_pack_r4(gbuf, n, xt, b, boff)
+        endif
+        return
+      endif
+      allocate(v8(n), vi4(n))
+      call small_vals(sk(s), n, v8, vi4)
+      if (xt == CDF_INT) then
+        call cdf_pack_i4(vi4, n, b, boff)
+      else
+        call cdf_pack_r8(v8, n, xt, b, boff)
+      endif
+    end subroutine pack_seg
+
+    subroutine head_bytes(s, nb, b)
+      ! the first nb bytes of segment s (file representation) into b
+      integer, intent(in) :: s
+      integer(8), intent(in) :: nb
+      type(cdf_buf_t), intent(inout) :: b
+      integer(8) :: n
+      if (.not. cdf_buf_reserve(b, 8192_8)) error stop 'io_server: head buffer'
+      xsz = dfile(k)%v(sv(s))%xsz
+      n = (nb + xsz - 1) / xsz
+      if (sk(s) > 0) then
+        call pack_head(isl, sk(s), sgx(s), sgy(s), r0%dbl, dfile(k)%v(sv(s))%xtype, n, b)
+      else
+        call pack_seg(s, b, 0_8)                 ! a small variable: all of it (at most a page)
+      endif
+    end subroutine head_bytes
+  end subroutine write_direct
+
+  subroutine flush_slot_partial(isl)
+    ! Write whatever tiles of slot isl have arrived, slab by slab, and free it.
+    ! CDF5 (one writer only; several stop before): the direct descriptor is
+    ! closed first (no direct write in flight), the slabs go through serial
+    ! netCDF, and the next record of the file reopens it for direct writes.
+    integer, intent(in) :: isl
+    integer :: t, k, ncid
+    k = slot_key(1, isl)
+    if (use_cdf5) then
+      if (dfile(k)%fd >= 0) call direct_close(k)
+      call nc_open_write(trim(opath(k)), ncid)
+      write(*,'(3a)') 'io_server: (CDF5: the partial record goes through serial netCDF; ', trim(opath(k)), &
+           ' is closed for direct writes meanwhile)'
+    else
+      if (ncid_open(k) < 0) error stop 'io_server: record before file open'
+      ncid = ncid_open(k)
+    endif
+    do t = 0, size(tbuf, 1) - 1
+      if (.not. tfill(t, isl)) cycle
+      if (tmeta(t, isl)%dbl) then
+        call write_record8(ncid, tmeta(t, isl), tbuf(t, isl)%b8)
+      else
+        call write_record(ncid, tmeta(t, isl), tbuf(t, isl)%b)
+      endif
+    enddo
+    if (use_cdf5) call nc_close(ncid)
     tfill(:, isl) = .false.; slot_n(isl) = 0; slot_key(:, isl) = -1
   end subroutine flush_slot_partial
 
@@ -1136,11 +1585,22 @@ contains
     me_g = mod(me_w, wgroup_size)
     call MPI_Comm_split(comm_writers(), my_group, me_w, gcomm, ierr)
     if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Comm_split groups'
+    call direct_options()
     c_start = wall_time()
     trecv = 0.0
     nquit = 0
     write(*,'(a,i0,a,i0,a,i0,a,i0,a,i0)') 'io_server: ready on world rank ', comm_world_rank(), '  writer ', me_w, ' of ', nserv, &
          '  group ', my_group, ' of ', wgroups
+    if (me_w == 0) then
+      if (use_cdf5) then
+        write(*,'(a,a,a,i0,a,i0,a,i0,a)') 'io_server: CDF5 output, ', merge('O_DIRECT', 'buffered', io_direct), &
+             ' writes in pieces of ', io_piece / 1048576_8, ' MiB, ', wgroups, ' group(s) of ', wgroup_size, &
+             ' writers'
+      else
+        write(*,'(a)') 'io_server: netCDF-4 output (ROMS_GPU_OUT_FORMAT=nc4)'
+      endif
+      if (nslot_use < NSLOT) write(*,'(a,i0,a)') 'io_server: ', nslot_use, ' record slots (ROMS_GPU_IO_NSLOT, a test setting)'
+    endif
     flush(6)
     do
       call MPI_Recv(hdr, NHDR, MPI_INTEGER, MPI_ANY_SOURCE, TAG_CMD, comm, stat, ierr)
@@ -1165,11 +1625,11 @@ contains
         endif
         ! slot for this (fkind, nfile, rec); a free slot if it is a new record
         isl = 0
-        do k = 1, NSLOT
+        do k = 1, nslot_use
           if (slot_key(1, k) == hdr(2) .and. slot_key(2, k) == hdr(6) .and. slot_key(3, k) == hdr(3)) isl = k
         enddo
         if (isl == 0) then
-          do k = 1, NSLOT
+          do k = 1, nslot_use
             if (isl == 0 .and. slot_n(k) == 0) isl = k
           enddo
         endif
@@ -1179,11 +1639,11 @@ contains
           ! of source order only when output is faster than the writer, so
           ! say so: a partially assembled record costs partial-chunk writes.
           isl = 1
-          do k = 2, NSLOT
+          do k = 2, nslot_use
             if (slot_key(2, k) < slot_key(2, isl) .or. &
                 (slot_key(2, k) == slot_key(2, isl) .and. slot_key(3, k) < slot_key(3, isl))) isl = k
           enddo
-          write(*,'(a,i0,a,i0,a,i0,a)') 'io_server: WARNING all ', NSLOT, ' record slots busy; writing record ', &
+          write(*,'(a,i0,a,i0,a,i0,a)') 'io_server: WARNING all ', nslot_use, ' record slots busy; writing record ', &
                slot_key(3, isl), ' with ', slot_n(isl), ' of its tiles present (output faster than the writer)'
           if (wgroup_size > 1) error stop 'io_server: record slots overrun with several writers (output faster than the writers): raise NSLOT or lower the output frequency'
           call open_for(slot_key(1, isl), slot_key(2, isl))
@@ -1255,13 +1715,23 @@ contains
           flush(6)
           call open_for(k, r%nfile)
           c1 = wall_time()
-          call write_assembled(ncid_open(k), isl)
-          c3 = wall_time()
-          call nc_sync(ncid_open(k))
-          c2 = wall_time()
+          if (use_cdf5) then
+            call write_direct(k, isl)
+            c3 = wall_time()
+            c2 = c3
+            c3 = c3 - t_sync
+          else
+            call write_assembled(ncid_open(k), isl)
+            c3 = wall_time()
+            call nc_sync(ncid_open(k))
+            c2 = wall_time()
+          endif
           write(*,'(a,i0,a,i0,a,i0,a,f7.2,a,f7.2,a,f7.2,a,f7.2,a)') 'io_server: writer ', me_w, ' kind ', k, &
                ' rec ', r%rec, ': extend ', t_ext, ' s  assemble ', t_asm, ' s  put ', t_put, &
                ' s  sync ', (c2 - c3), ' s'
+          if (use_cdf5) write(*,'(a,i0,a,f8.3,a,f7.2,a,f7.2,a,i0,a,i0)') 'io_server: writer ', me_w, ' direct ', &
+               real(d_bytes, 8) / 1.0d9, ' GB  pack ', t_pack, ' s  pwrite ', t_wr, ' s  rmw pages ', d_rmw, &
+               '  heads ', d_heads
           call report_written(r)
           write(*,'(a,i0,a,f7.2,a,f7.2,a)') 'io_server:   parts ', ncompute, '  recv ', trecv(isl), &
                ' s  write ', (c2 - c1), ' s'
@@ -1273,7 +1743,7 @@ contains
         flush(6)
         if (nquit < ncompute) cycle
         ! records still assembling: write their arrived tiles before closing
-        do k = 1, NSLOT
+        do k = 1, nslot_use
           if (slot_n(k) > 0) then
             write(*,'(a,i0,a,i0,a)') 'io_server: WARNING record ', slot_key(3, k), ' incomplete at quit (', &
                  slot_n(k), ' tiles); writing what arrived'
@@ -1286,7 +1756,11 @@ contains
           endif
         enddo
         do k = 1, NKIND
-          if (ncid_open(k) >= 0) call nc_close(ncid_open(k))
+          if (use_cdf5) then
+            if (dfile(k)%fd >= 0) call direct_close(k)
+          elseif (ncid_open(k) >= 0) then
+            call nc_close(ncid_open(k))
+          endif
           ncid_open(k) = -1
           nfile_open(k) = -1
         enddo
@@ -1321,29 +1795,58 @@ contains
     subroutine open_for(kind, nfile)
       ! Make file nfile of this kind the open one before a record of it is
       ! written: close the previous file and open the announced path.
+      ! CDF5: every writer of the group opens it for direct writes on its
+      ! own (no netCDF handle, no collective call); a file closed for a
+      ! partial record (flush_slot_partial) is reopened here.
       integer, intent(in) :: kind, nfile
       integer :: a, hit
-      if (nfile_open(kind) == nfile .and. ncid_open(kind) >= 0) return
-      hit = 0
-      do a = 1, NANN
-        if (ann_key(1, a) == kind .and. ann_key(2, a) == nfile) hit = a
-      enddo
-      if (hit == 0) then
-        write(*,'(a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' record of kind ', kind, &
-             ' for file ', nfile, ' before its open; file open: ', nfile_open(kind)
-        error stop 'io_server: record before file open'
+      character(len=256) :: msg
+      if (nfile_open(kind) == nfile) then
+        if (use_cdf5 .and. dfile(kind)%fd >= 0) return
+        if (.not. use_cdf5 .and. ncid_open(kind) >= 0) return
       endif
-      if (ncid_open(kind) >= 0) call nc_close(ncid_open(kind))
-      if (wgroup_size > 1) then
-        call nc_open_write_par(trim(ann_path(hit)), ncid_open(kind), gcomm)
+      if (nfile_open(kind) /= nfile .or. .not. use_cdf5) then
+        hit = 0
+        do a = 1, NANN
+          if (ann_key(1, a) == kind .and. ann_key(2, a) == nfile) hit = a
+        enddo
+        if (hit == 0) then
+          write(*,'(a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' record of kind ', kind, &
+               ' for file ', nfile, ' before its open; file open: ', nfile_open(kind)
+          error stop 'io_server: record before file open'
+        endif
+        if (use_cdf5) then
+          if (dfile(kind)%fd >= 0) call direct_close(kind)
+        elseif (ncid_open(kind) >= 0) then
+          call nc_close(ncid_open(kind))
+        endif
+        opath(kind) = ann_path(hit)
+        nfile_open(kind) = nfile
+        ann_key(:, hit) = -1
+        ann_path(hit) = ''
+      endif
+      if (use_cdf5) then
+        if (.not. cdf_open_w(trim(opath(kind)), dfile(kind), io_direct, msg)) then
+          if (io_direct) then
+            write(*,'(5a)') 'io_server: ', trim(opath(kind)), ': no O_DIRECT open (', trim(msg), &
+                 '); buffered descriptors from now on (ROMS_GPU_IO_DIRECT=0)'
+            io_direct = .false.
+            if (.not. cdf_open_w(trim(opath(kind)), dfile(kind), io_direct, msg)) then
+              write(*,'(4a)') 'io_server: ', trim(opath(kind)), ': ', trim(msg)
+              error stop 'io_server: CDF5 open for writing'
+            endif
+          else
+            write(*,'(4a)') 'io_server: ', trim(opath(kind)), ': ', trim(msg)
+            error stop 'io_server: CDF5 open for writing'
+          endif
+        endif
+      elseif (wgroup_size > 1) then
+        call nc_open_write_par(trim(opath(kind)), ncid_open(kind), gcomm)
       else
-        call nc_open_write(trim(ann_path(hit)), ncid_open(kind))
+        call nc_open_write(trim(opath(kind)), ncid_open(kind))
       endif
-      nfile_open(kind) = nfile
-      write(*,'(a,i0,a,a)') 'io_server: writer ', me_w, ' opened ', trim(ann_path(hit))
+      write(*,'(a,i0,a,a)') 'io_server: writer ', me_w, ' opened ', trim(opath(kind))
       flush(6)
-      ann_key(:, hit) = -1
-      ann_path(hit) = ''
     end subroutine open_for
   end subroutine io_server_run
 
