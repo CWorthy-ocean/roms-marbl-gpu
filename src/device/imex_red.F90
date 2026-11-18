@@ -38,11 +38,12 @@ module imex_red
   ! fs_gpu_timers 2). 0 (default): every call returns at once, no synchronisation, no output;
   ! 1: the outer windows; 2: also the pieces inside the stage solve (more synchronisation points).
   ! No arithmetic is touched. Windows 31-35: imex_pc = 'modes' (the mode build, the V-cycles, pcm_post with its
-  ! V-cycles, the z update, the early stopping test's reduction). Steps 1-10 are not counted; class 1 = steady
+  ! V-cycles, the z update, the early stopping test's reduction); 36: imex_bref_trigger's exposure measure (each
+  ! corrector, with its MPI max). Steps 1-10 are not counted; class 1 = steady
   ! step, 2 = b_ref rebuild step. At the last step one line per rank and window:
   !   IMEX_WIN <rank> <id> <name> <ms per steady step> <steady steps> <ms per rebuild step>
   !            <rebuild steps> <calls per steady step>
-  integer, parameter :: IT_N = 35
+  integer, parameter :: IT_N = 36
   integer :: it_lev = 0, it_cls = 1, it_nstep = 0, it_ns(2) = 0
   real(8) :: it_acc(IT_N, 2) = 0.0d0, it_t0(IT_N) = 0.0d0
   integer :: it_cnt(IT_N, 2) = 0
@@ -50,7 +51,8 @@ module imex_red
        's.setup', 's.bc_exch', 's.rhs', 's.solve', 's.correct', 'p.start', 'p.zexch', 'p.ops', 'p.allreduce', &
        'p.up', 'p.finish', 'pred_transport', 'obc_faces', 'shift', 'corr_exch', 'visc3d', 'pre_step3d', &
        'step3d_uv2', 'fs_step', 'prsgrd', 'step', 'step3d_uv1', 'tracers_end', 'forces_pred', 'forces_corr', &
-       'geom_pred', 's.advb', 'pcm.build', 'pcm.vcycle', 'pcm.post', 'pcm.zadd', 'pcm.early']
+       'geom_pred', 's.advb', 'pcm.build', 'pcm.vcycle', 'pcm.post', 'pcm.zadd', 'pcm.early', &
+       's.bref_expo']
 
 contains
 
