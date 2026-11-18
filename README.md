@@ -147,6 +147,20 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   GPU rank to the CPU cores next to its GPU.
 - **Environment:** set `MPICH_GPU_SUPPORT_ENABLED=1` to use GPU-to-GPU halo
   exchange (CUDA-aware MPI required); leave it unset otherwise.
+- **Start-up reads:** the grid and initial (restart) files are read by the
+  compute ranks, whole variables spread over them, and each tile's window
+  is sent to it. `ROMS_GPU_PAR_READ` picks the reader: `direct` (default)
+  reads a classic-format file (CDF-1, CDF-2 or CDF-5) with `O_DIRECT`,
+  bypassing the page cache, which on Lustre is several times faster.
+  A netCDF-4 file is read through netCDF as before (`whole`; a start-up
+  line says so), and so is a variable the direct reader cannot place (a
+  type other than double, float, int, short or byte, or a file cut
+  short). `whole` forces the netCDF reads, and `mpiio` reads the windows
+  collectively through parallel netCDF (netCDF-4 files). Results are the
+  same bit for bit with every reader. `ROMS_GPU_PAR_READ_VERIFY=1` reads
+  every variable a second time through netCDF and reports any difference
+  (a check; slower). `ROMS_GPU_DIRECT_PIECE_MB` sets the size of each read
+  (default 1024).
 - **Namelist:** the same groups and keys as UCLA ROMS, plus `np_xi` and
   `np_eta` (GPU tiles), `nt_bgc` (32 with MARBL) and `nt_passive`. Paths are
   relative to the namelist file. A group with a key the GPU model does not
@@ -227,6 +241,13 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- Faster start-up from classic-format (CDF-1, CDF-2, CDF-5) restart and
+  initial files: they are now read with `O_DIRECT` (`ROMS_GPU_PAR_READ`,
+  default `direct`; see Run). On Derecho the Pacific basin's 118-GB CDF5
+  restart (8 A100s on 2 nodes, input files not cached on the nodes) took
+  44-51 s to read and distribute and now takes 8.5-9.5 s; start-up fell
+  from 72-85 s to 38-40 s. netCDF-4 files are read as before. Results are
+  unchanged, bit for bit, with every file format.
 - New IMEX key `imex_corr_adv_clip` in `&imex_igw_settings`, the port of
   UCLA ROMS's key of the same name (CWorthy-ocean/ucla-roms#451,
   0b7a1403), with its default 0.1, its check (a value < 0 stops the run)
