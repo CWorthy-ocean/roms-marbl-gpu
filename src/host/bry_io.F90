@@ -13,7 +13,8 @@ module bry_io
   use decomp_mod
   use gpu_state
   use time_state
-  use frc_io, only: case_frcfiles, case_nfrc, cyc_bracket, frc_file_ncid, cached_times, frc_run_ncid_path
+  use frc_io, only: case_frcfiles, case_nfrc, cyc_bracket, frc_file_ncid, cached_times, frc_run_ncid_path, &
+                    frc_warm_series
   use passive_mod, only: ntp, passive_bry, passive_name, tb_west, tb_east, tb_south, tb_north
   use nc_io
   use arch_mod, only: sync_arch
@@ -248,6 +249,7 @@ contains
     s%n = n1
     call tile_window(axis, s%n, s%f0)
     allocate(s%buf(s%n, 2))
+    call frc_warm_series(s%vname, s%paths, s%irec, s%times, s%nrec, s%cycle)
     if (s%nrec >= 2) then
       ! No bracket yet: the first adv1 (the first set_bry_all) reads it.
       s%it1 = 0; s%it2 = 0
@@ -269,6 +271,7 @@ contains
     s%n = n1; s%nz = n2
     call tile_window(axis, s%n, s%f0)
     allocate(s%buf(s%n, n2, 2))
+    call frc_warm_series(s%vname, s%paths, s%irec, s%times, s%nrec, s%cycle)
     if (s%nrec >= 2) then
       ! No bracket yet: the first advz (the first set_bry_all) reads it.
       s%it1 = 0; s%it2 = 0

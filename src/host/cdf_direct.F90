@@ -38,10 +38,16 @@ module cdf_direct
   !     cdf_watchdog_set's seconds);
   !   - completed by cdf_set_numrecs (the first header page rewritten),
   !     cdf_close_w and cdf_truncate (the length netCDF computes).
+  ! Start-up read-ahead (frc_io's forcing warm-up): cdf_header parses a
+  ! header with plain reads (no O_DIRECT descriptor), and cdf_warm_add /
+  ! cdf_warm_launch / cdf_warm_join read a list of byte ranges with a few
+  ! POSIX threads (plain preads into per-thread buffers, data discarded),
+  ! so that they reach the node's page cache in the background.
   ! ssize_t is taken as C long (LP64 Linux; nvfortran 25.9 has no c_ssize_t).
   ! Only plain POSIX calls (open, pread, pwrite, lseek, close, fsync,
   ! truncate, unlink, rename, fgetxattr, gethostname, write, signal, alarm,
-  ! posix_memalign, free) through ISO_C_BINDING; no new library. Linux only
+  ! posix_memalign, free, pthread_create, pthread_join) through
+  ! ISO_C_BINDING; no new library. Linux only
   ! (O_DIRECT's value is architecture-specific); elsewhere cdf_open says it
   ! is not available.
   ! Compiled on its own (Makefile, like frc_reader.F90): plain host code with
@@ -55,6 +61,7 @@ module cdf_direct
   public :: cdf_open_w, cdf_close_w, cdf_var_index, cdf_calcsize, cdf_copy_header, cdf_set_numrecs, cdf_write, &
             cdf_read_page, cdf_pack_r4, cdf_pack_r8, cdf_pack_i4, cdf_plan, cdf_layout_fd, cdf_truncate, &
             cdf_unlink, cdf_rename, cdf_buf_reserve, cdf_watchdog_set, cdf_hostname
+  public :: cdf_header, cdf_ro_open, cdf_ro_close, cdf_warm_add, cdf_warm_launch, cdf_warm_join, cdf_warm_count
 
   ! netCDF external types this module converts; others are left to netCDF
   integer, parameter, public :: CDF_BYTE = 1, CDF_CHAR = 2, CDF_SHORT = 3, CDF_INT = 4, CDF_FLOAT = 5, &
@@ -221,6 +228,32 @@ module cdf_direct
 #endif
   end interface
 
+  ! Background warm-up reads (cdf_warm_*): a list of byte ranges read with
+  ! plain buffered preads by a few POSIX threads into scratch buffers, so
+  ! that they land in the node's page cache while the caller does other
+  ! work. Only the threads' own variables are touched while they run.
+  integer(int64), parameter :: WARM_CHUNK = 4194304_int64   ! bytes per pread and per thread buffer
+  integer, parameter :: WARM_MAXT = 64
+  integer :: warm_n = 0, warm_nthr = 0
+  integer(c_int), allocatable, target :: warm_fd(:), warm_tid(:)
+  integer(int64), allocatable :: warm_off(:), warm_len(:)
+  integer(c_long) :: warm_thr(WARM_MAXT) = 0
+  type(c_ptr) :: warm_buf(WARM_MAXT) = c_null_ptr
+  logical :: warm_running = .false.
+  interface
+    integer(c_int) function c_pthread_create(thr, attr, start, arg) bind(C, name='pthread_create')
+      import :: c_int, c_long, c_ptr, c_funptr
+      integer(c_long) :: thr
+      type(c_ptr), value :: attr, arg
+      type(c_funptr), value :: start
+    end function c_pthread_create
+    integer(c_int) function c_pthread_join(thr, ret) bind(C, name='pthread_join')
+      import :: c_int, c_long, c_ptr
+      integer(c_long), value :: thr
+      type(c_ptr), value :: ret
+    end function c_pthread_join
+  end interface
+
 contains
 
   integer function errno()
@@ -252,11 +285,6 @@ contains
     character(len=*), intent(in) :: path
     type(cdf_file_t), intent(inout) :: f
     character(len=*), intent(out) :: msg
-    integer(c_int) :: fd0
-    integer(int64) :: nh, got
-    integer(c_long) :: k
-    integer(int8), allocatable, target :: h(:)
-    logical :: more
     ok = .false.
     msg = ''
     call cdf_close(f)
@@ -264,42 +292,7 @@ contains
       msg = 'O_DIRECT is not available on this platform'
       return
     endif
-    fd0 = c_open(trim(path)//c_null_char, O_RDONLY)
-    if (fd0 < 0) then
-      write(msg, '(a,i0)') 'open failed, errno ', errno()
-      return
-    endif
-    f%fsize = c_lseek(fd0, 0_c_int64_t, SEEK_END)
-    if (f%fsize < 8) then
-      msg = 'file too short for a netCDF header'
-      fd0 = c_close(fd0)
-      return
-    endif
-    nh = min(f%fsize, 262144_int64)
-    do
-      allocate(h(nh))
-      got = 0
-      do while (got < nh)
-        k = c_pread(fd0, c_loc(h(got + 1)), int(nh - got, c_size_t), int(got, c_int64_t))
-        if (k <= 0) exit
-        got = got + k
-      enddo
-      if (got < nh) then
-        write(msg, '(a,i0)') 'header read failed, errno ', errno()
-        deallocate(h)
-        fd0 = c_close(fd0)
-        return
-      endif
-      ok = parse_header(h, nh, f, msg, more)
-      deallocate(h)
-      if (ok .or. .not. more) exit
-      if (nh >= f%fsize .or. nh >= 268435456_int64) then
-        msg = 'header longer than the file or than 256 MiB'
-        exit
-      endif
-      nh = min(f%fsize, 4 * nh)
-    enddo
-    fd0 = c_close(fd0)
+    ok = cdf_header(path, f, msg)
     if (.not. ok) return
     f%align = max(4096_int64, int(c_getpagesize(), int64))
     f%fd = c_open(trim(path)//c_null_char, O_RDONLY + O_DIRECT)
@@ -1370,5 +1363,168 @@ contains
     call c_f_pointer(c_loc(src(1)), s32, [n])
     call swap32_copy(s32(1:n), b%u32(w + 1:w + n))
   end subroutine cdf_pack_i4
+
+  logical function cdf_header(path, f, msg) result(ok)
+    ! Parse the header of a CDF-1/2/5 file with plain buffered reads; nothing
+    ! is left open (f%fd stays -1). .false.: msg says why (not a classic
+    ! file, an unsupported header).
+    character(len=*), intent(in) :: path
+    type(cdf_file_t), intent(inout) :: f
+    character(len=*), intent(out) :: msg
+    integer(c_int) :: fd0
+    integer(int64) :: nh, got
+    integer(c_long) :: k
+    integer(int8), allocatable, target :: h(:)
+    logical :: more
+    ok = .false.
+    msg = ''
+    call cdf_close(f)
+    fd0 = c_open(trim(path)//c_null_char, O_RDONLY)
+    if (fd0 < 0) then
+      write(msg, '(a,i0)') 'open failed, errno ', errno()
+      return
+    endif
+    f%fsize = c_lseek(fd0, 0_c_int64_t, SEEK_END)
+    if (f%fsize < 8) then
+      msg = 'file too short for a netCDF header'
+      fd0 = c_close(fd0)
+      return
+    endif
+    nh = min(f%fsize, 262144_int64)
+    do
+      allocate(h(nh))
+      got = 0
+      do while (got < nh)
+        k = c_pread(fd0, c_loc(h(got + 1)), int(nh - got, c_size_t), int(got, c_int64_t))
+        if (k <= 0) exit
+        got = got + k
+      enddo
+      if (got < nh) then
+        write(msg, '(a,i0)') 'header read failed, errno ', errno()
+        deallocate(h)
+        fd0 = c_close(fd0)
+        return
+      endif
+      ok = parse_header(h, nh, f, msg, more)
+      deallocate(h)
+      if (ok .or. .not. more) exit
+      if (nh >= f%fsize .or. nh >= 268435456_int64) then
+        msg = 'header longer than the file or than 256 MiB'
+        exit
+      endif
+      nh = min(f%fsize, 4 * nh)
+    enddo
+    fd0 = c_close(fd0)
+  end function cdf_header
+
+  integer function cdf_ro_open(path) result(fd)
+    ! A plain read-only descriptor (-1: cannot open).
+    character(len=*), intent(in) :: path
+    fd = int(c_open(trim(path)//c_null_char, O_RDONLY))
+    if (fd < 0) fd = -1
+  end function cdf_ro_open
+
+  subroutine cdf_ro_close(fd)
+    integer, intent(inout) :: fd
+    integer(c_int) :: ierr
+    if (fd >= 0) ierr = c_close(int(fd, c_int))
+    fd = -1
+  end subroutine cdf_ro_close
+
+  subroutine cdf_warm_add(fd, off, n)
+    ! Queue bytes off .. off+n-1 of descriptor fd for the next
+    ! cdf_warm_launch (not while threads run: the call is then ignored).
+    integer, intent(in) :: fd
+    integer(int64), intent(in) :: off, n
+    integer(c_int), allocatable :: ifd(:)
+    integer(int64), allocatable :: io(:), il(:)
+    integer :: m
+    if (warm_running .or. fd < 0 .or. n <= 0) return
+    if (.not. allocated(warm_fd)) then
+      allocate(warm_fd(1024), warm_off(1024), warm_len(1024))
+      warm_n = 0
+    endif
+    if (warm_n == size(warm_fd)) then
+      m = 2 * warm_n
+      allocate(ifd(m), io(m), il(m))
+      ifd(1:warm_n) = warm_fd(1:warm_n); io(1:warm_n) = warm_off(1:warm_n); il(1:warm_n) = warm_len(1:warm_n)
+      call move_alloc(ifd, warm_fd); call move_alloc(io, warm_off); call move_alloc(il, warm_len)
+    endif
+    warm_n = warm_n + 1
+    warm_fd(warm_n) = int(fd, c_int)
+    warm_off(warm_n) = max(off, 0_int64)
+    warm_len(warm_n) = n
+  end subroutine cdf_warm_add
+
+  integer function cdf_warm_count() result(n)
+    ! ranges queued (or being read)
+    n = warm_n
+  end function cdf_warm_count
+
+  subroutine cdf_warm_launch(nthreads)
+    ! Start nthreads (1..64) threads that read the queued ranges (thread t
+    ! takes ranges t, t+nthreads, ...) and return at once. Without threads
+    ! (pthread_create fails) the ranges are dropped: a warm-up only.
+    integer, intent(in) :: nthreads
+    integer :: t
+    integer(c_int) :: ierr
+    if (warm_running .or. warm_n == 0) return
+    warm_nthr = max(1, min(nthreads, WARM_MAXT, warm_n))
+    if (allocated(warm_tid)) deallocate(warm_tid)
+    allocate(warm_tid(warm_nthr))
+    do t = 1, warm_nthr
+      warm_tid(t) = t
+      if (.not. c_associated(warm_buf(t))) then
+        ierr = c_posix_memalign(warm_buf(t), 4096_c_size_t, int(WARM_CHUNK, c_size_t))
+        if (ierr /= 0) warm_buf(t) = c_null_ptr
+      endif
+    enddo
+    warm_running = .true.
+    do t = 1, warm_nthr
+      warm_thr(t) = 0
+      if (.not. c_associated(warm_buf(t))) cycle
+      ierr = c_pthread_create(warm_thr(t), c_null_ptr, c_funloc(warm_worker), c_loc(warm_tid(t)))
+      if (ierr /= 0) warm_thr(t) = 0
+    enddo
+  end subroutine cdf_warm_launch
+
+  subroutine cdf_warm_join()
+    ! Wait for the threads of the last launch; the queue is emptied.
+    integer :: t
+    integer(c_int) :: ierr
+    if (warm_running) then
+      do t = 1, warm_nthr
+        if (warm_thr(t) /= 0) ierr = c_pthread_join(warm_thr(t), c_null_ptr)
+        warm_thr(t) = 0
+      enddo
+      warm_running = .false.
+    endif
+    warm_n = 0
+  end subroutine cdf_warm_join
+
+  function warm_worker(arg) bind(C) result(res)
+    ! A warm-up thread: plain preads of its ranges into its own buffer. No
+    ! allocation, no Fortran I/O, only the module's read-only queue.
+    type(c_ptr), value :: arg
+    type(c_ptr) :: res
+    integer(c_int), pointer :: tid
+    integer :: i, t
+    integer(int64) :: done, req
+    integer(c_long) :: k
+    res = c_null_ptr
+    call c_f_pointer(arg, tid)
+    t = int(tid)
+    i = t
+    do while (i <= warm_n)
+      done = 0
+      do while (done < warm_len(i))
+        req = min(WARM_CHUNK, warm_len(i) - done)
+        k = c_pread(warm_fd(i), warm_buf(t), int(req, c_size_t), int(warm_off(i) + done, c_int64_t))
+        if (k <= 0) exit
+        done = done + k
+      enddo
+      i = i + warm_nthr
+    enddo
+  end function warm_worker
 
 end module cdf_direct
