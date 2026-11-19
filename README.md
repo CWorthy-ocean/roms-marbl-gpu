@@ -291,6 +291,14 @@ v0.1.2-beta, bit for bit.
   at single points up to 3.6 times). A
   solve that meets a NaN or Inf stops the run with a message (the same
   test and message as the implicit free surface of UCLA ROMS).
+- CDR volume releases (`cdr_volume`), as in UCLA ROMS (CWorthy-ocean/ucla-roms#470):
+  the output vertical velocity `w` (history and averages) now includes the
+  released water, as `omega` already did, so `w` changes above the release
+  cells; and the weight sum that normalizes each parameterized release now
+  adds each cell's column first and then the cells in global (j, i) order,
+  the CPU's new tiling-independent order (the GPU's sum was already
+  tiling-independent; multi-cell releases change at the rounding level).
+  Runs without CDR releases are unchanged bit for bit.
 
 ## Numerics
 
