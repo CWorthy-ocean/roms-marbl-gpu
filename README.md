@@ -300,6 +300,21 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- Results change: `omega` sizes the predictor's split of the vertical
+  velocity into an explicit and an implicit part for the step the
+  predictor takes, `(1 - AM3_crv) dt` = 5/6 `dt` (`lf_am3_weights`),
+  instead of `0.6 dt`, as UCLA ROMS does since ucla-roms#467 (upstream
+  CESR-lab/ucla-roms 9684929). Before, the explicit part's Courant number
+  in the predictor could reach (5/6)/0.6 = 1.39 instead of `cu_max` = 1.
+  Where the vertical Courant number `dt |W| / dz` stays below about 0.7
+  the change is at rounding level; above it, over steep topography and in
+  strong vertical flows, more of the predictor's vertical advection is
+  implicit. On the Sargasso Sea (cold start, 2 x 2) the GPU's results
+  move as the CPU's, variable for variable (IMEX at 1440 s, 10 steps: u
+  by 2.7e-2 of its largest value; stock step at 480 s, 12 steps: 1.5e-5),
+  and they stay within 2.6 (IMEX) and 3.1 (stock) times the CPU's own
+  strict-build spread of the fixed CPU, as before the change (2.2 and
+  3.1 against the CPU before it).
 - New IMEX key `imex_bref_trigger` in `&imex_igw_settings` (default
   0.646; 0 off), the port of UCLA ROMS's key of the same name
   (CWorthy-ocean/ucla-roms#456): the reference stratification
