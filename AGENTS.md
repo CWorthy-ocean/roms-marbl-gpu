@@ -78,7 +78,9 @@ first, on the smallest case that exercises it.
   (about 15 s) for the direct writes of the same module: header copy,
   page ownership of 1-4 writers, packing, record count, length, layout
   read-back, all against `nf90_get_var`; run it in a default-layout
-  directory and in one with `lfs setstripe -c 48 -S 16M`.
+  directory and in one with `lfs setstripe -c 48 -S 16M`. `make cdf_tests`
+  builds both also at `-O2` and `-O3` (`build_gpu/test_cdf_*_O2`, `_O3`);
+  run all of them: an aliasing bug shows only at some levels (Gotchas).
 - **Bit identity.** With a new feature off, the run must be bit-identical to
   the base binary: `python3 tools/cmp_nc.py A B`. Compare restart files with a
   record every step (history is float32, restarts are double). In split mode
@@ -209,6 +211,21 @@ keys it does not read, and the GPU-only groups and keys. Read it first.
   rank-local `iprb_*`/`jprb_*` (or `iprb_x`/`jprb_x`), checks them against the
   tile range, and checks any fixed level against nz.
   CUDA graphs (`ROMS_GPU_GRAPH=1`) damp zeta; keep them off for validation.
+- No type punning through pointers in host code. Two pointers of different
+  types to the same memory (`c_f_pointer` of one `c_loc`, e.g. an integer
+  view of a real array) break the compiler's type-based alias analysis: a
+  store through one and a load through the other may be reordered. The CPU
+  port of `cdf_direct` read stale values that way at gfortran `-O3`
+  (ucla-roms #461); nvfortran 25.9 happened to compile the same GPU code
+  correctly at every level, so a passing test does not prove such code
+  right. Reinterpret bits with `TRANSFER` or `memcpy`, on
+  cache-sized chunks: nvfortran 25.9 does not vectorise a `TRANSFER` per
+  element (0.9 GB/s); `cdf_direct` swaps bytes on integer words and moves
+  the bits between integer and real arrays with `memcpy` (`bits_copy`),
+  which was faster than an array `TRANSFER`. Copy or zero bytes of a
+  buffer that is also written as words with `memcpy`/`memset`
+  (`cdf_buf_copy`); see `cdf_buf_t` in `src/host/cdf_direct.F90`.
+  nvfortran 25.9 has no `shifta`.
 - nvfortran pitfalls (`value` arguments in device code, the inliner, stack
   size) are in `MARBL_GPU_PORT.md`, "Toolchain lessons".
   Two more from `imex_igw.F90` (nvfortran 25.9): module device functions
