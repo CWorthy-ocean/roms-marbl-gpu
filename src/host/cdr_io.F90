@@ -34,10 +34,10 @@ module cdr_io
   !   cdr_vsc = 0, all at the level nearest to -cdr_dep; otherwise
   !   frac*exp(-((z_r0+dep)/vsc)^2)*Hz0/(vsc*sqrt(pi));
   ! - normalized so the weights of the release sum to 1 over the domain.
-  ! The CPU finds the cells and sums the weights across its MPI ranks; here
-  ! every rank does it on the global grid in one fixed order, so the
-  ! weights are the same for every GPU tiling (the CPU's sum order, and
-  ! with it the last bit of the normalization, depends on its tiling).
+  ! The CPU finds the cells across its MPI ranks and sums the weights in one
+  ! fixed global order (each cell's column, then the cells in (j, i) order);
+  ! here every rank does it on the global grid in that order, so the
+  ! weights are the same for every GPU tiling and match the CPU's.
   !
   ! cdr_trcflx(ncdr, ntracers, time) [mmol/s] has the CPU's tracer axis
   ! (T, S, generic, CDR_LITE, MARBL; passive_mod cpu_tracer_index) and must
@@ -132,7 +132,7 @@ contains
     real(rp), allocatable :: zr0(:), hz0(:), prf(:), w(:,:), wq(:,:)
     integer, allocatable :: ci(:), cj(:), cr(:), nqr(:), cellof(:,:), cnt(:)
     integer(ip), allocatable :: oc_i(:), oc_j(:), oc_col(:), oc_p0(:), oq_rel(:)
-    real(rp) :: dmin, vint, arg, gsum, amin
+    real(rp) :: dmin, vint, arg, gsum, colw, amin
     integer :: nq_r, q, c, li, lj, nloc_c
     if (.not. cdr_source) return
     nzl = int(decomp%nz)
@@ -290,13 +290,16 @@ contains
           ci(q) = i; cj(q) = j; cr(q) = r; w(:, q) = prf
         enddo
       enddo
-      ! the release's weights sum to 1 (k outer, cells inner, as the CPU's
-      ! SUM over its (cidx, k) section)
+      ! the release's weights sum to 1: each cell's column sum (k ascending),
+      ! then the cells in global (j, i) order, as the CPU's release_weight_sum
+      ! (ucla-roms#TBD; before it, the CPU summed per-rank partial sums)
       gsum = 0.0_rp
-      do k = 1, nzl
-        do c = q0 + 1, q
-          gsum = gsum + w(k, c)
+      do c = q0 + 1, q
+        colw = 0.0_rp
+        do k = 1, nzl
+          colw = colw + w(k, c)
         enddo
+        gsum = gsum + colw
       enddo
       ! depth profiles are not normalized (the CPU normalizes only
       ! parameterized releases)
