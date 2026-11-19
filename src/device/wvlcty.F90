@@ -3,7 +3,10 @@ module wvlcty_mod
   ! True vertical velocity at rho points (CPU wvlcty_tile), for output only:
   ! the S-coordinate vertical velocity from the bottom-up integral of the
   ! mass-flux divergence times pm*pn (without the moving-interface term),
-  ! interpolated to the rho levels, plus the projection of u, v (slot nstp)
+  ! plus the water of the CDR volume releases accumulated bottom-up as omega
+  ! adds it to Wi (CPU wvlcty_tile since ucla-roms#TBD, which also adds pipes;
+  ! the GPU has none), interpolated to the rho levels, plus the projection
+  ! of u, v (slot nstp)
   ! along the slopes of the S surfaces; at the physical edges the gradient
   ! condition (the edge row/column and corners copy their neighbour).
   ! Computed on the interior 1:nx, 1:ny of each tile, the edges as above.
@@ -11,6 +14,7 @@ module wvlcty_mod
   use decomp_mod, only: decomp
   use gpu_state
   use time_state
+  use cdr_src_mod, only: cdr_vol_on, cdr_cmap, cd_vol, cq_w, cc_p0, cq_rel
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
 #endif
@@ -24,9 +28,10 @@ contains
 
   subroutine wvlcty_compute(wv)
     real(rp), WORK_ATTR intent(inout) :: wv(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz)
-    integer(ip) :: i, j, k, nx, ny, nz, ns, w, e, s, n
-    real(rp) :: wxl, wxr, wes, wen
+    integer(ip) :: i, j, k, nx, ny, nz, ns, w, e, s, n, cvo, cc, q, r
+    real(rp) :: wxl, wxr, wes, wen, cfv
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ns = nstp
+    cvo = merge(1_ip, 0_ip, cdr_vol_on)
     if (nz < 3) error stop 'wvlcty_compute: nz < 3'
     if (.not. allocated(wrk)) allocate(wrk(decomp%is:decomp%ie, decomp%js:decomp%je, 0:nz))
 #ifdef USE_CUDA
@@ -40,6 +45,20 @@ contains
                FlxU(i + 1, j, k) - FlxU(i, j, k) &
                + FlxV(i, j + 1, k) - FlxV(i, j, k))
         enddo
+        ! CDR volume releases (CPU wvlcty_tile), in release order
+        if (cvo == 1) then
+          cc = cdr_cmap(i, j)
+          if (cc > 0) then
+            do q = cc_p0(cc), cc_p0(cc + 1) - 1
+              r = cq_rel(q)
+              cfv = 0.0_rp
+              do k = 1, nz
+                cfv = cfv + cd_vol(r) * cq_w(k, q)
+                wrk(i, j, k) = wrk(i, j, k) + pm(i, j) * pn(i, j) * cfv
+              enddo
+            enddo
+          endif
+        endif
         wv(i, j, nz) = +0.375_rp * wrk(i, j, nz) + 0.75_rp * wrk(i, j, nz - 1) &
                        - 0.125_rp * wrk(i, j, nz - 2)
         do k = nz - 1, 2, -1
