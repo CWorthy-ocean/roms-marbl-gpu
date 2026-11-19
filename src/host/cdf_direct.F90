@@ -60,7 +60,7 @@ module cdf_direct
   public :: cdf_progress_if
   public :: cdf_open_w, cdf_close_w, cdf_var_index, cdf_calcsize, cdf_copy_header, cdf_set_numrecs, cdf_write, &
             cdf_read_page, cdf_pack_r4, cdf_pack_r8, cdf_pack_i4, cdf_plan, cdf_layout_fd, cdf_truncate, &
-            cdf_unlink, cdf_rename, cdf_buf_reserve, cdf_watchdog_set, cdf_hostname
+            cdf_unlink, cdf_rename, cdf_buf_reserve, cdf_buf_copy, cdf_watchdog_set, cdf_hostname
   public :: cdf_header, cdf_ro_open, cdf_ro_close, cdf_warm_add, cdf_warm_launch, cdf_warm_join, cdf_warm_count
 
   ! netCDF external types this module converts; others are left to netCDF
@@ -68,6 +68,7 @@ module cdf_direct
                                 CDF_DOUBLE = 6
   integer, parameter :: MAXD = 8            ! dimensions of a variable handled here (more: netCDF reads it)
   integer, parameter :: MAXNAME = 256       ! NC_MAX_NAME
+  integer(int64), parameter :: CVCH = 4096  ! values per chunk of the conversions (their temporaries stay in cache)
 
   type :: cdf_var_t
     character(len=MAXNAME) :: name = ''
@@ -90,6 +91,15 @@ module cdf_direct
     character(len=1024) :: path = ''
   end type cdf_file_t
 
+  ! An aligned byte buffer with two views of the same memory: u8 (bytes, and
+  ! the addresses given to pread / pwrite / MPI) and u32 (32-bit words). No
+  ! Fortran code stores through one view and then loads or stores the same
+  ! bytes through the other: type-based alias analysis may reorder accesses
+  ! of different types (gfortran -O3 did, in the CPU port of this reader,
+  ! ucla-roms #461). Integer bits become real values and back only inside
+  ! memcpy (bits_copy, in cdf_unpack and cdf_pack_*); the words are written
+  ! through u32 only, and bytes copied or zeroed into a buffer that is also
+  ! packed go through memcpy / memset (cdf_buf_copy, cdf_read_page).
   type :: cdf_buf_t
     type(c_ptr) :: p = c_null_ptr
     integer(int64) :: cap = 0
@@ -161,6 +171,17 @@ module cdf_direct
       import :: c_ptr
       type(c_ptr), value :: p
     end subroutine c_free
+    type(c_ptr) function c_memcpy(d, s, n) bind(C, name='memcpy')
+      import :: c_ptr, c_size_t
+      type(c_ptr), value :: d, s
+      integer(c_size_t), value :: n
+    end function c_memcpy
+    type(c_ptr) function c_memset(d, v, n) bind(C, name='memset')
+      import :: c_ptr, c_int, c_size_t
+      type(c_ptr), value :: d
+      integer(c_int), value :: v
+      integer(c_size_t), value :: n
+    end function c_memset
     integer(c_int) function c_getpagesize() bind(C, name='getpagesize')
       import :: c_int
     end function c_getpagesize
@@ -668,48 +689,27 @@ contains
     nullify(b%u8, b%u32)
   end subroutine cdf_buf_free
 
-  elemental integer(int32) function bswap32(x)
-    integer(int32), intent(in) :: x
-    bswap32 = ior(ior(ishft(x, 24), iand(ishft(x, 8), int(z'00FF0000', int32))), &
-                  ior(iand(ishft(x, -8), int(z'0000FF00', int32)), iand(ishft(x, -24), int(z'000000FF', int32))))
-  end function bswap32
-
-  elemental integer(int64) function bswap64(x)
-    integer(int64), intent(in) :: x
-    integer(int64), parameter :: M16 = int(z'0000FFFF0000FFFF', int64), M8 = int(z'00FF00FF00FF00FF', int64)
-    integer(int64) :: y
-    y = ior(ishft(x, 32), ishft(x, -32))
-    y = ior(ishft(iand(y, M16), 16), iand(ishft(y, -16), M16))
-    bswap64 = ior(ishft(iand(y, M8), 8), iand(ishft(y, -8), M8))
-  end function bswap64
-
   subroutine cdf_unpack(b, dshift, xtype, gx, gy, i0, j0, n1, n2, n3, out)
     ! Window (i0..i0+n1-1, j0..j0+n2-1, 1..n3) of the field (gx, gy, n3) whose
     ! big-endian bytes start at byte dshift of b, into out(n1*n2*n3) as
     ! real(8) in host order (Fortran order), converted as netCDF converts.
-    ! Per row: the bytes are copied as 32-bit words (the data are only 4-byte
-    ! aligned in the file), then swapped in place; simple loops that the
-    ! compiler vectorises (an element-wise swap-and-assemble loop ran at
-    ! 0.7-0.9 GB/s).
+    ! Doubles and floats: the rows' 32-bit words (the data are only 4-byte
+    ! aligned in the file) are copied with memcpy into a local integer chunk
+    ! of CVCH values, rows after rows (out is filled in order); a full chunk
+    ! is byte-swapped in place and goes to out through memcpy (flush_*). No
+    ! pointer of another type views out or the buffer (see cdf_buf_t), and
+    ! there are few calls per row (rows of a tile window are short).
     type(cdf_buf_t), intent(in) :: b
     integer(int64), intent(in) :: dshift
     integer, intent(in) :: xtype, gx, gy, i0, j0, n1, n2, n3
     real(real64), intent(out), target :: out(*)
-    integer(int64) :: e0, boff, w, o, ntot
+    integer(int32), target :: t(2 * CVCH)
+    integer(int64) :: e0, boff, w, o, ntot, k, ofl, done, p
     integer :: i, j, kk, v
-    integer(int64), pointer :: o64(:)
-    integer(int32), pointer :: o32(:)
-    real(real32), pointer :: t4(:)
-    integer(int32), allocatable, target :: t32(:)
     ntot = int(n1, int64) * n2 * n3
     if (ntot <= 0) return
-    if (xtype == CDF_DOUBLE) then
-      call c_f_pointer(c_loc(out(1)), o64, [ntot])
-      call c_f_pointer(c_loc(out(1)), o32, [2 * ntot])
-    else
-      allocate(t32(n1))
-      call c_f_pointer(c_loc(t32(1)), t4, [n1])
-    endif
+    k = 0                                        ! values in t, for out(ofl+1 : ofl+k)
+    ofl = 0
     do kk = 1, n3
       do j = 1, n2
         e0 = (int(kk - 1, int64) * gy + (j0 + j - 2)) * gx + (i0 - 1)
@@ -717,16 +717,27 @@ contains
         select case (xtype)
         case (CDF_DOUBLE)
           w = (dshift + e0 * 8) / 4
-          o32(2 * o + 1:2 * o + 2 * n1) = b%u32(w + 1:w + 2 * n1)
-          o64(o + 1:o + n1) = bswap64(o64(o + 1:o + n1))
+          done = 0
+          do while (done < n1)
+            p = min(n1 - done, CVCH - k)
+            call bits_copy(c_loc(t(2 * k + 1)), c_loc(b%u32(w + 2 * done + 1)), 8 * p)
+            k = k + p
+            done = done + p
+            if (k == CVCH) call flush_double(t, k, out, ofl)
+          enddo
         case (CDF_FLOAT)
           w = (dshift + e0 * 4) / 4
-          t32(1:n1) = bswap32(b%u32(w + 1:w + n1))
-          out(o + 1:o + n1) = real(t4(1:n1), real64)
+          done = 0
+          do while (done < n1)
+            p = min(n1 - done, CVCH - k)
+            call bits_copy(c_loc(t(k + 1)), c_loc(b%u32(w + done + 1)), 4 * p)
+            k = k + p
+            done = done + p
+            if (k == CVCH) call flush_float(t, k, out, ofl)
+          enddo
         case (CDF_INT)
           w = (dshift + e0 * 4) / 4
-          t32(1:n1) = bswap32(b%u32(w + 1:w + n1))
-          out(o + 1:o + n1) = real(t32(1:n1), real64)
+          call be_int_to_r8(b%u32(w + 1:w + n1), out(o + 1:o + n1))
         case (CDF_SHORT)
           ! unsigned 16 bits, then the sign (nvfortran 25.9 -O2 dropped the sign
           ! extension of int(int8 -> int32) inside ior(ishft(...)))
@@ -746,8 +757,80 @@ contains
         end select
       enddo
     enddo
-    if (allocated(t32)) deallocate(t32)
+    if (k > 0 .and. xtype == CDF_DOUBLE) call flush_double(t, k, out, ofl)
+    if (k > 0 .and. xtype == CDF_FLOAT) call flush_float(t, k, out, ofl)
   end subroutine cdf_unpack
+
+  ! Conversions between host values and the file's big-endian bytes, held as
+  ! 32-bit words (host-order loads and stores of 4 file bytes). The bytes
+  ! are swapped on integer words only (flush_*, swap32_copy, swap64_copy), in
+  ! chunks of CVCH values in a local integer array, and the bits cross between
+  ! integer and real arrays only inside memcpy (bits_copy), which the
+  ! compiler treats as a byte copy: no memory is seen through two types.
+  ! nvfortran 25.9 does not vectorise a TRANSFER per element (0.9 GB/s);
+  ! an array TRANSFER of the chunk was correct but slower than memcpy
+  ! (GPU_CDF_PUNNING.md).
+
+  subroutine bits_copy(d, s, nbytes)
+    ! memcpy of nbytes from s to d (distinct arrays of any types)
+    type(c_ptr), intent(in) :: d, s
+    integer(int64), intent(in) :: nbytes
+    type(c_ptr) :: p
+    p = c_memcpy(d, s, int(nbytes, c_size_t))
+  end subroutine bits_copy
+
+  subroutine flush_double(t, k, out, ofl)
+    ! k big-endian doubles in t (two words each, the high half first) ->
+    ! out(ofl+1 : ofl+k); then ofl = ofl + k, k = 0
+    integer(int32), intent(inout), target :: t(*)
+    integer(int64), intent(inout) :: k, ofl
+    real(real64), intent(inout), target :: out(*)
+    integer(int32), parameter :: M2 = int(z'00FF0000', int32), M3 = int(z'0000FF00', int32)
+    integer(int64) :: i
+    integer(int32) :: x, y
+    do i = 1, k
+      x = t(2 * i)
+      y = t(2 * i - 1)
+      t(2 * i - 1) = ior(ior(ishft(x, 24), iand(ishft(x, 8), M2)), ior(iand(ishft(x, -8), M3), ishft(x, -24)))
+      t(2 * i) = ior(ior(ishft(y, 24), iand(ishft(y, 8), M2)), ior(iand(ishft(y, -8), M3), ishft(y, -24)))
+    enddo
+    call bits_copy(c_loc(out(ofl + 1)), c_loc(t(1)), 8 * k)
+    ofl = ofl + k
+    k = 0
+  end subroutine flush_double
+
+  subroutine flush_float(t, k, out, ofl)
+    ! k big-endian floats in t -> out(ofl+1 : ofl+k) as real(8) (exact);
+    ! then ofl = ofl + k, k = 0
+    integer(int32), intent(inout), target :: t(*)
+    integer(int64), intent(inout) :: k, ofl
+    real(real64), intent(inout) :: out(*)
+    integer(int32), parameter :: M2 = int(z'00FF0000', int32), M3 = int(z'0000FF00', int32)
+    real(real32), target :: f(CVCH)
+    integer(int64) :: i
+    integer(int32) :: x
+    do i = 1, k
+      x = t(i)
+      t(i) = ior(ior(ishft(x, 24), iand(ishft(x, 8), M2)), ior(iand(ishft(x, -8), M3), ishft(x, -24)))
+    enddo
+    call bits_copy(c_loc(f), c_loc(t(1)), 4 * k)
+    out(ofl + 1:ofl + k) = real(f(1:k), real64)
+    ofl = ofl + k
+    k = 0
+  end subroutine flush_float
+
+  subroutine be_int_to_r8(s, d)
+    ! big-endian ints -> real(8)
+    integer(int32), intent(in), contiguous :: s(:)
+    real(real64), intent(out), contiguous :: d(:)
+    integer(int32), parameter :: M2 = int(z'00FF0000', int32), M3 = int(z'0000FF00', int32)
+    integer(int64) :: i
+    integer(int32) :: x
+    do i = 1, size(d, kind=int64)
+      x = s(i)
+      d(i) = real(ior(ior(ishft(x, 24), iand(ishft(x, 8), M2)), ior(iand(ishft(x, -8), M3), ishft(x, -24))), real64)
+    enddo
+  end subroutine be_int_to_r8
 
   ! ============================== direct writes ==============================
 
@@ -818,6 +901,21 @@ contains
     integer(int64), intent(in) :: n
     ok = buf_reserve(b, max(n, 4096_int64), max(4096_int64, int(c_getpagesize(), int64)))
   end function cdf_buf_reserve
+
+  subroutine cdf_buf_copy(d, doff, s, soff, n)
+    ! n bytes of s from byte soff to d at byte doff (0-based), with memcpy:
+    ! d and s may have been packed through their word views, and a copy
+    ! through the byte views could be reordered with those stores (see
+    ! cdf_buf_t). d and s are different buffers.
+    type(cdf_buf_t), intent(inout) :: d
+    type(cdf_buf_t), intent(in) :: s
+    integer(int64), intent(in) :: doff, soff, n
+    type(c_ptr) :: p
+    if (n <= 0) return
+    if (doff < 0 .or. soff < 0 .or. doff + n > d%cap .or. soff + n > s%cap) &
+      error stop 'cdf_buf_copy: byte range outside a buffer'
+    p = c_memcpy(c_loc(d%u8(doff + 1)), c_loc(s%u8(soff + 1)), int(n, c_size_t))
+  end subroutine cdf_buf_copy
 
   logical function hdr_from_fd(fd, f, b, nread, msg) result(ok)
     ! Read the header of the open file fd into the aligned buffer b (from
@@ -1035,6 +1133,7 @@ contains
     integer(int64), intent(in) :: boff, off, n
     integer(int64) :: got
     integer(c_long) :: k
+    type(c_ptr) :: p
     ok = .false.
     if (f%fd < 0) return
     got = 0
@@ -1047,7 +1146,8 @@ contains
       if (k == 0) exit
       got = got + k
     enddo
-    if (got < n) b%u8(boff + got + 1:boff + n) = 0_int8
+    ! memset, not a store through u8: the caller packs words into this buffer (see cdf_buf_t)
+    if (got < n) p = c_memset(c_loc(b%u8(boff + got + 1)), 0_c_int, int(n - got, c_size_t))
     ok = .true.
   end function cdf_read_page
 
@@ -1276,8 +1376,9 @@ contains
   end subroutine swap32_copy
 
   subroutine swap64_copy(s, d)
-    ! 64-bit values given as pairs of 32-bit words (host order, little-endian
-    ! words) -> big-endian bytes as 32-bit words: the halves swap places
+    ! 64-bit values as pairs of 32-bit words (host order: the low half first)
+    ! <-> big-endian bytes as 32-bit words: the halves swap places and each
+    ! is byte-reversed (the same operation both ways)
     integer(int32), intent(in), contiguous :: s(:)
     integer(int32), intent(inout), contiguous :: d(:)
     integer(int32), parameter :: M2 = int(z'00FF0000', int32), M3 = int(z'0000FF00', int32)
@@ -1291,31 +1392,81 @@ contains
     enddo
   end subroutine swap64_copy
 
+  subroutine r8_to_be_double(s, d)
+    ! real(8) -> big-endian doubles as pairs of words (the high half first)
+    real(real64), intent(in), contiguous, target :: s(:)
+    integer(int32), intent(inout), contiguous :: d(:)
+    integer(int32), target :: t(2 * CVCH)
+    integer(int64) :: i0, m, n
+    n = size(s, kind=int64)
+    do i0 = 1, n, CVCH
+      m = min(CVCH, n - i0 + 1)
+      call bits_copy(c_loc(t), c_loc(s(i0)), 8 * m)
+      call swap64_copy(t(1:2 * m), d(2 * i0 - 1:2 * (i0 + m - 1)))
+    enddo
+  end subroutine r8_to_be_double
+
+  subroutine r4_to_be_double(s, d)
+    ! real(4) -> real(8) (exact) -> big-endian doubles as pairs of words
+    real(real32), intent(in), contiguous :: s(:)
+    integer(int32), intent(inout), contiguous :: d(:)
+    integer(int32), target :: t(2 * CVCH)
+    real(real64), target :: g(CVCH)
+    integer(int64) :: i0, m, n
+    n = size(s, kind=int64)
+    do i0 = 1, n, CVCH
+      m = min(CVCH, n - i0 + 1)
+      g(1:m) = real(s(i0:i0 + m - 1), real64)
+      call bits_copy(c_loc(t), c_loc(g), 8 * m)
+      call swap64_copy(t(1:2 * m), d(2 * i0 - 1:2 * (i0 + m - 1)))
+    enddo
+  end subroutine r4_to_be_double
+
+  subroutine r4_to_be_float(s, d)
+    ! real(4) -> big-endian floats as words
+    real(real32), intent(in), contiguous, target :: s(:)
+    integer(int32), intent(inout), contiguous :: d(:)
+    integer(int32), target :: t(CVCH)
+    integer(int64) :: i0, m, n
+    n = size(s, kind=int64)
+    do i0 = 1, n, CVCH
+      m = min(CVCH, n - i0 + 1)
+      call bits_copy(c_loc(t), c_loc(s(i0)), 4 * m)
+      call swap32_copy(t(1:m), d(i0:i0 + m - 1))
+    enddo
+  end subroutine r4_to_be_float
+
+  subroutine r8_to_be_float(s, d)
+    ! real(8) -> real(4) (rounded as netCDF converts) -> big-endian floats as words
+    real(real64), intent(in), contiguous :: s(:)
+    integer(int32), intent(inout), contiguous :: d(:)
+    integer(int32), target :: t(CVCH)
+    real(real32), target :: f(CVCH)
+    integer(int64) :: i0, m, n
+    n = size(s, kind=int64)
+    do i0 = 1, n, CVCH
+      m = min(CVCH, n - i0 + 1)
+      f(1:m) = real(s(i0:i0 + m - 1), real32)
+      call bits_copy(c_loc(t), c_loc(f), 4 * m)
+      call swap32_copy(t(1:m), d(i0:i0 + m - 1))
+    enddo
+  end subroutine r8_to_be_float
+
   subroutine cdf_pack_r4(src, n, xtype, b, boff)
     ! n real(4) values into b at byte boff (a multiple of 4) as the file's
     ! type xtype (float, or double as netCDF converts), big-endian
     integer(int64), intent(in) :: n, boff
-    real(real32), intent(in), target :: src(*)
+    real(real32), intent(in) :: src(*)
     integer, intent(in) :: xtype
     type(cdf_buf_t), intent(inout) :: b
-    integer(int32), pointer :: s32(:)
-    real(real64), allocatable, target :: t8(:)
-    integer(int64), parameter :: CH = 1048576
-    integer(int64) :: w, i0, m
+    integer(int64) :: w
     if (n <= 0) return
     w = boff / 4
     select case (xtype)
     case (CDF_FLOAT)
-      call c_f_pointer(c_loc(src(1)), s32, [n])
-      call swap32_copy(s32(1:n), b%u32(w + 1:w + n))
+      call r4_to_be_float(src(1:n), b%u32(w + 1:w + n))
     case (CDF_DOUBLE)
-      allocate(t8(min(n, CH)))
-      call c_f_pointer(c_loc(t8(1)), s32, [2 * size(t8, kind=int64)])
-      do i0 = 1, n, CH
-        m = min(CH, n - i0 + 1)
-        t8(1:m) = real(src(i0:i0 + m - 1), real64)
-        call swap64_copy(s32(1:2 * m), b%u32(w + 2 * (i0 - 1) + 1:w + 2 * (i0 - 1) + 2 * m))
-      enddo
+      call r4_to_be_double(src(1:n), b%u32(w + 1:w + 2 * n))
     case default
       error stop 'cdf_pack_r4: file type not float or double'
     end select
@@ -1325,27 +1476,17 @@ contains
     ! n real(8) values into b at byte boff (a multiple of 4) as the file's
     ! type xtype (double, or float rounded as netCDF converts), big-endian
     integer(int64), intent(in) :: n, boff
-    real(real64), intent(in), target :: src(*)
+    real(real64), intent(in) :: src(*)
     integer, intent(in) :: xtype
     type(cdf_buf_t), intent(inout) :: b
-    integer(int32), pointer :: s32(:)
-    real(real32), allocatable, target :: t4(:)
-    integer(int64), parameter :: CH = 1048576
-    integer(int64) :: w, i0, m
+    integer(int64) :: w
     if (n <= 0) return
     w = boff / 4
     select case (xtype)
     case (CDF_DOUBLE)
-      call c_f_pointer(c_loc(src(1)), s32, [2 * n])
-      call swap64_copy(s32(1:2 * n), b%u32(w + 1:w + 2 * n))
+      call r8_to_be_double(src(1:n), b%u32(w + 1:w + 2 * n))
     case (CDF_FLOAT)
-      allocate(t4(min(n, CH)))
-      call c_f_pointer(c_loc(t4(1)), s32, [size(t4, kind=int64)])
-      do i0 = 1, n, CH
-        m = min(CH, n - i0 + 1)
-        t4(1:m) = real(src(i0:i0 + m - 1), real32)
-        call swap32_copy(s32(1:m), b%u32(w + i0:w + i0 + m - 1))
-      enddo
+      call r8_to_be_float(src(1:n), b%u32(w + 1:w + n))
     case default
       error stop 'cdf_pack_r8: file type not float or double'
     end select
@@ -1354,14 +1495,12 @@ contains
   subroutine cdf_pack_i4(src, n, b, boff)
     ! n default integers into b at byte boff (a multiple of 4) as netCDF int, big-endian
     integer(int64), intent(in) :: n, boff
-    integer(int32), intent(in), target :: src(*)
+    integer(int32), intent(in) :: src(*)
     type(cdf_buf_t), intent(inout) :: b
-    integer(int32), pointer :: s32(:)
     integer(int64) :: w
     if (n <= 0) return
     w = boff / 4
-    call c_f_pointer(c_loc(src(1)), s32, [n])
-    call swap32_copy(s32(1:n), b%u32(w + 1:w + n))
+    call swap32_copy(src(1:n), b%u32(w + 1:w + n))
   end subroutine cdf_pack_i4
 
   logical function cdf_header(path, f, msg) result(ok)

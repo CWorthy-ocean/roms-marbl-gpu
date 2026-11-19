@@ -69,7 +69,8 @@ module io_server
   use run_timers, only: wall_time
   use cdf_direct, only: cdf_file_t, cdf_buf_t, cdf_open_w, cdf_close_w, cdf_var_index, cdf_calcsize, &
                         cdf_set_numrecs, cdf_write, cdf_read_page, cdf_pack_r4, cdf_pack_r8, cdf_pack_i4, cdf_plan, &
-                        cdf_truncate, cdf_buf_reserve, cdf_buf_free, cdf_watchdog_set, CDF_INT, CDF_FLOAT, CDF_DOUBLE
+                        cdf_truncate, cdf_buf_reserve, cdf_buf_free, cdf_buf_copy, cdf_watchdog_set, CDF_INT, &
+                        CDF_FLOAT, CDF_DOUBLE
 #ifdef USE_CUDA
   use cudafor
   use arch_mod, only: work_stream
@@ -1088,7 +1089,7 @@ contains
         if (wseg(t) /= s) cycle
         hb = min(snb(t), (soff(t) / a + 1) * a - soff(t))
         if (rq(t) > 0) call MPI_Wait(reqs(rq(t)), MPI_STATUS_IGNORE, ierr)
-        pbuf%u8(soff(t) - base + 1:soff(t) - base + hb) = hrecv(t)%u8(1:hb)
+        call cdf_buf_copy(pbuf, soff(t) - base, hrecv(t), 0_8, hb)   ! memcpy: both were packed as words
       enddo
       c2 = wall_time()
       t_pack = t_pack + real(c2 - c1)

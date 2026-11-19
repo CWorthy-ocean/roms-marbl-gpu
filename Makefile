@@ -251,6 +251,29 @@ $(GPUDIR)/test_cdf_write: src/host/cdf_direct.F90 tests/test_cdf_write.F90 | $(G
 	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/host/cdf_direct.F90 -o $(GPUDIR)/cdf_direct.o
 	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -o $@ tests/test_cdf_write.F90 $(GPUDIR)/cdf_direct.o $(LIBS)
 
+# Both tests again at -O2 and -O3 (the other flags of FFLAGS_GPU kept; each binary has its own object and
+# module directory): the CPU port of cdf_direct gave wrong values at gfortran -O3 (a type-punned
+# conversion, ucla-roms #461), so the module must give the same bits at each level. Run each binary like
+# the ones above.
+#   make cdf_tests FFLAGS_GPU=... LIBS=...   (build_gpu/test_cdf_{direct,write}{,_O2,_O3})
+CDF_TEST_LEVELS = O2 O3
+CDF_OPT_FLAGS = -O -O0 -O1 -O2 -O3 -O4 -Ofast
+.PHONY: cdf_tests
+cdf_tests: $(GPUDIR)/test_cdf_direct $(GPUDIR)/test_cdf_write \
+           $(foreach l,$(CDF_TEST_LEVELS),$(GPUDIR)/test_cdf_direct_$(l) $(GPUDIR)/test_cdf_write_$(l))
+$(GPUDIR)/cdf_%.dir:
+	mkdir -p $@
+$(GPUDIR)/test_cdf_direct_%: src/host/cdf_direct.F90 tests/test_cdf_direct.F90 | $(GPUDIR)/cdf_direct_%.dir
+	$(FC_GPU) $(filter-out $(CDF_OPT_FLAGS),$(FFLAGS_GPU)) -$* -module $(GPUDIR)/cdf_direct_$*.dir \
+	  -c src/host/cdf_direct.F90 -o $(GPUDIR)/cdf_direct_$*.dir/cdf_direct.o
+	$(FC_GPU) $(filter-out $(CDF_OPT_FLAGS),$(FFLAGS_GPU)) -$* -module $(GPUDIR)/cdf_direct_$*.dir \
+	  -o $@ tests/test_cdf_direct.F90 $(GPUDIR)/cdf_direct_$*.dir/cdf_direct.o $(LIBS)
+$(GPUDIR)/test_cdf_write_%: src/host/cdf_direct.F90 tests/test_cdf_write.F90 | $(GPUDIR)/cdf_write_%.dir
+	$(FC_GPU) $(filter-out $(CDF_OPT_FLAGS),$(FFLAGS_GPU)) -$* -module $(GPUDIR)/cdf_write_$*.dir \
+	  -c src/host/cdf_direct.F90 -o $(GPUDIR)/cdf_write_$*.dir/cdf_direct.o
+	$(FC_GPU) $(filter-out $(CDF_OPT_FLAGS),$(FFLAGS_GPU)) -$* -module $(GPUDIR)/cdf_write_$*.dir \
+	  -o $@ tests/test_cdf_write.F90 $(GPUDIR)/cdf_write_$*.dir/cdf_direct.o $(LIBS)
+
 # Column-by-column check of the device MARBL interior kernels against the
 # unchanged MARBL code (host).
 $(GPUDIR)/test_marbl_interior: $(GPUDIR)/kinds_pre.o $(GPUDIR)/marbl_host.o tests/test_marbl_interior.F90 \
