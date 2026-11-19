@@ -298,6 +298,8 @@ v0.1.2-beta, bit for bit.
   adds each cell's column first and then the cells in global (j, i) order,
   the CPU's new tiling-independent order (the GPU's sum was already
   tiling-independent; multi-cell releases change at the rounding level).
+  The release volume is also set before the start-up diagnostics, as on
+  the CPU, so the initial history record's `omega` and `w` include it.
   Runs without CDR releases are unchanged bit for bit.
 
 ## Numerics
