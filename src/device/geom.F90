@@ -229,12 +229,13 @@ contains
     nx = decomp%nx
     ny = decomp%ny
     nz = decomp%nz
+    ! dtau: the step that the stage taking this W advances by
     if (nrhs == 3) then
-      dtau = dt
+      dtau = dt                         ! corrector (step3d_uv, step3d_t)
     elseif (is_first_time_step()) then
-      dtau = 0.5_rp * dt
+      dtau = 0.5_rp * dt                ! first predictor (pre_step3d)
     else
-      dtau = 0.6_rp * dt
+      dtau = (1.0_rp - AM3_crv) * dt    ! predictor (pre_step3d, lf_am3_weights)
     endif
     lim = dry_lim(G_GEOM)
     cvo = merge(1_ip, 0_ip, cdr_vol_on)
@@ -839,7 +840,7 @@ contains
     elseif (is_first_time_step()) then
       dtau = 0.5_rp * dt
     else
-      dtau = 0.6_rp * dt
+      dtau = (1.0_rp - AM3_crv) * dt    ! as omega
     endif
     cx0 = dtau * pm(i, j) * pn(i, j)
     wrk = 0.0_rp
