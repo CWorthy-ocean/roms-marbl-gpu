@@ -296,7 +296,7 @@ contains
         lok = cdf_buf_reserve(tb, ((snb(s) + 8) / 4096 + 1) * 4096)
         call pack_var(sidx(s), rec, file_type(wf(1), sidx(s)), tb, 0_int64)
         lok = cdf_buf_reserve(hbuf(s), 4096_int64)
-        hbuf(s)%u8(1:hb) = tb%u8(1:hb)
+        call cdf_buf_copy(hbuf(s), 0_int64, tb, 0_int64, hb)
       enddo
       ! each writer writes the pages of its segments
       do w = 0, nown - 1
@@ -319,7 +319,7 @@ contains
           do t = s + 1, nsg
             if (wseg(t) /= s) cycle
             hb = min(snb(t), (soff(t) / a + 1) * a - soff(t))
-            pb%u8(soff(t) - base + 1:soff(t) - base + hb) = hbuf(t)%u8(1:hb)
+            call cdf_buf_copy(pb, soff(t) - base, hbuf(t), 0_int64, hb)
           enddo
           lok = cdf_write(wf(w + 1), pb, (wp1(s) - fp) * a, wp1(s) * a, (wp2(s) - wp1(s) + 1) * a, 8192_int64)
           call chk(lok, trim(fname)//' cdf_write')
