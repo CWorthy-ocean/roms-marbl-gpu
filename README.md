@@ -300,6 +300,16 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- CDR volume releases (`cdr_volume`), as in UCLA ROMS (CWorthy-ocean/ucla-roms#469):
+  the output vertical velocity `w` (history and averages) now includes the
+  released water, as `omega` already did, so `w` changes above the release
+  cells; and the weight sum that normalizes each parameterized release now
+  adds each cell's column first and then the cells in global (j, i) order,
+  the CPU's new tiling-independent order (the GPU's sum was already
+  tiling-independent; multi-cell releases change at the rounding level).
+  The release volume is also set before the start-up diagnostics, as on
+  the CPU, so the initial history record's `omega` and `w` include it.
+  Runs without CDR releases are unchanged bit for bit.
 - Results change: `omega` sizes the predictor's split of the vertical
   velocity into an explicit and an implicit part for the step the
   predictor takes, `(1 - AM3_crv) dt` = 5/6 `dt` (`lf_am3_weights`),

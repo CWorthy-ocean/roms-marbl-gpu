@@ -14,7 +14,7 @@ module case_io
   use bry_io, only: init_bry, set_bry_all
   use tide_io, only: read_tide_namelist, init_tides, set_tides
   use river_io, only: read_river_namelist, init_rivers, set_rivers
-  use cdr_io, only: read_cdr_namelist, init_cdr
+  use cdr_io, only: read_cdr_namelist, init_cdr, set_cdr_pred
   use cdr_lite_io, only: read_cdr_lite_namelist, init_cdr_lite
   use cdr_lite_out, only: read_cdr_lite_output_namelist, set_cdr_lite_output_root, init_cdr_lite_output
   use random_out, only: read_random_namelist, set_random_output_root, init_random_output
@@ -854,6 +854,7 @@ contains
     call set_forces()
     call wall_stamp('first forcing records')
     call set_rivers(0)                ! river volume at time n for set_HUV (CPU: set_forces)
+    call set_cdr_pred()               ! CDR volume at time n for the initial omega and w (CPU: set_forces)
     call wall_stamp('first river records')
     call set_bry_all()
     call wall_stamp('first boundary records')
