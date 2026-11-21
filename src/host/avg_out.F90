@@ -15,22 +15,26 @@ module avg_out
   !    stamped with the running mean of the model time;
   !  - <root>_bgc_avg.<date>.nc: the MARBL tracers, a record every
   !    output_period_bgc_avg, stamped with the time at the write.
-  ! The tracers averaged are those the CPU flags (wrt_t_avg): with MARBL,
-  ! the tracers named in marbl_tracers_to_write, or every tracer when the
-  ! list is empty; temperature, salinity and the CDR_LITE tracers go to the
-  ! ocean file, the MARBL tracers to the BGC file. Without MARBL, none.
+  ! The tracers averaged are those the CPU flags (wrt_t_avg): temperature
+  ! and salinity when &ts_output_settings wrt_avg_temp / wrt_avg_salt are
+  ! set; with MARBL also the tracers named in marbl_tracers_to_write, or
+  ! every tracer when the list is empty (so with MARBL and an empty list,
+  ! T and S are averaged whatever wrt_avg_temp / wrt_avg_salt say, as on
+  ! the CPU). Temperature, salinity and the CDR_LITE tracers go to the
+  ! ocean file, the MARBL tracers to the BGC file.
   !
   ! As the CPU since ucla-roms #400: the start-up state is not a sample of
   ! the first BGC average window (with wrt_bgc_his on or off), so each
   ! record averages the steps of the period that ends at its time, and
   ! nrpf_bgc_avg records go in each file.
   use kinds
-  use his_io, only: output_fname, refdatestr
+  use his_io, only: output_fname, refdatestr, wrt_avg_temp, wrt_avg_salt
   use decomp_mod
   use gpu_state
   use time_state
   use nc_io
   use implicit_fs_gpu, only: fs_global_atts
+  use sponge_io, only: sponge_global_atts
   use io_server, only: IO_KIND_AVG, IO_KIND_BGCAVG, io_init, io_init8, io_stage8_begin, io_stage8_2d, &
                        io_stage8_3d, io_stage8_3d_pt, io_stage8_end
   ! BGC tracer subcycling keys of &bgc_settings (UCLA ROMS after 0.14.0, #428),
@@ -39,7 +43,7 @@ module avg_out
                               bgc_subcycle_diag
   use comm_mod, only: comm_rank, compute_barrier
   use passive_mod, only: ntp, n_marbl, tp, passive_name, ncdr, cdr0, n_oae
-  use marbl_gpu, only: marbl_on, marbl_trc_list
+  use marbl_gpu, only: marbl_on, marbl_trc_list, xco2_default
   use marbl_host, only: marbl_tracer_units, marbl_tracer_lnames
   use wvlcty_mod, only: wvlcty_compute
 #ifdef USE_CUDA
@@ -88,7 +92,7 @@ contains
     integer, intent(in) :: unit
     integer :: ios
     real(rp) :: output_period_rst, output_period_his
-    integer :: nrpf_his, nbgc_flx, nrpf_bgc_his, nrpf_bgc_his_dia, nrpf_bgc_avg_dia
+    integer :: nrpf_his, nrpf_bgc_his, nrpf_bgc_his_dia, nrpf_bgc_avg_dia
     logical :: wrt_file_rst, wrt_file_his, monthly_restarts, wrt_Z, wrt_Ub, wrt_Vb, wrt_U, wrt_V, &
                wrt_R, wrt_O, wrt_W, wrt_Akv, wrt_Akt, wrt_aks, wrt_Hbls, wrt_Hbbl
     logical :: wrt_avg_Z, wrt_avg_Ub, wrt_avg_Vb, wrt_avg_U, wrt_avg_V, wrt_avg_R, wrt_avg_O, wrt_avg_W, &
@@ -103,7 +107,7 @@ contains
     namelist /bgc_settings/ wrt_bgc_his, wrt_bgc_avg, wrt_bgc_dia_his, wrt_bgc_dia_avg, interp_bgc_frc, &
          output_period_bgc_his, nrpf_bgc_his, output_period_bgc_avg, nrpf_bgc_avg, &
          output_period_bgc_his_dia, nrpf_bgc_his_dia, output_period_bgc_avg_dia, nrpf_bgc_avg_dia, &
-         nbgc_flx, xco2air_default, bgc_physics_subcycle, bgc_physics_timestep, bgc_subcycle_pos, &
+         xco2air_default, bgc_physics_subcycle, bgc_physics_timestep, bgc_subcycle_pos, &
          bgc_subcycle_diag
     wrt_avg_Z = .true.; wrt_avg_Ub = .true.; wrt_avg_Vb = .true.; wrt_avg_U = .true.; wrt_avg_V = .true.
     wrt_avg_R = .true.; wrt_avg_O = .true.; wrt_avg_W = .true.; wrt_avg_Akv = .true.; wrt_avg_Akt = .true.
@@ -114,12 +118,17 @@ contains
     wz = wrt_avg_Z; wub = wrt_avg_Ub; wvb = wrt_avg_Vb; wu = wrt_avg_U; wv = wrt_avg_V; wr = wrt_avg_R
     wo = wrt_avg_O; ww = wrt_avg_W; wakv = wrt_avg_Akv; wakt = wrt_avg_Akt; waks = wrt_avg_Aks
     whbl = wrt_avg_Hbls; whbbl = wrt_avg_Hbbl
+    xco2air_default = 284.7_rp     ! ppm, the CPU's default (see NAMELIST_COMPAT)
     rewind(unit)
     read(unit, nml=bgc_settings, iostat=ios)
     if (ios > 0) error stop 'read_avg_namelist: bgc_settings'
     if (ios < 0) then
       wrt_bgc_avg = .false.; wrt_bgc_his = .false.
     endif
+    ! MARBL's atmospheric xCO2 (and the ALT_CO2 one) where the forcing has
+    ! no xco2_air (xco2_air_alt): the CPU's xco2air_default without
+    ! PCO2AIR_FORCING (marbl_gpu)
+    xco2_default = xco2air_default
   end subroutine read_avg_namelist
 
   subroutine set_avg_root(out_root)
@@ -129,14 +138,16 @@ contains
   end subroutine set_avg_root
 
   subroutine select_tracers(sel_ts, sel_cdr, sel_marbl)
-    ! The CPU's wrt_t_avg: the names in marbl_tracers_to_write (up to the
-    ! first blank entry) among all tracers, or all tracers when the list
-    ! is empty; nothing without MARBL. sel_cdr covers the tracers after
-    ! MARBL in tp (generic passives, then CDR_LITE: the CPU's order),
-    ! tp indices n_marbl+1 .. ntp.
+    ! The CPU's wrt_t_avg: temperature and salinity by wrt_avg_temp and
+    ! wrt_avg_salt (tracers.F90); with MARBL also (or) the names in
+    ! marbl_tracers_to_write (up to the first blank entry) among all
+    ! tracers, or all tracers when the list is empty (marbl_driver.F90).
+    ! sel_cdr covers the tracers after MARBL in tp (generic passives, then
+    ! CDR_LITE: the CPU's order), tp indices n_marbl+1 .. ntp.
     logical, intent(out) :: sel_ts(2), sel_cdr(max(int(ntp - n_marbl), 1)), sel_marbl(max(int(n_marbl), 1))
     integer :: l, m
-    sel_ts = .false.; sel_cdr = .false.; sel_marbl = .false.
+    sel_ts(1) = wrt_avg_temp; sel_ts(2) = wrt_avg_salt
+    sel_cdr = .false.; sel_marbl = .false.
     if (.not. marbl_on) return
     if (len_trim(marbl_trc_list(1)) == 0) then
       sel_ts = .true.; sel_cdr = .true.; sel_marbl = .true.
@@ -610,6 +621,7 @@ contains
     call nc_put_att_text(ncid, '', 'averaging_timescale', trim(adjustl(ts))//' seconds')
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu averages')
     call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
+    call sponge_global_atts(ncid)   ! sponge layer (&v_sponge_settings)
     call nc_enddef(ncid)
     call nc_close(ncid)
     write(*,'(a,a)') 'created averages file: ', trim(path)
@@ -635,6 +647,7 @@ contains
     enddo
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu BGC averages')
     call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
+    call sponge_global_atts(ncid)   ! sponge layer (&v_sponge_settings)
     call nc_enddef(ncid)
     call nc_close(ncid)
     write(*,'(a,a)') 'created BGC averages file: ', trim(path)

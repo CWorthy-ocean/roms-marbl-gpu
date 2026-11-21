@@ -146,23 +146,27 @@ contains
     if (present(verbose)) verb = verbose
 
     ! Settings: every line of the config file goes through put_setting,
-    ! exactly as the CPU driver does (an empty/missing file = MARBL defaults).
-    inquire(file=config_file, exist=exists)
-    if (exists) then
-      open(newunit=unit, file=config_file, status='old', action='read', iostat=ios)
-      if (ios == 0) then
-        do
-          read(unit, '(A)', iostat=ios) line
-          if (ios /= 0) exit
-          call mi%put_setting(line)
-          if (verb .and. line(1:1) /= '!' .and. len_trim(line) > 0) &
-               write(*,'(a,": ",a)') trim(config_file), trim(line)
-        enddo
-        close(unit)
-      endif
+    ! exactly as the CPU driver does. An empty name = MARBL defaults; a file
+    ! that cannot be opened stops the run, as on the CPU.
+    if (len_trim(config_file) == 0) then
+      if (verb) write(*,'(a)') 'marbl_host: marbl_config_file = "": using MARBL defaults'
     else
-      if (verb) write(*,'(3a)') 'marbl_host: config file ', trim(config_file), &
-           ' not found; using MARBL defaults'
+      inquire(file=config_file, exist=exists)
+      ios = 1
+      if (exists) open(newunit=unit, file=config_file, status='old', action='read', iostat=ios)
+      if (ios /= 0) then
+        write(*,'(3a)') 'marbl_host: cannot open MARBL settings file ', trim(config_file), &
+             ' (marbl_config_file); set marbl_config_file = "" to run MARBL with its default settings'
+        error stop 'marbl_host_init: marbl_config_file'
+      endif
+      do
+        read(unit, '(A)', iostat=ios) line
+        if (ios /= 0) exit
+        call mi%put_setting(line)
+        if (verb .and. line(1:1) /= '!' .and. len_trim(line) > 0) &
+             write(*,'(a,": ",a)') trim(config_file), trim(line)
+      enddo
+      close(unit)
     endif
 
     allocate(dummy(nz)); dummy = 1.0_r8
