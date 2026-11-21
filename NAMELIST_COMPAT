@@ -7,19 +7,78 @@
 # group it reads stops the run at start-up, naming the group (before, the rest
 # of that group silently kept its defaults).
 #
-# Keys added in later UCLA ROMS releases that roms_gpu does not read (the run
-# stops if they are present):
+# Keys added in later UCLA ROMS releases that roms_gpu reads (after
+# v0.1.3-beta; before, a namelist with them stopped at the read):
 #   0.12.0  &cdr_lite_settings  cdr_carbonate_sensitivity_time_interpolation
+#           as UCLA ROMS: .true. (default) interpolates ddic_dco2 and
+#           ddic_dalk linearly in time; .false. holds each record until the
+#           model time passes the next one (the first step of a run takes
+#           the record at or before its time), without the missing-record
+#           rule (the CPU applies it only with interpolation).
 #   0.13.0  &v_sponge_settings  v_sponge_trc
+#           as UCLA ROMS: the maximum tracer diffusivity of the sponge
+#           layer (m^2/s); negative or absent: v_sponge; 0: a sponge on the
+#           currents only. Every tracer (T, S, the passive, CDR_LITE and
+#           MARBL tracers) gets it. v_sponge = 0 with v_sponge_trc > 0
+#           gives a sponge on the tracers only. Output files carry the
+#           global attributes v_sponge, v_sponge_trc and their _units, as
+#           UCLA ROMS.
 #
 # GPU-only additions: the optional group &tile_settings (tile balancing),
 # &passive_tracers (n_passive, init_mode, write_passive), and in
-# &param_settings the keys n, nsub_x, nsub_e and ntrc_bio.
+# &param_settings the key n. Removed after v0.1.3-beta (unused; a namelist
+# that sets them now stops at the read): &param_settings nsub_x, nsub_e and
+# ntrc_bio (not UCLA ROMS keys), &bgc_settings nbgc_flx (UCLA ROMS still
+# reads it, unused, and its template does not set it). The GPU-only groups
+# &flux_frc_settings and &bulk_frc_settings (unused copies of
+# &surf_frc_settings keys) are no longer read, so they are ignored.
+#
+# UCLA ROMS settings that roms_gpu reads but cannot honour stop the run at
+# start-up with a message naming the key (after v0.1.3-beta; before, they
+# were ignored or, for diag_uv and diag_trc, gave a warning):
+#   &ts_output_settings        wrt_temp_dia, wrt_salt_dia = .true.
+#   &diagnostics_settings      diag_uv, diag_trc = .true.
+#   &surf_flx_output_settings  wrt_swflx = .true.
+#   &bgc_settings              wrt_bgc_dia_his = .true. (no _bgc_dia file;
+#                              wrt_bgc_dia_avg = .true. already stopped)
+#   &implicit_fs               fs_selftest > 0 with fs_mode = 'implicit'
+#                              (UCLA ROMS runs the self-test only there)
+#   &marbl_biogeochemistry_settings
+#     marbl_diagnostics_to_write: a name outside the fixed set the GPU
+#     writes to _his (PH, pCO2SURF, DpCO2, FG_CO2, FG_ALT_CO2, PH_ALT_CO2,
+#     pCO2SURF_ALT_CO2, zsatcalc, zsatarag, CO3, CO3_ALT_CO2,
+#     co3_sat_calc, co3_sat_arag). An empty list (UCLA ROMS: all) is
+#     accepted. On UCLA ROMS the list selects the _bgc_dia files' fields.
+#     marbl_config_file: a non-empty name of a file that does not exist
+#     (before, the GPU ran MARBL with its default settings); "" runs MARBL
+#     with its defaults, as UCLA ROMS. The path is relative to the
+#     namelist file.
+#
+# &surf_frc_settings check_bulk_frc_units = .true. (after v0.1.3-beta;
+# before, ignored): as UCLA ROMS, with bulk forcing, after the first step's
+# fluxes the units attribute of qair must be 'kg/kg' and of rain 'cm/day'
+# in the file of the record read last; otherwise the run stops. No effect
+# with flux forcing.
+#
+# Averages of temperature and salinity: &ts_output_settings wrt_avg_temp
+# and wrt_avg_salt (default .false., as UCLA ROMS) put temp and salt in the
+# _avg file. As on UCLA ROMS, with MARBL the tracers selected by
+# marbl_tracers_to_write are averaged too: an empty list (every tracer) or
+# a list naming temp or salt averages them whatever wrt_avg_temp and
+# wrt_avg_salt say. Before, the GPU averaged T and S only through that
+# list (without MARBL, never), which the default .false. keeps.
+#
+# Atmospheric xCO2 for MARBL: &bgc_settings xco2air_default (ppm, default
+# 284.7) is used where the forcing files hold no xco2_air (xco2_air_alt
+# for the ALT_CO2 system), as UCLA ROMS without PCO2AIR_FORCING. Before,
+# the GPU read the key and used a fixed 284.7.
 #
 # Surface restoring: UCLA ROMS selects it with cpp keys, which the GPU model
-# cannot see; roms_gpu switches it on with GPU-only logical keys in
+# cannot see; roms_gpu switches it on with logical keys in
 # &surf_frc_settings (default .false., bulk forcing only), and reads the
-# coefficient from the same group as UCLA ROMS:
+# coefficient from the same group as UCLA ROMS. UCLA ROMS (cpp-to-namelist
+# branch, unreleased) also accepts these three keys and stops when one
+# disagrees with its cpp key, so a namelist can carry them for both models:
 #   CPU cpp key        roms_gpu &surf_frc_settings   coefficient group (cm/day)
 #   SFLX_CORR          sflx_corr = .true.             &sss_correction dSSSdt
 #   QCORRECTION        qcorrection = .true.           &sst_correction dSSTdt
@@ -71,7 +130,8 @@
 # fs_cor_metric, fs_pot_time, fs_pg_rho, fs_flather_zghost (fs_rho_inf =
 # 0, fs_nsub = 1, fs_pg_rho = fs_flather_zghost = .false. give the earlier
 # single step); UCLA ROMS's MPI-layout keys fs_mg_gather, fs_mg_global_on
-# and fs_exch_thin are read and not used, fs_selftest is read and ignored.
+# and fs_exch_thin are read and not used; fs_selftest > 0 stops the run
+# (the GPU has no solver self-test).
 # GPU tuning settings (roms_gpu only): fs_gpu_gather, fs_gpu_coarse,
 # fs_gpu_graph and fs_gpu_opt (layout and latency of the solve),
 # fs_gpu_timers (timing runs: FS_COST, FS_WIN). fs_stress_time is no

@@ -9,8 +9,9 @@ module feature_guard
   ! reject. Every rank scans it (a few kB), so all ranks, writers included,
   ! stop together; world rank 0 prints the report.
   !
-  ! Switches that act on the CPU only together with a cpp key the GPU cannot
-  ! see (DIAGNOSTICS) print a warning instead of stopping.
+  ! Also checked here: switches in groups the GPU reads that it cannot honour
+  ! (&bgc_settings, &ts_output_settings). The budget
+  ! diagnostics (DIAGNOSTICS cpp key on the CPU) stop too.
   ! (&calc_pflx_settings calc_pflx is on the GPU: pflx_mod; &sponge_tune_settings
   ! ub_tune: sponge_io.)
   use comm_mod, only: comm_world_rank
@@ -27,12 +28,12 @@ contains
 
   subroutine check_namelist_features(path)
     character(len=*), intent(in) :: path
-    integer :: nerr, nwarn
+    integer :: nerr
     logical :: talk
 
     if (.not. load_text(path)) return   ! a missing namelist is reported by load_case
     talk = (comm_world_rank() == 0)
-    nerr = 0; nwarn = 0
+    nerr = 0
 
     ! Not on the GPU: stop.
     if (is_true('river_frc_settings', 'river_source')) &
@@ -41,7 +42,6 @@ contains
     ! every CDR forcing mode (cdr_frc_settings) is on the GPU
     if (is_true('cdr_output_settings', 'do_cdr_output')) &
       call need_off('cdr_output_settings', 'cdr_monthly_averages', 'monthly CDR averages')
-    call need_off('cdr_tracer_output_settings', 'do_cdr_tracer_output', 'CDR tracer output')
     if (is_true('cdr_gas_exch_output_settings', 'do_cdr_gas_exch_output')) &
       call need_off('cdr_gas_exch_output_settings', 'cdr_gas_monthly_averages', 'monthly CDR gas-exchange averages')
     if (is_true('cdr_lite_output_settings', 'do_cdr_lite_output')) &
@@ -53,18 +53,19 @@ contains
     call need_off('surf_flx_output_settings', 'wrt_smflx', 'surface momentum flux output')
     call need_off('surf_flx_output_settings', 'wrt_stflx', 'surface tracer flux output')
     call need_off('surf_flx_output_settings', 'wrt_rstflx', 'surface restoring flux output')
+    call need_off('surf_flx_output_settings', 'wrt_swflx', 'surface water flux (P-E) output')
     call need_off('basic_output_settings', 'monthly_restarts', 'monthly restarts')
+    call need_off('bgc_settings', 'wrt_bgc_dia_his', 'the BGC diagnostics history file (_bgc_dia;'// &
+                  ' the GPU writes a fixed set of MARBL diagnostics to _his)')
     call need_off('bgc_settings', 'wrt_bgc_dia_avg', 'BGC diagnostic averages output')
+    call need_off('ts_output_settings', 'wrt_temp_dia', 'temperature budget diagnostics output')
+    call need_off('ts_output_settings', 'wrt_salt_dia', 'salinity budget diagnostics output')
     call need_off('tidal_frc_settings', 'ana_tides', 'analytical tides')
     call need_off('tides_settings', 'ana_tides', 'analytical tides')
+    call need_off('diagnostics_settings', 'diag_uv', 'momentum budget diagnostics (DIAGNOSTICS cpp key on the CPU)')
+    call need_off('diagnostics_settings', 'diag_trc', 'tracer budget diagnostics (DIAGNOSTICS cpp key on the CPU)')
 
-    ! Inert on the CPU without a cpp key, or nesting-only: warn.
-    call warn_on('diagnostics_settings', 'diag_uv', &
-                 'momentum budget diagnostics (DIAGNOSTICS cpp key on the CPU) are not on the GPU')
-    call warn_on('diagnostics_settings', 'diag_trc', &
-                 'tracer budget diagnostics (DIAGNOSTICS cpp key on the CPU) are not on the GPU')
-
-    if (talk .and. nerr + nwarn > 0) flush(6)
+    if (talk .and. nerr > 0) flush(6)
     deallocate(txt)
     if (nerr > 0) then
       if (talk) then
@@ -85,13 +86,6 @@ contains
       if (talk) write(*,'(7a)') 'ERROR: &', group, ' ', key, ' = .true.: ', what, &
                                 ' is not available on the GPU model.'
     end subroutine need_off
-
-    subroutine warn_on(group, key, what)
-      character(len=*), intent(in) :: group, key, what
-      if (.not. is_true(group, key)) return
-      nwarn = nwarn + 1
-      if (talk) write(*,'(6a)') 'WARNING: &', group, ' ', key, ' = .true.: ', what
-    end subroutine warn_on
 
   end subroutine check_namelist_features
 
