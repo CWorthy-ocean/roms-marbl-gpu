@@ -159,7 +159,8 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   saturation depths zsatcalc and zsatarag, and the 3-D CO3, CO3_ALT_CO2,
   co3_sat_calc and co3_sat_arag; `_bgc_avg` averages the tracers named in
   `marbl_tracers_to_write`. There is no separate `_bgc` or `_bgc_dia`
-  stream.
+  stream: `wrt_bgc_dia_his`, `wrt_bgc_dia_avg` and a
+  `marbl_diagnostics_to_write` entry outside the fields above stop the run.
 - **Namelist versions:** `NAMELIST_COMPAT` gives the UCLA ROMS namelist
   each release reads (0.11.0 so far) and the later keys it does not.
 - **Output files** are named as UCLA ROMS names them,
@@ -217,6 +218,37 @@ v0.1.2-beta, bit for bit.
 
 ## Changes after v0.1.3-beta
 
+- Namelist: UCLA ROMS settings that the GPU model reads but cannot honour
+  now stop the run at start-up, naming the key, instead of being ignored:
+  `wrt_temp_dia`, `wrt_salt_dia`, `diag_uv`, `diag_trc` (before: a
+  warning), `wrt_swflx` and `wrt_bgc_dia_his` set to `.true.`,
+  `fs_selftest > 0` with the implicit free surface, a
+  `marbl_diagnostics_to_write` entry the GPU does not write, and a
+  `marbl_config_file` that does not exist (before, MARBL ran with its
+  default settings; `marbl_config_file = ""` still does that).
+- Namelist: the UCLA ROMS keys `v_sponge_trc` (`&v_sponge_settings`),
+  `cdr_carbonate_sensitivity_time_interpolation` (`&cdr_lite_settings`),
+  `wrt_avg_temp` and `wrt_avg_salt` (`&ts_output_settings`) are read and
+  act as in UCLA ROMS, so its namelist template no longer stops at the
+  read for them. `v_sponge_trc` gives the tracers a sponge of their own
+  (negative or absent: `v_sponge`, so existing runs are unchanged; 0: the
+  currents only), and the output files carry `v_sponge` and `v_sponge_trc`
+  as global attributes. `cdr_carbonate_sensitivity_time_interpolation =
+  .false.` holds each `ddic_dco2` / `ddic_dalk` record instead of
+  interpolating in time. `&surf_frc_settings check_bulk_frc_units =
+  .true.` checks the units of `qair` and `rain` at the first bulk forcing
+  step (before, ignored). `wrt_avg_temp` / `wrt_avg_salt` write
+  temperature / salinity to the `_avg` file, also without MARBL; with
+  MARBL, `marbl_tracers_to_write` still selects them as before (an empty
+  list averages every tracer), as in UCLA ROMS. Their default `.false.`
+  leaves the output of existing namelists unchanged.
+- MARBL: `&bgc_settings xco2air_default` sets the atmospheric xCO2 where the
+  forcing holds no `xco2_air` (before, a fixed 284.7 ppm, which is also
+  the default, so results change only where a namelist sets another value).
+- Removed namelist keys (a namelist that sets them now stops at the read):
+  `&param_settings nsub_x`, `nsub_e`, `ntrc_bio` and `&bgc_settings
+  nbgc_flx`, all unused. The unused GPU-only groups `&flux_frc_settings`
+  and `&bulk_frc_settings` are no longer read (ignored).
 - Pressure fluxes for nesting (`&calc_pflx_settings calc_pflx`): the
   depth-integrated internal-tide energy flux `up`/`vp` of the parent,
   written to the child boundary file (`up_<side>`, `vp_<side>`) as UCLA ROMS

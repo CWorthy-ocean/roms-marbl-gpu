@@ -16,7 +16,7 @@ module his_io
   use passive_mod, only: ntp, tp, wrt_passive, passive_name
   use rivers_mod, only: river_on
   use pflx_mod, only: calc_pflx, u_slow, v_slow, p_slow
-  use sponge_io, only: def_rst_ub, stage_rst_ub, put_rst_ub
+  use sponge_io, only: def_rst_ub, stage_rst_ub, put_rst_ub, sponge_global_atts
   use wvlcty_mod, only: wvlcty_compute
   use marbl_gpu, only: marbl_on, marbl_gpu_nhis, marbl_gpu_nhis3, marbl_gpu_define_his, marbl_gpu_stage_his, &
                        marbl_gpu_define_rst, marbl_gpu_write_rst, marbl_gpu_stage_rst8
@@ -38,6 +38,9 @@ module his_io
   logical  :: wrt_Akv = .true., wrt_Akt = .true., wrt_Aks = .true.
   logical  :: wrt_Hbls = .true., wrt_Hbbl = .true.
   logical  :: wrt_temp = .true., wrt_salt = .true.
+  ! &ts_output_settings: temperature and salinity in the averages file
+  ! (avg_out), as the CPU's wrt_t_avg; .false. when absent, as the CPU.
+  logical, public :: wrt_avg_temp = .false., wrt_avg_salt = .false.
 
   character(len=512) :: output_root = './output'
   character(len=256) :: output_title = 'roms_gpu'
@@ -94,7 +97,9 @@ contains
          wrt_avg_Z, wrt_avg_Ub, wrt_avg_Vb, wrt_avg_U, wrt_avg_V, wrt_avg_R, &
          wrt_avg_O, wrt_avg_W, wrt_avg_Akv, wrt_avg_Akt, wrt_avg_Aks, &
          wrt_avg_Hbls, wrt_avg_Hbbl
-    namelist /ts_output_settings/ wrt_temp, wrt_salt, wrt_temp_dia, wrt_salt_dia
+    ! wrt_temp_dia, wrt_salt_dia: read so that a CPU namelist reads; .true.
+    ! stops the run (feature_guard)
+    namelist /ts_output_settings/ wrt_temp, wrt_salt, wrt_avg_temp, wrt_avg_salt, wrt_temp_dia, wrt_salt_dia
 
     output_period_his = 100.0_rp
     output_period_rst = 2000.0_rp
@@ -116,6 +121,7 @@ contains
     wrt_avg_Akt = .true.; wrt_avg_Aks = .true.
     wrt_avg_Hbls = .true.; wrt_avg_Hbbl = .true.
     wrt_temp = .true.; wrt_salt = .true.
+    wrt_avg_temp = .false.; wrt_avg_salt = .false.
     wrt_temp_dia = .false.; wrt_salt_dia = .false.
 
     rewind(unit)
@@ -457,6 +463,7 @@ contains
     if (marbl_on) call marbl_gpu_define_his(ncid, d_xi, d_eta, d_s, d_t)
     call nc_put_att_text(ncid, '', 'title', output_title)
     call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
+    call sponge_global_atts(ncid)   ! sponge layer (&v_sponge_settings)
     call nc_put_att_text(ncid, '', 'history_precision', 'float32 (staged on the GPU)')
     call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
@@ -538,6 +545,7 @@ contains
     call def_rst_ub(ncid, d_xi, d_eta, d_t)
     call nc_put_att_text(ncid, '', 'title', output_title)
     call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
+    call sponge_global_atts(ncid)   ! sponge layer (&v_sponge_settings)
     call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
     call nc_enddef(ncid)

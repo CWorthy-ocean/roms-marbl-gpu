@@ -29,6 +29,10 @@ module sponge_io
   implicit none
   private
   public :: adjust_orlanski, def_rst_ub, stage_rst_ub, put_rst_ub, load_rst_ub, init_spn_arrays
+  ! The sponge layer's maxima (&v_sponge_settings; case_io), written as
+  ! global attributes of every output file, as the CPU's put_global_atts
+  public :: set_sponge_global_atts, sponge_global_atts
+  real(rp) :: gatt_v_sponge = 0.0_rp, gatt_v_sponge_trc = 0.0_rp
   ! for sponge_out (the _spn file): the child flux of the step, the averages
   ! (or the step's values without sponge_avg) and the average counter
   public :: cf_w, cf_e, cf_s, cf_n, cfa_w, cfa_e, cfa_s, cfa_n, pfa_w, pfa_e, pfa_s, pfa_n
@@ -43,6 +47,30 @@ module sponge_io
   character(len=8), parameter :: ub_name(4) = (/'ub_west ', 'ub_east ', 'ub_south', 'ub_north'/)
 
 contains
+
+  subroutine set_sponge_global_atts(v_sponge, v_sponge_trc)
+    ! v_sponge_trc resolved (v_sponge when the namelist value is negative)
+    real(rp), intent(in) :: v_sponge, v_sponge_trc
+    gatt_v_sponge = v_sponge
+    gatt_v_sponge_trc = v_sponge_trc
+  end subroutine set_sponge_global_atts
+
+  subroutine sponge_global_atts(ncid)
+    ! The CPU's put_global_atts (SPONGE): v_sponge, v_sponge_units,
+    ! v_sponge_trc, v_sponge_trc_units. Called with fs_global_atts by every
+    ! output module (compute rank 0, which has read the namelist).
+    use netcdf, only: nf90_put_att, nf90_global, nf90_noerr, nf90_strerror
+    integer, intent(in) :: ncid
+    integer :: ierr
+    ierr = nf90_put_att(ncid, nf90_global, 'v_sponge', real(gatt_v_sponge, 8))
+    if (ierr == nf90_noerr) ierr = nf90_put_att(ncid, nf90_global, 'v_sponge_units', 'm^2/s')
+    if (ierr == nf90_noerr) ierr = nf90_put_att(ncid, nf90_global, 'v_sponge_trc', real(gatt_v_sponge_trc, 8))
+    if (ierr == nf90_noerr) ierr = nf90_put_att(ncid, nf90_global, 'v_sponge_trc_units', 'm^2/s')
+    if (ierr /= nf90_noerr) then
+      write(*,'(1x,A,A)') 'sponge_global_atts: ', trim(nf90_strerror(ierr))
+      error stop 'sponge_global_atts: netCDF error'
+    endif
+  end subroutine sponge_global_atts
 
   subroutine init_spn_arrays()
     ! After alloc_state; zero (the corners and the off-edge parts stay 0).

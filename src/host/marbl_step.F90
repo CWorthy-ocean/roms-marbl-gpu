@@ -35,7 +35,9 @@ module marbl_gpu
   character(len=512), public :: marbl_config_file = 'marbl_in'
   real(rp), public :: marbl_timestep = 3600.0_rp
   integer(ip), public :: marbl_timestep_ratio = 1
-  real(rp), public :: xco2_default = 284.7_rp       ! ppm when no xco2 forcing (CPU default)
+  ! ppm where the forcing has no xco2_air / xco2_air_alt: &bgc_settings
+  ! xco2air_default (set by avg_out, which reads the group)
+  real(rp), public :: xco2_default = 284.7_rp
   ! Constant iron (CPU marbl_driver): with use_constant_Fe, MARBL's Fe is held
   ! at constant_Fe_value (mmol/m3) at every wet point (passive_hold): after
   ! the initial state is loaded, before each MARBL call and after each
@@ -89,9 +91,10 @@ contains
     integer, intent(in) :: unit
     character(len=*), intent(in) :: nml_dir
     integer(ip), intent(in) :: nt_bgc
-    integer :: ios
+    integer :: ios, l, k
     character(len=512) :: cfg
     real(rp) :: tstep
+    logical :: exists, ok
     character(len=32) :: marbl_tracers_to_write(64)
     character(len=400) :: marbl_diagnostics_to_write(64)
     namelist /marbl_biogeochemistry_settings/ marbl_config_file, marbl_timestep, &
@@ -108,12 +111,38 @@ contains
     read(unit, nml=marbl_biogeochemistry_settings, iostat=ios)
     if (ios > 0) error stop 'marbl_biogeochemistry_settings: read error'
     marbl_trc_list = marbl_tracers_to_write
+    ! The CPU writes the listed MARBL diagnostics ("" = all) to its _bgc_dia
+    ! files; the GPU writes a fixed set to _his (his_name, his2i_name,
+    ! his3_name). An empty list is accepted; a named diagnostic outside the
+    ! fixed set stops the run.
+    do l = 1, size(marbl_diagnostics_to_write)
+      if (len_trim(marbl_diagnostics_to_write(l)) == 0) exit
+      ok = any(his_name == marbl_diagnostics_to_write(l)) .or. any(his2i_name == marbl_diagnostics_to_write(l)) &
+           .or. any(his3_name == marbl_diagnostics_to_write(l))
+      if (.not. ok) then
+        write(*,'(3a)') 'MARBL_BIOGEOCHEMISTRY_SETTINGS: marbl_diagnostics_to_write names ', &
+             trim(marbl_diagnostics_to_write(l)), ', which the GPU model does not write. It writes'
+        write(*,'(a,*(1x,a))') '  these MARBL diagnostics (to _his):', (trim(his_name(k)), k = 1, NHIS), &
+             (trim(his2i_name(k)), k = 1, NHIS2I), (trim(his3_name(k)), k = 1, NHIS3)
+        error stop 'read_marbl_namelist: marbl_diagnostics_to_write not available'
+      endif
+    enddo
     if (use_constant_Fe) then
       if (constant_Fe_value < 0.0_rp) error stop 'use_constant_Fe: constant_Fe_value must be non-negative'
       write(*,'(a,es12.5,a)') 'MARBL Fe held constant at ', constant_Fe_value, ' (use_constant_Fe)'
     endif
+    ! "" runs MARBL with its defaults; a named file that does not exist
+    ! stops the run, as on the CPU (path relative to the namelist directory)
     cfg = marbl_config_file
-    if (cfg(1:1) /= '/') marbl_config_file = trim(nml_dir)//'/'//trim(cfg)
+    if (len_trim(cfg) > 0) then
+      if (cfg(1:1) /= '/') marbl_config_file = trim(nml_dir)//'/'//trim(cfg)
+      inquire(file=trim(marbl_config_file), exist=exists)
+      if (.not. exists) then
+        write(*,'(3a)') 'MARBL_BIOGEOCHEMISTRY_SETTINGS: marbl_config_file ', trim(marbl_config_file), &
+             ' does not exist; set marbl_config_file = "" to run MARBL with its default settings'
+        error stop 'read_marbl_namelist: marbl_config_file not found'
+      endif
+    endif
     tstep = marbl_timestep
     write(*,'(a,i0,a,a,a,f8.1)') 'MARBL on: nt_bgc = ', nt_bgc, '  config ', trim(marbl_config_file), &
          '  requested timestep ', tstep
