@@ -138,6 +138,9 @@ contains
     dev_glob = (trim(fs_gpu_coarse) == 'device')
     if (fs_gpu_opt < 0 .or. fs_gpu_opt > 65535) error stop 'IMPLICIT_FS: fs_gpu_opt must lie in [0, 65535]'
     if (fs_gpu_timers < 0 .or. fs_gpu_timers > 2) error stop 'IMPLICIT_FS: fs_gpu_timers must be 0, 1 or 2'
+    ! the CPU's manufactured-solution test of the first solve (implicit mode only, as on the CPU)
+    if (fs_selftest > 0) error stop 'IMPLICIT_FS: fs_selftest > 0 (the solver self-test) is not available '// &
+         'on the GPU model; set fs_selftest = 0'
     call fs_opt_flags()
     if (talk) then
       write(*,'(/1x,A)') 'IMPLICIT_FS: fs_mode = implicit (the step2d fast loop is replaced)'
@@ -162,7 +165,6 @@ contains
            trim(fs_mg_global_on), ' fs_exch_thin = ', fs_exch_thin, ')'
       write(*,'(1x,A,A,A,I2,A,I6)') 'IMPLICIT_FS: fs_gpu_coarse = ', trim(fs_gpu_coarse), ' fs_gpu_graph =', &
            fs_gpu_graph, ' fs_gpu_opt =', fs_gpu_opt
-      if (fs_selftest > 0) write(*,'(1x,A)') 'IMPLICIT_FS: note: fs_selftest is not implemented on the GPU (ignored)'
     endif
   end subroutine fs_read_namelist
 

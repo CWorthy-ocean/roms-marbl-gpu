@@ -34,7 +34,7 @@ module case_io
   use pflx_mod, only: calc_pflx, pflx_timescale, init_pflx, pflx_fill_slow_halos, u_slow, v_slow, p_slow
   use pflx_mod, only: ub_tune, sponge_timescale, nrpf_sponge, output_period_sponge, wrt_sponge, sponge_avg, &
                       init_sponge_tune
-  use sponge_io, only: load_rst_ub, init_spn_arrays
+  use sponge_io, only: load_rst_ub, init_spn_arrays, set_sponge_global_atts
   use sponge_out, only: set_spn_root, init_spn_output
   use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name, &
        passive_hold, set_cdr_lite, passive_finish_list, ncdr, tnu2_tp, n_marbl, cdr0, passive_mirror
@@ -109,6 +109,7 @@ module case_io
   ! a periodic direction, which has no boundary column (infer_layout).
   integer :: case_du = 1, case_dv = 1
   real(rp),    public :: case_v_sponge = 0.0_rp
+  real(rp),    public :: case_v_sponge_trc = 0.0_rp   ! resolved: v_sponge when negative
   ! UCLA ROMS reads akt_bak and tnu2 with one value per tracer (NT long), in
   ! its tracer order (T, S, nt_passive generic, CDR_LITE, MARBL; tracers.F90),
   ! and C-Star writes them so. A fixed, generous length accepts any such list
@@ -130,28 +131,28 @@ contains
     integer :: unit, ios
     character(len=512) :: msg, nml_dir
 
-    integer(ip) :: llm, mmm, nz, n, np_xi, np_eta, nt_passive, nt_bgc, ntrc_bio, nt_cdr_oae, nt_cdr_dor
-    integer(ip) :: nsub_x, nsub_e, ndtfast_in, ntimes_in, ninfo, nrrec
+    integer(ip) :: llm, mmm, nz, n, np_xi, np_eta, nt_passive, nt_bgc, nt_cdr_oae, nt_cdr_dor
+    integer(ip) :: ndtfast_in, ntimes_in, ninfo, nrrec
     real(rp) :: dt_in, theta_s_in, theta_b_in, hc_in
     real(rp) :: zob_in, rdrg_in, rdrg2_in, visc2_in, akv_bak_in, rho0_in
     real(rp) :: akt_bak_in(2)
     character(len=512) :: grdname, inifile, ininame, title, output_root_name
 
-    namelist /param_settings/ np_xi, np_eta, nsub_x, nsub_e, llm, mmm, nz, n, &
-                              nt_passive, nt_bgc, ntrc_bio, nt_cdr_oae, nt_cdr_dor
+    namelist /param_settings/ np_xi, np_eta, llm, mmm, nz, n, &
+                              nt_passive, nt_bgc, nt_cdr_oae, nt_cdr_dor
     namelist /grid_settings/ grdname
     namelist /initial_conditions/ inifile, ininame, nrrec
     namelist /simulation_name_settings/ output_root_name, title
     namelist /ubind_settings/ ubind
-    real(rp) :: v_sponge
-    namelist /v_sponge_settings/ v_sponge
+    real(rp) :: v_sponge, v_sponge_trc
+    namelist /v_sponge_settings/ v_sponge, v_sponge_trc
     namelist /calc_pflx_settings/ calc_pflx, pflx_timescale
     namelist /sponge_tune_settings/ sponge_timescale, nrpf_sponge, output_period_sponge, ub_tune, wrt_sponge, &
                                     sponge_avg
 
     llm = 32; mmm = 32; nz = 0; n = 0
-    np_xi = 1; np_eta = 1; nsub_x = 1; nsub_e = 1
-    nt_passive = 0; nt_bgc = 0; ntrc_bio = 0; nt_cdr_oae = 0; nt_cdr_dor = 0; nrrec = -1
+    np_xi = 1; np_eta = 1
+    nt_passive = 0; nt_bgc = 0; nt_cdr_oae = 0; nt_cdr_dor = 0; nrrec = -1
     ininame = ''
     dt_in = 100.0_rp; ndtfast_in = 60; ntimes_in = 1; ninfo = 1
     theta_s_in = 6.0_rp; theta_b_in = 6.0_rp; hc_in = 250.0_rp
@@ -198,10 +199,14 @@ contains
     rewind(unit); read(unit, nml=ubind_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'UBIND_SETTINGS')
     v_sponge = 0.0_rp
+    v_sponge_trc = -1.0_rp     ! the CPU's default: negative (or absent) = v_sponge
     rewind(unit); read(unit, nml=v_sponge_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'V_SPONGE_SETTINGS')
     if (ios /= 0) v_sponge = 0.0_rp
+    if (v_sponge_trc < 0.0_rp) v_sponge_trc = v_sponge   ! as the CPU (scalars.F90)
     case_v_sponge = v_sponge
+    case_v_sponge_trc = v_sponge_trc
+    call set_sponge_global_atts(v_sponge, v_sponge_trc)
     ! pressure fluxes for nesting (optional group; absent: off)
     calc_pflx = .false.; pflx_timescale = 0.0_rp
     rewind(unit); read(unit, nml=calc_pflx_settings, iostat=ios, iomsg=msg)
@@ -367,7 +372,9 @@ contains
     integer(ip) :: i, j, ig, jg, isp, ibnd, itrc, i_lo, i_hi, j_lo, j_hi
     real(rp), allocatable :: wrk(:,:)
 
-    if (case_v_sponge <= 0.0_rp) return
+    ! The CPU adds both terms whatever the values (0 adds nothing): with
+    ! v_sponge = 0 and v_sponge_trc > 0 the tracers alone get a sponge.
+    if (case_v_sponge <= 0.0_rp .and. case_v_sponge_trc <= 0.0_rp) return
     isp = sponge_size + 1_ip
     i_lo = lbound(visc2_r, 1); i_hi = ubound(visc2_r, 1)
     j_lo = lbound(visc2_r, 2); j_hi = ubound(visc2_r, 2)
@@ -385,20 +392,23 @@ contains
       enddo
     enddo
 
-    visc2_r = visc2_r + case_v_sponge * wrk
-    do j = j_lo + 1, j_hi
-      do i = i_lo + 1, i_hi
-        visc2_p(i, j) = visc2_p(i, j) + 0.25_rp * case_v_sponge * &
-             (wrk(i, j) + wrk(i - 1, j) + wrk(i, j - 1) + wrk(i - 1, j - 1))
+    if (case_v_sponge > 0.0_rp) then        ! momentum (the CPU's UV_VIS2 part)
+      visc2_r = visc2_r + case_v_sponge * wrk
+      do j = j_lo + 1, j_hi
+        do i = i_lo + 1, i_hi
+          visc2_p(i, j) = visc2_p(i, j) + 0.25_rp * case_v_sponge * &
+               (wrk(i, j) + wrk(i - 1, j) + wrk(i, j - 1) + wrk(i - 1, j - 1))
+        enddo
       enddo
-    enddo
+    endif
+    ! tracers (the CPU's TS_DIF2 part, which the GPU always has): v_sponge_trc
     do itrc = 1, size(diff2, 3)
-      diff2(:, :, itrc) = diff2(:, :, itrc) + case_v_sponge * wrk
+      diff2(:, :, itrc) = diff2(:, :, itrc) + case_v_sponge_trc * wrk
     enddo
-    diff2_sp = case_v_sponge * wrk    ! the passives add it to their tnu2
+    diff2_sp = case_v_sponge_trc * wrk    ! the passives add it to their tnu2
     deallocate(wrk)
-    if (comm_rank() == 0) write(*,'(a,i3,a,es12.4)') 'Sponge layer = ', sponge_size, &
-         ' interior grid points, v_sponge =', case_v_sponge
+    if (comm_rank() == 0) write(*,'(a,i3,a,es12.4,a,es12.4)') 'Sponge layer = ', sponge_size, &
+         ' interior grid points, v_sponge =', case_v_sponge, ', v_sponge_trc =', case_v_sponge_trc
   end subroutine apply_sponge
 
   subroutine apply_decomp(periodic_x, periodic_y)

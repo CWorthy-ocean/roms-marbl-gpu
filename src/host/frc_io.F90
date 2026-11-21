@@ -83,6 +83,10 @@ module frc_io
     ! climatology: cycle_length attribute of the time axis (<= 0: none);
     ! t1e/t2e are the shifted record times of the current bracket
     real(rp) :: cycle = -1.0_rp, t1e = 0.0_rp, t2e = 0.0_rp
+    ! hold: no time interpolation, each record held until the model time
+    ! passes the next one (the CPU's time_interpolation = .false.; fill_any);
+    ! filled: fill_any has set the field once
+    logical :: hold = .false., filled = .false.
     integer, allocatable :: ifile(:), irec(:)
     character(len=512), allocatable :: paths(:)
     real(rp), allocatable :: times(:)
@@ -152,6 +156,9 @@ module frc_io
   !   by the passive corrector from the first step on (CPU b49a3e63,
   !   claude-docs#116), &dic_alk_correction dcdt [cm/day].
   logical,  public :: sflx_corr = .false., qcorrection = .false., cflx_corr = .false.
+  ! &surf_frc_settings check_bulk_frc_units: the units attributes of qair and
+  ! rain are checked once, at the first bulk forcing step (bulk_units_check)
+  logical :: check_bulk_frc_units = .false.
   real(rp), public :: dsssdt = 7.777_rp, dsstdt = 7.777_rp, dcdt = 7.777_rp
   real(rp)         :: dsssdt_ms = 0.0_rp, dsstdt_ms = 0.0_rp, dcdt_ms = 0.0_rp   ! piston velocities, m/s
   integer(ip)      :: ic_dic = 0, ic_dica = 0, ic_alk = 0, ic_alka = 0          ! CFLX_CORR passive indices
@@ -204,15 +211,13 @@ contains
     integer :: ios, i
     character(len=512) :: msg
     character(len=512) :: frcfiles(max_frc), frcfile(max_frc)
-    logical :: interp_bulk_frc, check_bulk_frc_units
+    logical :: interp_bulk_frc
     namelist /forcing_files/ frcfiles, frcfile
     namelist /surf_frc_settings/ interp_flux_frc, interp_bulk_frc, check_bulk_frc_units, sflx_corr, &
                                  qcorrection, cflx_corr
     namelist /sss_correction/ dsssdt
     namelist /sst_correction/ dsstdt
     namelist /dic_alk_correction/ dcdt
-    namelist /flux_frc_settings/ interp_flux_frc
-    namelist /bulk_frc_settings/ interp_bulk_frc, check_bulk_frc_units
     real(rp) :: gamma2
     namelist /gamma2_settings/ gamma2
 
@@ -229,18 +234,6 @@ contains
     read(unit, nml=surf_frc_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
       write(*,*) 'SURF_FRC_SETTINGS: ', trim(iomsg_text(msg))
-      error stop 'read_forcing_namelist'
-    endif
-    rewind(unit)
-    read(unit, nml=flux_frc_settings, iostat=ios, iomsg=msg)
-    if (ios > 0) then
-      write(*,*) 'FLUX_FRC_SETTINGS: ', trim(iomsg_text(msg))
-      error stop 'read_forcing_namelist'
-    endif
-    rewind(unit)
-    read(unit, nml=bulk_frc_settings, iostat=ios, iomsg=msg)
-    if (ios > 0) then
-      write(*,*) 'BULK_FRC_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
     rewind(unit)
@@ -368,6 +361,46 @@ contains
     if (have_flux) write(*,'(a,i0,a)') 'flux forcing (no bulk vars): ', case_nfrc, ' files'
   end subroutine init_forcing
 
+  subroutine bulk_units_check(s, units)
+    ! The CPU's nc_check_units (bulk_frc check_bulk_frc_units): the units
+    ! attribute of the variable in the file of the series' last record read
+    ! (the CPU's frcfiles(nc%ifile)) must be units; otherwise, or when the
+    ! file, variable or attribute cannot be read, the run stops with the
+    ! CPU's message. Every compute rank checks (the same file).
+    use netcdf, only: nf90_open, nf90_nowrite, nf90_inq_varid, nf90_get_att, nf90_close, nf90_noerr
+    type(series2d),   intent(in) :: s
+    character(len=*), intent(in) :: units
+    character(len=20) :: file_var_units      ! the CPU's length
+    character(len=512) :: path
+    integer :: ierr, ncid, varid
+    if (.not. s%ready) then
+      write(*,'(3a)') 'nc_check_units: cannot find var ', trim(s%vname), ' in the forcing files'
+      error stop 'check_bulk_frc_units'
+    endif
+    path = s%paths(max(1, min(s%it2, s%ntot)))
+    ierr = nf90_open(trim(path), nf90_nowrite, ncid)
+    if (ierr /= nf90_noerr) then
+      write(*,'(2a)') 'nc_check_units: error opening ', trim(path)
+      error stop 'check_bulk_frc_units'
+    endif
+    ierr = nf90_inq_varid(ncid, trim(s%vname), varid)
+    if (ierr /= nf90_noerr) then
+      write(*,'(2a)') 'nc_check_units: cannot find var ', trim(s%vname)
+      error stop 'check_bulk_frc_units'
+    endif
+    file_var_units = ''
+    ierr = nf90_get_att(ncid, varid, 'units', file_var_units)
+    if (ierr /= nf90_noerr) then
+      write(*,'(4a)') 'nc_check_units: cannot find units. (', trim(s%vname), ' in ', trim(path)//')'
+      error stop 'check_bulk_frc_units'
+    endif
+    ierr = nf90_close(ncid)
+    if (trim(units) /= trim(file_var_units)) then
+      write(*,*) trim(file_var_units), ' for var: ', trim(s%vname), ',  Units must be: ', trim(units)
+      error stop 'check_bulk_frc_units: wrong units in the forcing file'
+    endif
+  end subroutine bulk_units_check
+
   subroutine set_forces()
     real(rp) :: tneed
     logical, save :: logged_bulk = .false.
@@ -413,6 +446,12 @@ contains
       if (qcorrection) call fill_r(s_sst, tneed, sst)
       call calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad_in, sflx_corr, dsssdt_ms, sss, &
                            qcorrection, dsstdt_ms, sst)
+      if (check_bulk_frc_units) then      ! once, after the first step's bulk fluxes, as the CPU
+        if (comm_rank() == 0) write(*,'(a)') 'Checking Bulk force units'
+        call bulk_units_check(s_qair, 'kg/kg')
+        call bulk_units_check(s_prate, 'cm/day')
+        check_bulk_frc_units = .false.
+      endif
       if (cflx_corr) then
         ! the passive corrector applies them (the one surface-flux array
         ! with CDR_LITE's, cdrl_psf); from the predicted state at n+1/2,
@@ -1396,17 +1435,25 @@ contains
     character(len=1), intent(in)  :: gtype
     logical,        intent(in)    :: kn
     real(rp) :: c1, c2
+    integer :: only
     if (.not. s%ready) return
     call advance_series(s, tneed)
-    call weights(s, tneed, c1, c2)
+    only = 0
+    if (s%hold) then
+      only = hold_slot(s, tneed)
+      if (only == 0) return      ! dest keeps the record held so far
+      c1 = 0.0_rp; c2 = 0.0_rp
+    else
+      call weights(s, tneed, c1, c2)
+    endif
     if (s%lay == LAY_GRID) then
       if (kn) then
-        call interp_on_grid_nan(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0)
+        call interp_on_grid_nan(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0, only)
       else
-        call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0)
+        call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, s%li0, s%lj0, only)
       endif
     else
-      call interp_coarse(s%buf, s%n1, s%n2, c1, c2, dest, gtype, kn)
+      call interp_coarse(s%buf, s%n1, s%n2, c1, c2, dest, gtype, kn, only)
     endif
     ! On a periodic grid the halo is the periodic copy of the interior, as
     ! UCLA ROMS's exchange_xxx after each record read (roms_read_write
@@ -1419,7 +1466,33 @@ contains
     if (decomp%periodic_x .or. decomp%periodic_y .or. s%halo_fill) call halo_fill_2d(dest, STAGGER_RHO)
   end subroutine fill_any
 
-  subroutine interp_coarse(b, n1, n2, c1, c2, dest, gtype, kn)
+  integer function hold_slot(s, tneed) result(slot)
+    ! A held series (the CPU's set_frc_data with time_interpolation =
+    ! .false.: var = vdata(it1)): the CPU's lower record it1, which its
+    ! first record search takes as the last record at or before the model
+    ! time, and which then changes only once the model time is past the
+    ! upper record (refresh when times(it2) < modtime). At a model time
+    ! equal to a record time t_k the CPU so holds record k at the first fill
+    ! and record k-1 while stepping; the GPU's bracket there is (k-1, k)
+    ! (advance_series, at or after the first record) or, for a climatology,
+    ! (k, k+1) (cyc_bracket). Returns the buffer slot to copy, or 0: keep
+    ! the field as it is (the record held since the previous call).
+    type(series2d), intent(inout) :: s
+    real(rp),       intent(in)    :: tneed
+    real(rp) :: t1, t2
+    slot = 1
+    if (s%ntot >= 2) then
+      call bracket_times(s, t1, t2)
+      if (.not. s%filled) then
+        if (tneed == t2) slot = 2
+      elseif (tneed == t1) then
+        slot = 0
+      endif
+    endif
+    s%filled = .true.
+  end function hold_slot
+
+  subroutine interp_coarse(b, n1, n2, c1, c2, dest, gtype, kn, only)
     ! A 2x-coarse field (two buffered records b(:,:,1:2), the whole file
     ! extent) on this tile, as the CPU (roms_read_write coarse2fine, then
     ! set_frc_data's time interpolation): each record is interpolated
@@ -1440,7 +1513,8 @@ contains
     ! NaN).
     ! Filled: rho i = 0:nx+1, j = 0:ny+1; u i = 1:nx+1, j = 0:ny+1;
     ! v i = 0:nx+1, j = 1:ny+1 (the standard on-grid windows).
-    integer,          intent(in) :: n1, n2
+    ! only = 1 or 2: that record alone (a held series), not combined.
+    integer,          intent(in) :: n1, n2, only
     real(rp), WORK_ATTR intent(in) :: b(n1, n2, 2)
     real(rp),         intent(in) :: c1, c2
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
@@ -1509,7 +1583,13 @@ contains
         endif
         f1 = (1.0_rp - yl) * ((1.0_rp - xl) * a00 + xl * a10) + yl * ((1.0_rp - xl) * a01 + xl * a11)
         f2 = (1.0_rp - yl) * ((1.0_rp - xl) * q00 + xl * q10) + yl * ((1.0_rp - xl) * q01 + xl * q11)
-        x = c1 * f1 + c2 * f2
+        if (only == 1) then
+          x = f1
+        elseif (only == 2) then
+          x = f2
+        else
+          x = c1 * f1 + c2 * f2
+        endif
         if (.not. kn .and. x /= x) x = 0.0_rp
         dest(i, j) = x
       enddo
@@ -1549,10 +1629,10 @@ contains
     endif
   end subroutine coarse_rule
 
-  subroutine interp_on_grid(b, n1, n2, c1, c2, dest, i0, j0)
+  subroutine interp_on_grid(b, n1, n2, c1, c2, dest, i0, j0, only)
     ! Device time interpolation of two buffered records onto the grid,
-    ! NaN (missing) -> 0.
-    integer,  intent(in) :: n1, n2, i0, j0
+    ! NaN (missing) -> 0. only = 1 or 2: that record alone (a held series).
+    integer,  intent(in) :: n1, n2, i0, j0, only
     real(rp), WORK_ATTR intent(in) :: b(n1, n2, 2)
     real(rp), intent(in) :: c1, c2
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
@@ -1563,16 +1643,22 @@ contains
 #endif
     do j = 1, n2
       do i = 1, n1
-        x = c1 * b(i, j, 1) + c2 * b(i, j, 2)
+        if (only == 1) then
+          x = b(i, j, 1)
+        elseif (only == 2) then
+          x = b(i, j, 2)
+        else
+          x = c1 * b(i, j, 1) + c2 * b(i, j, 2)
+        endif
         if (x /= x) x = 0.0_rp
         dest(i0 + i - 1, j0 + j - 1) = x
       enddo
     enddo
   end subroutine interp_on_grid
 
-  subroutine interp_on_grid_nan(b, n1, n2, c1, c2, dest, i0, j0)
+  subroutine interp_on_grid_nan(b, n1, n2, c1, c2, dest, i0, j0, only)
     ! As interp_on_grid, with NaN kept (CPU set_frc_data).
-    integer,  intent(in) :: n1, n2, i0, j0
+    integer,  intent(in) :: n1, n2, i0, j0, only
     real(rp), WORK_ATTR intent(in) :: b(n1, n2, 2)
     real(rp), intent(in) :: c1, c2
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
@@ -1582,7 +1668,13 @@ contains
 #endif
     do j = 1, n2
       do i = 1, n1
-        dest(i0 + i - 1, j0 + j - 1) = c1 * b(i, j, 1) + c2 * b(i, j, 2)
+        if (only == 1) then
+          dest(i0 + i - 1, j0 + j - 1) = b(i, j, 1)
+        elseif (only == 2) then
+          dest(i0 + i - 1, j0 + j - 1) = b(i, j, 2)
+        else
+          dest(i0 + i - 1, j0 + j - 1) = c1 * b(i, j, 1) + c2 * b(i, j, 2)
+        endif
       enddo
     enddo
   end subroutine interp_on_grid_nan
@@ -1593,11 +1685,13 @@ contains
   ! CDR_time; absent everywhere = 0, as the CPU's allow_missing). Records
   ! are cataloged in the CPU's file order (bind_series cpu_order); NaN in
   ! the sensitivities stays NaN (no gas exchange there, as on the CPU).
-  subroutine init_cdr_lite_forcing(nd, names, with_ddic, have_dco2, have_dalk, have_flx)
+  subroutine init_cdr_lite_forcing(nd, names, with_ddic, ddic_interp, have_dco2, have_dalk, have_flx)
     ! with_ddic false (online sensitivities): the ddic series are not bound.
+    ! ddic_interp: cdr_carbonate_sensitivity_time_interpolation (.false.:
+    ! each ddic record held, as the CPU's nc_ddic_*%time_interpolation).
     integer,          intent(in)  :: nd
     character(len=*), intent(in)  :: names(:)
-    logical,          intent(in)  :: with_ddic
+    logical,          intent(in)  :: with_ddic, ddic_interp
     logical,          intent(out) :: have_dco2, have_dalk, have_flx(:)
     integer :: d
     have_dco2 = .false.; have_dalk = .false.; have_flx = .false.
@@ -1605,6 +1699,8 @@ contains
     if (with_ddic) then
       call bind_series(s_ddco2, 'ddic_dco2', 'ddic_dco2_time', 'r', cpu_order=.true.)
       call bind_series(s_ddalk, 'ddic_dalk', 'ddic_dalk_time', 'r', cpu_order=.true.)
+      s_ddco2%hold = .not. ddic_interp; s_ddalk%hold = .not. ddic_interp
+      s_ddco2%filled = .false.; s_ddalk%filled = .false.
     endif
     have_dco2 = s_ddco2%ready; have_dalk = s_ddalk%ready
     if (allocated(s_cflx)) deallocate(s_cflx)
@@ -1635,7 +1731,8 @@ contains
     call cover_check(s_ddalk, tneed)
     if (s_ddco2%ready) call fill_r(s_ddco2, tneed, ddco2, keep_nan=.true.)
     if (s_ddalk%ready) call fill_r(s_ddalk, tneed, ddalk, keep_nan=.true.)
-    if (s_ddco2%ready .and. s_ddalk%ready) call missing_sensitivity(tneed, ddco2, ddalk)
+    ! as the CPU, the missing-record rule only with time interpolation
+    if (s_ddco2%ready .and. s_ddalk%ready .and. .not. s_ddco2%hold) call missing_sensitivity(tneed, ddco2, ddalk)
     do d = 1, nd
       call cover_check(s_cflx(d), tneed)
       if (s_cflx(d)%ready) call fill_r(s_cflx(d), tneed, cflx(:, :, d))
