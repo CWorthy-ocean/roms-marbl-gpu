@@ -70,6 +70,10 @@
 #     with its defaults, as UCLA ROMS. The path is relative to the
 #     namelist file.
 #
+# &nhmg_settings nhmg = .true. stops the run at start-up: roms_gpu has no
+# non-hydrostatic solver. (UCLA ROMS from its run-time NHMG switch,
+# unreleased; before, NHMG was a cpp key the GPU could not see.)
+#
 # &surf_frc_settings check_bulk_frc_units = .true. (after v0.1.3-beta;
 # before, ignored): as UCLA ROMS, with bulk forcing, after the first step's
 # fluxes the units attribute of qair must be 'kg/kg' and of rain 'cm/day'
@@ -122,8 +126,8 @@
 # Surface restoring: UCLA ROMS selects it with cpp keys, which the GPU model
 # cannot see; roms_gpu switches it on with logical keys in
 # &surf_frc_settings (default .false., bulk forcing only), and reads the
-# coefficient from the same group as UCLA ROMS. UCLA ROMS (cpp-to-namelist
-# branch, unreleased) also accepts these three keys and stops when one
+# coefficient from the same group as UCLA ROMS. UCLA ROMS (after 0.16.0,
+# ucla-roms#475) also accepts these three keys and stops when one
 # disagrees with its cpp key, so a namelist can carry them for both models:
 #   CPU cpp key        roms_gpu &surf_frc_settings   coefficient group (cm/day)
 #   SFLX_CORR          sflx_corr = .true.             &sss_correction dSSSdt
@@ -135,9 +139,9 @@
 #
 # Pressure fluxes for nesting: &calc_pflx_settings calc_pflx and
 # pflx_timescale as UCLA ROMS (the group is optional here; absent means
-# off). UCLA ROMS computes up/vp only when built with the DIAGNOSTICS cpp
-# key; roms_gpu computes them whenever calc_pflx = .true., with the
-# internal-tide pressure of ucla-roms eae883ee, writes up_<side>/vp_<side>
+# off). Both models compute up/vp whenever calc_pflx = .true. (UCLA ROMS
+# up to 0.16.0 only when built with the DIAGNOSTICS cpp key); roms_gpu
+# uses the internal-tide pressure of ucla-roms eae883ee, writes up_<side>/vp_<side>
 # to the child boundary file for objects whose output_vars name them, and
 # keeps u_slow, v_slow, p_slow in the restart. pflx_timescale must be > 0
 # when calc_pflx is on (the run stops otherwise).

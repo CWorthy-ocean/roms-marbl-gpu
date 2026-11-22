@@ -64,6 +64,7 @@ contains
     call need_off('tides_settings', 'ana_tides', 'analytical tides')
     call need_off('diagnostics_settings', 'diag_uv', 'momentum budget diagnostics (DIAGNOSTICS cpp key on the CPU)')
     call need_off('diagnostics_settings', 'diag_trc', 'tracer budget diagnostics (DIAGNOSTICS cpp key on the CPU)')
+    call need_off('nhmg_settings', 'nhmg', 'the non-hydrostatic solver (NHMG)')
 
     if (talk .and. nerr > 0) flush(6)
     deallocate(txt)
