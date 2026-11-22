@@ -14,7 +14,6 @@
     np_eta = 2
     nt_passive = 0
     nt_bgc = 32
-    ntrc_bio = 0
 /
 
 &grid_settings

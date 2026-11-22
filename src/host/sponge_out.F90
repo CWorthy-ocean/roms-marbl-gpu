@@ -22,6 +22,7 @@ module sponge_out
   use comm_mod, only: comm_rank, comm_reduce_sum
   use arch_mod, only: sync_arch
   use pflx_mod, only: ub_tune, wrt_sponge, nrpf_sponge, output_period_sponge
+  use sponge_io, only: sponge_global_atts
   use sponge_io, only: cfa_w, cfa_e, cfa_s, cfa_n, pfa_w, pfa_e, pfa_s, pfa_n, uba_w, uba_e, uba_s, uba_n, navg_spn
   implicit none
   private
@@ -205,6 +206,7 @@ contains
     enddo
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu sponge tuning')
     call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
+    call sponge_global_atts(ncid)   ! sponge layer (&v_sponge_settings)
     call nc_enddef(ncid)
     call nc_close(ncid)
     write(*,'(a,a)') 'created sponge-tuning file: ', trim(path)
