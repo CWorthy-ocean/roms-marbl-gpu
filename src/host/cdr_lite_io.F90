@@ -24,7 +24,12 @@ module cdr_lite_io
   public :: read_cdr_lite_namelist, init_cdr_lite, set_cdr_lite, alt_co2_tracers
 
   logical :: cdr_online_carbonate_sensitivity = .false.
-  namelist /cdr_lite_settings/ cdr_online_carbonate_sensitivity
+  ! ddic_dco2/ddic_dalk from the forcing files: .true. (default) linear in
+  ! time between the bracketing records; .false. each record held until the
+  ! model time passes the next one, as the CPU (frc_io hold_slot), without
+  ! the missing-record rule (missing_sensitivity), as the CPU.
+  logical :: cdr_carbonate_sensitivity_time_interpolation = .true.
+  namelist /cdr_lite_settings/ cdr_online_carbonate_sensitivity, cdr_carbonate_sensitivity_time_interpolation
   integer(ip) :: ialk = 0, idic = 0, ipo4 = 0, isio3 = 0      ! ALT_CO2 system (online)
   integer :: ir0, ir1, jr0, jr1
 
@@ -34,6 +39,7 @@ contains
     integer, intent(in) :: unit
     integer :: ios
     character(len=512) :: msg
+    cdr_carbonate_sensitivity_time_interpolation = .true.
     rewind(unit)
     read(unit, nml=cdr_lite_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
@@ -75,7 +81,8 @@ contains
     do m = 1, nd
       names(m) = passive_name(dic(m))
     enddo
-    call init_cdr_lite_forcing(int(nd), names, .not. cdr_online_carbonate_sensitivity, hd, ha, hf)
+    call init_cdr_lite_forcing(int(nd), names, .not. cdr_online_carbonate_sensitivity, &
+                               cdr_carbonate_sensitivity_time_interpolation, hd, ha, hf)
     if (.not. cdr_online_carbonate_sensitivity .and. .not. (hd .and. ha)) then
       write(*,'(a,2l2)') 'init_cdr_lite: ddic_dco2, ddic_dalk found =', hd, ha
       error stop 'init_cdr_lite: CDR_LITE needs ddic_dco2 and ddic_dalk in the forcing files'
