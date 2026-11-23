@@ -333,6 +333,16 @@ v0.1.2-beta, bit for bit.
   The release volume is also set before the start-up diagnostics, as on
   the CPU, so the initial history record's `omega` and `w` include it.
   Runs without CDR releases are unchanged bit for bit.
+- Results change where the lateral viscosity is nonzero (`visc2`, the
+  sponge `v_sponge`), as in UCLA ROMS (CWorthy-ocean/ucla-roms#473): the
+  depth integral of the 3-D viscous tendency enters the barotropic forcing
+  `rufrc`/`rvfrc` times the u- and v-point areas `dm_u dn_u` and
+  `dm_v dn_v`. Before, it entered divided by the cell area (per unit area
+  in a sum that is area-integrated everywhere else), so the barotropic
+  mode got almost no lateral viscosity and the 3-D coupling then removed
+  the depth mean of the viscous increment: the sponge did not damp
+  `ubar`, `vbar` and `zeta`. Runs without lateral viscosity are unchanged
+  bit for bit.
 
 ## Numerics
 
