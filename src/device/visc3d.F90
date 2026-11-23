@@ -2,6 +2,9 @@
 module visc3d_mod
   ! Harmonic viscosity along s-surfaces (UV_VIS2). Adds to rufrc/rvfrc
   ! and to Hz*u, Hz*v at nnew (already mass-weighted after step3d_uv1).
+  ! cff is per unit area [m2/s2] and rufrc/rvfrc are integrated over the
+  ! cell area [m4/s2], so cff enters them times dm_u*dn_u (dm_v*dn_v), as
+  ! in UCLA ROMS from ucla-roms#473.
   ! IMEX_IGW imex_mix_split = 1 (CPU visc3d_mod under IMEX_IGW, c65bb854):
   ! the Laplacian acts on this step's corrected velocity (split_vel), not u^n.
   use kinds
@@ -107,7 +110,7 @@ contains
             cff = 0.125_rp * (pm(i - 1, j) + pm(i, j)) * (pn(i - 1, j) + pn(i, j)) * ( &
                   (pn(i - 1, j) + pn(i, j)) * (wrk2a(i, j) - wrk2a(i - 1, j)) + &
                   (pm(i - 1, j) + pm(i, j)) * (wrk2c(i, j + 1) - wrk2c(i, j)))
-            rufrc(i, j) = rufrc(i, j) + cff
+            rufrc(i, j) = rufrc(i, j) + cff * dm_u(i, j) * dn_u(i, j)
             u(i, j, k, n_new) = u(i, j, k, n_new) + dt_loc * cff
           enddo
         enddo
@@ -119,7 +122,7 @@ contains
             cff = 0.125_rp * (pm(i, j) + pm(i, j - 1)) * (pn(i, j) + pn(i, j - 1)) * ( &
                   (pn(i, j - 1) + pn(i, j)) * (wrk2d(i + 1, j) - wrk2d(i, j)) + &
                   (pm(i, j - 1) + pm(i, j)) * (wrk2b(i, j) - wrk2b(i, j - 1)))
-            rvfrc(i, j) = rvfrc(i, j) + cff
+            rvfrc(i, j) = rvfrc(i, j) + cff * dm_v(i, j) * dn_v(i, j)
             v(i, j, k, n_new) = v(i, j, k, n_new) + dt_loc * cff
           enddo
         enddo
@@ -225,7 +228,7 @@ contains
             cff = 0.125_rp * (pm(i - 1, j) + pm(i, j)) * (pn(i - 1, j) + pn(i, j)) * ( &
                   (pn(i - 1, j) + pn(i, j)) * (wrk3a(i, j, k) - wrk3a(i - 1, j, k)) + &
                   (pm(i - 1, j) + pm(i, j)) * (wrk3c(i, j + 1, k) - wrk3c(i, j, k)))
-            rufrc(i, j) = rufrc(i, j) + cff
+            rufrc(i, j) = rufrc(i, j) + cff * dm_u(i, j) * dn_u(i, j)
             u(i, j, k, n_new) = u(i, j, k, n_new) + dt_loc * cff
           enddo
         enddo
@@ -241,7 +244,7 @@ contains
             cff = 0.125_rp * (pm(i, j) + pm(i, j - 1)) * (pn(i, j) + pn(i, j - 1)) * ( &
                   (pn(i, j - 1) + pn(i, j)) * (wrk3d(i + 1, j, k) - wrk3d(i, j, k)) + &
                   (pm(i, j - 1) + pm(i, j)) * (wrk3b(i, j, k) - wrk3b(i, j - 1, k)))
-            rvfrc(i, j) = rvfrc(i, j) + cff
+            rvfrc(i, j) = rvfrc(i, j) + cff * dm_v(i, j) * dn_v(i, j)
             v(i, j, k, n_new) = v(i, j, k, n_new) + dt_loc * cff
           enddo
         enddo
