@@ -32,6 +32,7 @@ module sponge_io
   ! The sponge layer's maxima (&v_sponge_settings; case_io), written as
   ! global attributes of every output file, as the CPU's put_global_atts
   public :: set_sponge_global_atts, sponge_global_atts
+  logical  :: gatt_sponge = .true.             ! use_boundary_sponge
   real(rp) :: gatt_v_sponge = 0.0_rp, gatt_v_sponge_trc = 0.0_rp
   ! for sponge_out (the _spn file): the child flux of the step, the averages
   ! (or the step's values without sponge_avg) and the average counter
@@ -48,20 +49,23 @@ module sponge_io
 
 contains
 
-  subroutine set_sponge_global_atts(v_sponge, v_sponge_trc)
+  subroutine set_sponge_global_atts(use_boundary_sponge, v_sponge, v_sponge_trc)
     ! v_sponge_trc resolved (v_sponge when the namelist value is negative)
+    logical,  intent(in) :: use_boundary_sponge
     real(rp), intent(in) :: v_sponge, v_sponge_trc
+    gatt_sponge = use_boundary_sponge
     gatt_v_sponge = v_sponge
     gatt_v_sponge_trc = v_sponge_trc
   end subroutine set_sponge_global_atts
 
   subroutine sponge_global_atts(ncid)
-    ! The CPU's put_global_atts (SPONGE): v_sponge, v_sponge_units,
+    ! The CPU's put_global_atts (use_boundary_sponge): v_sponge, v_sponge_units,
     ! v_sponge_trc, v_sponge_trc_units. Called with fs_global_atts by every
     ! output module (compute rank 0, which has read the namelist).
     use netcdf, only: nf90_put_att, nf90_global, nf90_noerr, nf90_strerror
     integer, intent(in) :: ncid
     integer :: ierr
+    if (.not. gatt_sponge) return
     ierr = nf90_put_att(ncid, nf90_global, 'v_sponge', real(gatt_v_sponge, 8))
     if (ierr == nf90_noerr) ierr = nf90_put_att(ncid, nf90_global, 'v_sponge_units', 'm^2/s')
     if (ierr == nf90_noerr) ierr = nf90_put_att(ncid, nf90_global, 'v_sponge_trc', real(gatt_v_sponge_trc, 8))
