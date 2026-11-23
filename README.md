@@ -232,7 +232,7 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   `interp_bgc_frc` inputs; the GPU model tells the two apart by the file
   shape and interpolates half-resolution fields as the CPU model does. Any
   other shape stops the run at start-up. Surface restoring (SSS, SST,
-  MARBL DIC/ALK), selected on the CPU with cpp keys, is switched on with
+  MARBL DIC/ALK) is switched on with
   `&surf_frc_settings sflx_corr / qcorrection / cflx_corr` (see
   `NAMELIST_COMPAT`).
 - **MARBL output:** with `nt_bgc = 32` the history file carries every
@@ -1004,6 +1004,15 @@ v0.1.2-beta, bit for bit.
   the depth mean of the viscous increment: the sponge did not damp
   `ubar`, `vbar` and `zeta`. Runs without lateral viscosity are unchanged
   bit for bit.
+- Namelist: `use_boundary_sponge` (`&v_sponge_settings`, default `.true.`)
+  switches the sponge along the open boundaries, as in UCLA ROMS after
+  0.16.0, where it replaces the `SPONGE` cpp key. Runs without the key are
+  unchanged. A negative `v_sponge` stops the run (before, its momentum part
+  was ignored).
+- Namelist: a surface restoring switch (`sflx_corr`, `qcorrection`,
+  `cflx_corr`) that is on stops the run if its coefficient group
+  (`&sss_correction`, `&sst_correction`, `&dic_alk_correction`) is missing,
+  as in UCLA ROMS; before, 7.777 cm/day was used.
 
 ## Numerics
 

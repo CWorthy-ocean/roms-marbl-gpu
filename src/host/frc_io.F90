@@ -143,8 +143,8 @@ module frc_io
   logical, public :: bgc_frc_on = .false.
   real(rp), WORK_ATTR allocatable :: uwnd(:,:), vwnd(:,:), qair(:,:), prate(:,:), lwrad_in(:,:)
   real(rp), WORK_ATTR allocatable :: sss(:,:), sst(:,:), sdic(:,:), salk(:,:)
-  ! Surface restoring, bulk forcing only (UCLA ROMS bulk_frc.F90; there cpp
-  ! keys, here GPU-only &surf_frc_settings switches, see NAMELIST_COMPAT):
+  ! Surface restoring, bulk forcing only (UCLA ROMS bulk_frc.F90; the
+  ! &surf_frc_settings switches of both models, see NAMELIST_COMPAT):
   ! SFLX_CORR (sflx_corr): stflx(isalt) = -dSSSdt (S_surface - sss),
   !   &sss_correction dsssdt [cm/day];
   ! QCORRECTION (qcorrection): stflx(itemp) -= dSSTdt (T_surface - sst),
@@ -242,18 +242,21 @@ contains
       write(*,*) 'SSS_CORRECTION: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
+    if (ios < 0 .and. sflx_corr) error stop 'sflx_corr = .true. needs the namelist group SSS_CORRECTION (dSSSdt)'
     rewind(unit)
     read(unit, nml=sst_correction, iostat=ios, iomsg=msg)
     if (ios > 0) then
       write(*,*) 'SST_CORRECTION: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
+    if (ios < 0 .and. qcorrection) error stop 'qcorrection = .true. needs the namelist group SST_CORRECTION (dSSTdt)'
     rewind(unit)
     read(unit, nml=dic_alk_correction, iostat=ios, iomsg=msg)
     if (ios > 0) then
       write(*,*) 'DIC_ALK_CORRECTION: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
+    if (ios < 0 .and. cflx_corr) error stop 'cflx_corr = .true. needs the namelist group DIC_ALK_CORRECTION (dCdt)'
     ! In single precision, as the CPU (surf_flux.F90: default-real dSSSdt, read from the
     ! namelist, then dSSSdt / (100.*86400.)): about -3.6e-8 relative to the double value.
     ! The same for dSSTdt and dCdt.
@@ -1251,9 +1254,9 @@ contains
   end subroutine init_cflx_corr
 
   subroutine warn_unused_restoring()
-    ! Restoring data in the forcing files with its switch off: a CPU case
-    ! built with the cpp key would restore, the GPU would not (the GPU
-    ! cannot see cpp keys). Warn, as the data alone do not prove the key.
+    ! Restoring data in the forcing files with its switch off: a case from
+    ! a UCLA ROMS version that selected restoring with cpp keys would
+    ! restore there, not here. Warn, as the data alone do not prove it.
     ! The variable names are the CPU's (surf_flux.F90; a flux file's
     ! upper-case SST/SSS are not restoring data).
     if (comm_rank() /= 0) return
