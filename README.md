@@ -863,8 +863,7 @@ v0.1.2-beta, bit for bit.
   restart. The pressure is the internal-tide pressure of Kelly, Nash and
   Kunze (2010) (ucla-roms eae883ee), and the boundary values are taken by
   index (ucla-roms 4b07d30e).
-- Sponge tuning for nested children (`&sponge_tune_settings ub_tune`, the
-  CPU's SPONGE_TUNE): the inflow nudging of the 3-D open boundary
+- Sponge tuning for nested children (`&sponge_tune_settings apply_sponge_tune`): the inflow nudging of the 3-D open boundary
   conditions (velocity and every tracer) is tuned every step so that the
   child's internal-tide energy flux next to each side follows the parent's
   `up`/`vp` from the boundary files; needs `calc_pflx`. The coefficients
@@ -914,7 +913,7 @@ v0.1.2-beta, bit for bit.
     difference (hbbl 1.8 times), and the GPU against the CPU at the same
     tiling 0.6-1.05 times (hbbl 1.8).
   - Not tested on the GPU: periodic domains, `fs_drag_implicit`, sponge tuning
-    (`ub_tune`) together with the implicit free surface, more than two
+    (`apply_sponge_tune`) together with the implicit free surface, more than two
     nodes. A closed basin and river and CDR volume sources were checked
     during the port's development, not on this branch's gate cases, of
     which only Pac has rivers. Pipe sources and MPI_MASKING are not
@@ -1013,6 +1012,14 @@ v0.1.2-beta, bit for bit.
   `cflx_corr`) that is on stops the run if its coefficient group
   (`&sss_correction`, `&sst_correction`, `&dic_alk_correction`) is missing,
   as in UCLA ROMS; before, 7.777 cm/day was used.
+- Namelist: `ub_tune` (`&sponge_tune_settings`) is renamed
+  `apply_sponge_tune`, as in UCLA ROMS after 0.16.0; a namelist with the old
+  name stops at the read. `sponge_avg` defaults to `.true.`, as in UCLA
+  ROMS (before, `.false.`), and the `_spn` period is checked against the
+  restart period only when the tuning is on.
+- Upscaling (`do_upscale`) works without MARBL in runs with CDR_LITE
+  tracers: the `_uscl` files then hold the fluxes of those tracers only, as
+  in UCLA ROMS after 0.16.0.
 
 ## Numerics
 
@@ -1070,7 +1077,7 @@ bit for bit.
   (`&imex_igw_settings`, 'modal' or 'fixed' open boundary), any tiling.
 - **Not on the GPU yet** (the run stops at start-up): the positivity
   limiter `bgc_subcycle_pos` and its test `bgc_subcycle_diag >= 2`.
-  UPSCALING output and `ub_tune` are refused, as in UCLA ROMS.
+  Upscaling output and `apply_sponge_tune` are refused, as in UCLA ROMS.
 - **Diagnostics:** `bgc_subcycle_diag = 1` prints UCLA ROMS's `BGCSUB` and
   `BGCSUBNEG` lines for every window (Courant numbers, sub-passes,
   continuity, the shadow uniform tracer, the worst per-tracer budget

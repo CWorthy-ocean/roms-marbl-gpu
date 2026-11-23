@@ -1,7 +1,9 @@
 #include "mem_attr.inc"
 module upscale_out
-  ! Upscaling output (CPU upscale_output.F90, UPSCALING), for runs that write
-  ! the open-boundary transects a parent domain's CDR forcing is made from.
+  ! Upscaling output (CPU upscale_output.F90), for runs that write the
+  ! open-boundary transects a parent domain's CDR forcing is made from. The
+  ! ALK and DIC additionality needs the MARBL tracers, the CDR_LITE fluxes do
+  ! not: a run without MARBL writes the CDR_LITE tracers only.
   ! The open-boundary inflow term 0.5*(t_out - t_in)*inflow of the
   ! horizontal tracer fluxes, once the CPU's UPSCALING term, applies in every
   ! run on the open sides (gpu_state open_edge_codes). With do_upscale:
@@ -47,6 +49,7 @@ module upscale_out
   logical :: on = .false.
   character(len=512) :: root = './output', fname = ''
   integer :: record = 0, nfile = 0, navg = 0, nsel = 0, nv = 0
+  integer :: nm = 0           ! MARBL additionality variables: 2 (ALK, DIC), or 0 without MARBL
   real(rp) :: otime = 0.0_rp
   ! sides in the CPU's file order
   integer, parameter :: SN = 1, SS = 2, SE = 3, SW = 4
@@ -54,10 +57,10 @@ module upscale_out
   character(len=8), parameter :: sadj(4) = (/'northern', 'southern', 'eastern ', 'western '/)
   logical :: side_on(4) = .false., side_mine(4) = .false.
   integer :: nline(4) = 0, boff(4) = 0, nbuf = 0, ncbuf = 0
-  ! selected passive tracers: ALK, ALK_ALT_CO2, DIC, DIC_ALT_CO2, CDR_LITE
+  ! selected passive tracers: ALK, ALK_ALT_CO2, DIC, DIC_ALT_CO2 (with MARBL), CDR_LITE
   integer(ip), WORK_ATTR allocatable :: sel(:)
   ! outward fluxes rX(along, k, sel) and means aX(along, k, v): v = 1 ALK
-  ! additionality, 2 DIC additionality, 2+m CDR_LITE tracer m, nv layer thickness
+  ! additionality, 2 DIC additionality (with MARBL), nm+m CDR_LITE tracer m, nv layer thickness
   real(rp), WORK_ATTR allocatable :: rw(:,:,:), re(:,:,:), rs(:,:,:), rn(:,:,:)
   real(rp), WORK_ATTR allocatable :: aw(:,:,:), ae(:,:,:), as(:,:,:), an(:,:,:)
   real(8), allocatable :: hbuf(:), gbuf(:)
@@ -100,14 +103,18 @@ contains
     integer :: is, ie, js, je, nz, m, s
     on = .false.
     if (.not. do_upscale) return
-    if (.not. marbl_on) error stop 'init_upscale_output: upscaling needs MARBL'
+    if (.not. marbl_on .and. ncdr == 0) error stop 'init_upscale_output: do_upscale needs MARBL tracers '// &
+         '(nt_bgc > 0) or CDR_LITE tracers (nt_cdr_oae or nt_cdr_dor > 0)'
     if (nrpf_uscl < 1) error stop 'init_upscale_output: nrpf_uscl must be >= 1'
-    nsel = 4 + int(ncdr)
-    nv = 3 + int(ncdr)
+    nm = merge(2, 0, marbl_on)
+    nsel = 2 * nm + int(ncdr)
+    nv = nm + int(ncdr) + 1
     allocate(sel(nsel))
-    sel(1) = pidx('ALK'); sel(2) = pidx('ALK_ALT_CO2'); sel(3) = pidx('DIC'); sel(4) = pidx('DIC_ALT_CO2')
+    if (nm > 0) then
+      sel(1) = pidx('ALK'); sel(2) = pidx('ALK_ALT_CO2'); sel(3) = pidx('DIC'); sel(4) = pidx('DIC_ALT_CO2')
+    endif
     do m = 1, int(ncdr)
-      sel(4 + m) = cdr0 + m
+      sel(2 * nm + m) = cdr0 + m
     enddo
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je; nz = decomp%nz
     allocate(rw(js:je, nz, nsel), re(js:je, nz, nsel), rs(is:ie, nz, nsel), rn(is:ie, nz, nsel))
@@ -320,12 +327,12 @@ contains
   subroutine average()
     ! The CPU's calc_average over the tile's boundary points (corners
     ! included): avg*(1 - coef) + x*coef, coef = 1/navg.
-    integer :: i, j, k, m, nx, ny, nz, nc, j0, j1, i0, i1
+    integer :: i, j, k, m, nx, ny, nz, nc, na, j0, j1, i0, i1
     real(rp) :: coef, omc
     navg = navg + 1
     coef = 1.0_rp / real(navg, rp)
     omc = 1.0_rp - coef
-    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; nc = int(ncdr)
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; nc = int(ncdr); na = nm
     j0 = merge(0, 1, decomp%edge_s); j1 = merge(ny + 1, ny, decomp%edge_n)
     i0 = merge(0, 1, decomp%edge_w); i1 = merge(nx + 1, nx, decomp%edge_e)
     if (decomp%edge_w .and. obc_west) then
@@ -334,12 +341,14 @@ contains
 #endif
       do k = 1, nz
         do j = j0, j1
-          aw(j, k, 1) = aw(j, k, 1) * omc + (rw(j, k, 1) - rw(j, k, 2)) * coef
-          aw(j, k, 2) = aw(j, k, 2) * omc + (rw(j, k, 3) - rw(j, k, 4)) * coef
+          if (na > 0) then
+            aw(j, k, 1) = aw(j, k, 1) * omc + (rw(j, k, 1) - rw(j, k, 2)) * coef
+            aw(j, k, 2) = aw(j, k, 2) * omc + (rw(j, k, 3) - rw(j, k, 4)) * coef
+          endif
           do m = 1, nc
-            aw(j, k, 2 + m) = aw(j, k, 2 + m) * omc + rw(j, k, 4 + m) * coef
+            aw(j, k, na + m) = aw(j, k, na + m) * omc + rw(j, k, 2 * na + m) * coef
           enddo
-          aw(j, k, nc + 3) = aw(j, k, nc + 3) * omc + Hz(0, j, k) * coef
+          aw(j, k, na + nc + 1) = aw(j, k, na + nc + 1) * omc + Hz(0, j, k) * coef
         enddo
       enddo
     endif
@@ -349,12 +358,14 @@ contains
 #endif
       do k = 1, nz
         do j = j0, j1
-          ae(j, k, 1) = ae(j, k, 1) * omc + (re(j, k, 1) - re(j, k, 2)) * coef
-          ae(j, k, 2) = ae(j, k, 2) * omc + (re(j, k, 3) - re(j, k, 4)) * coef
+          if (na > 0) then
+            ae(j, k, 1) = ae(j, k, 1) * omc + (re(j, k, 1) - re(j, k, 2)) * coef
+            ae(j, k, 2) = ae(j, k, 2) * omc + (re(j, k, 3) - re(j, k, 4)) * coef
+          endif
           do m = 1, nc
-            ae(j, k, 2 + m) = ae(j, k, 2 + m) * omc + re(j, k, 4 + m) * coef
+            ae(j, k, na + m) = ae(j, k, na + m) * omc + re(j, k, 2 * na + m) * coef
           enddo
-          ae(j, k, nc + 3) = ae(j, k, nc + 3) * omc + Hz(nx + 1, j, k) * coef
+          ae(j, k, na + nc + 1) = ae(j, k, na + nc + 1) * omc + Hz(nx + 1, j, k) * coef
         enddo
       enddo
     endif
@@ -364,12 +375,14 @@ contains
 #endif
       do k = 1, nz
         do i = i0, i1
-          as(i, k, 1) = as(i, k, 1) * omc + (rs(i, k, 1) - rs(i, k, 2)) * coef
-          as(i, k, 2) = as(i, k, 2) * omc + (rs(i, k, 3) - rs(i, k, 4)) * coef
+          if (na > 0) then
+            as(i, k, 1) = as(i, k, 1) * omc + (rs(i, k, 1) - rs(i, k, 2)) * coef
+            as(i, k, 2) = as(i, k, 2) * omc + (rs(i, k, 3) - rs(i, k, 4)) * coef
+          endif
           do m = 1, nc
-            as(i, k, 2 + m) = as(i, k, 2 + m) * omc + rs(i, k, 4 + m) * coef
+            as(i, k, na + m) = as(i, k, na + m) * omc + rs(i, k, 2 * na + m) * coef
           enddo
-          as(i, k, nc + 3) = as(i, k, nc + 3) * omc + Hz(i, 0, k) * coef
+          as(i, k, na + nc + 1) = as(i, k, na + nc + 1) * omc + Hz(i, 0, k) * coef
         enddo
       enddo
     endif
@@ -379,12 +392,14 @@ contains
 #endif
       do k = 1, nz
         do i = i0, i1
-          an(i, k, 1) = an(i, k, 1) * omc + (rn(i, k, 1) - rn(i, k, 2)) * coef
-          an(i, k, 2) = an(i, k, 2) * omc + (rn(i, k, 3) - rn(i, k, 4)) * coef
+          if (na > 0) then
+            an(i, k, 1) = an(i, k, 1) * omc + (rn(i, k, 1) - rn(i, k, 2)) * coef
+            an(i, k, 2) = an(i, k, 2) * omc + (rn(i, k, 3) - rn(i, k, 4)) * coef
+          endif
           do m = 1, nc
-            an(i, k, 2 + m) = an(i, k, 2 + m) * omc + rn(i, k, 4 + m) * coef
+            an(i, k, na + m) = an(i, k, na + m) * omc + rn(i, k, 2 * na + m) * coef
           enddo
-          an(i, k, nc + 3) = an(i, k, nc + 3) * omc + Hz(i, ny + 1, k) * coef
+          an(i, k, na + nc + 1) = an(i, k, na + nc + 1) * omc + Hz(i, ny + 1, k) * coef
         enddo
       enddo
     endif
@@ -509,14 +524,14 @@ contains
   function var_name(v, s) result(vn)
     integer, intent(in) :: v, s
     character(len=64) :: vn
-    if (v == 1) then
+    if (v == 1 .and. nm > 0) then
       vn = 'ALK_add_'//trim(sname(s))
-    elseif (v == 2) then
+    elseif (v == 2 .and. nm > 0) then
       vn = 'DIC_add_'//trim(sname(s))
     elseif (v == nv) then
       vn = 'h_'//trim(sname(s))
     else
-      vn = trim(passive_name(cdr0 + v - 2))//'_add_'//trim(sname(s))
+      vn = trim(passive_name(cdr0 + v - nm))//'_add_'//trim(sname(s))
     endif
   end function var_name
 
@@ -556,10 +571,10 @@ contains
       do v = 1, nv
         vn = var_name(v, s)
         id = nc_def_var(ncid, trim(vn), (/dl, d_s, d_t/))
-        if (v == 1) then
+        if (v == 1 .and. nm > 0) then
           call nc_put_att_text(ncid, trim(vn), 'long_name', 'ALK additionality on '//trim(sadj(s))//' boundary')
           call nc_put_att_text(ncid, trim(vn), 'units', 'meq/m^3s-1')
-        elseif (v == 2) then
+        elseif (v == 2 .and. nm > 0) then
           call nc_put_att_text(ncid, trim(vn), 'long_name', 'DIC additionality on '//trim(sadj(s))//' boundary')
           call nc_put_att_text(ncid, trim(vn), 'units', 'mmol/m^3s-1')
         elseif (v == nv) then
@@ -567,7 +582,7 @@ contains
           call nc_put_att_text(ncid, trim(vn), 'units', 'meters')
         else
           call nc_put_att_text(ncid, trim(vn), 'long_name', &
-               trim(passive_name(cdr0 + v - 2))//' additionality on '//trim(sadj(s))//' boundary')
+               trim(passive_name(cdr0 + v - nm))//' additionality on '//trim(sadj(s))//' boundary')
           call nc_put_att_text(ncid, trim(vn), 'units', 'mMol m-3s-1')
         endif
       enddo

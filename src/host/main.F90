@@ -97,10 +97,10 @@ program roms_gpu
         iic = ntstart + istep - 1
         call rt_step_begin()
         call run_baroclinic_step()
-        ! ub_tune: the CPU's adjust_orlanski, before the outputs here, so that a
+        ! apply_sponge_tune: the CPU's adjust_orlanski, before the outputs here, so that a
         ! restart holds the coefficients the next step uses (exact restart)
         call adjust_orlanski()
-        call wrt_spn()                  ! ub_tune + wrt_sponge: the _spn file
+        call wrt_spn()                  ! apply_sponge_tune + wrt_sponge: the _spn file
         call rt_tic(RT_OUTPUT)
         call maybe_wrt_output()
         call wrt_avg()

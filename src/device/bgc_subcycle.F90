@@ -47,7 +47,7 @@ module bgc_subcycle_mod
   use marbl_gpu, only: marbl_on, marbl_timestep_ratio, marbl_gpu_step
   use his_io, only: wrt_file_rst, output_period_rst
   use upscale_out, only: do_upscale
-  use pflx_mod, only: ub_tune
+  use pflx_mod, only: apply_sponge_tune
   use rivers_mod, only: river_on, rivers_win_faces, rivers_win_acc
   use cdr_src_mod, only: cdr_on, cdr_win_nq, cdr_win_cols, cdr_win_acc, cdr_win_tr3d
   use cdr_lite_mod, only: cdrl_on, cdrl_psf, psf_cflx
@@ -185,11 +185,11 @@ contains
         call raise('bgcsub_init', info)
       endif
     endif
-    ! Not with subcycling (UCLA ROMS: UPSCALING output, SPONGE_TUNE ub_tune;
+    ! Not with subcycling (UCLA ROMS: upscaling output, apply_sponge_tune;
     ! GPU only: the salinity-mirror validation tracer, and what the GPU does
     ! not have yet)
     if (do_upscale) call raise('bgcsub_init', 'bgc_physics_subcycle does not support UPSCALING output')
-    if (ub_tune) call raise('bgcsub_init', 'bgc_physics_subcycle does not support SPONGE_TUNE ub_tune')
+    if (apply_sponge_tune) call raise('bgcsub_init', 'bgc_physics_subcycle does not support apply_sponge_tune')
     if (trim(passive_init) == 'mirror_salt') call raise('bgcsub_init', &
          "bgc_physics_subcycle does not support &passive_tracers init_mode = 'mirror_salt'")
     if (bgc_subcycle_pos) call raise('bgcsub_init', &

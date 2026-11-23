@@ -153,16 +153,18 @@
 # keeps u_slow, v_slow, p_slow in the restart. pflx_timescale must be > 0
 # when calc_pflx is on (the run stops otherwise).
 #
-# Sponge tuning for nested children: &sponge_tune_settings ub_tune (the CPU
-# needs the SPONGE_TUNE cpp key as well; the GPU only the switch) tunes the
+# Sponge tuning for nested children: &sponge_tune_settings apply_sponge_tune
+# (default .false.; named ub_tune in UCLA ROMS up to 0.16.0, which also needs
+# its SPONGE_TUNE cpp key; a namelist with ub_tune stops at the read) tunes the
 # inflow nudging of the open boundaries to the parent's up/vp of the
 # boundary files; it needs calc_pflx = .true. (the run stops otherwise), as
 # UCLA ROMS. wrt_sponge writes <output_root_name>_spn.<date>.nc every
 # output_period_sponge (nrpf_sponge records per file): the child and parent
 # fluxes and the coefficient of every open side, averaged over the period
 # (sponge_avg) or of the output step, as UCLA ROMS with its fixes of
-# 2026-11 (sponge-tune-pio-fixes). As UCLA ROMS's precheck, with restarts
-# and wrt_sponge on, nrpf_sponge * output_period_sponge must be positive
+# 2026-11 (sponge-tune-pio-fixes). sponge_avg defaults to .true., as in UCLA
+# ROMS (before, .false.). As UCLA ROMS's precheck, with restarts, the
+# tuning and wrt_sponge on, nrpf_sponge * output_period_sponge must be positive
 # and divide output_period_rst (the run stops otherwise). The coefficients
 # ub_west, ub_east, ub_south, ub_north are restart fields, written after
 # the step's tuning (exact restarts), as in that version of UCLA ROMS.
@@ -241,7 +243,7 @@
 # boundary), as UCLA ROMS dev 809aa24a runs the combination.
 # Refused at start-up (each with its own message): bgc_subcycle_pos =
 # .true. and bgc_subcycle_diag >= 2 (the positivity limiter and its test;
-# not on the GPU yet); UPSCALING output and ub_tune (refused by UCLA ROMS
+# not on the GPU yet); upscaling output and apply_sponge_tune (refused by UCLA ROMS
 # too); the GPU-only &passive_tracers init_mode = 'mirror_salt' test
 # tracer; builds without -DPASSIVE_FP64.
 #

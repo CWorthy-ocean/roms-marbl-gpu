@@ -50,7 +50,7 @@
   ! - sponge: a nest whose boundary data carry the internal tide runs best with a quarter of the v_sponge
   !   used with the stock boundary (the sponge damps the tide that comes in); an outermost domain, whose
   !   boundary data have no internal tide, keeps the stock value. Keep v_sponge dt/dx^2 <= 0.1;
-  ! - SPONGE_TUNE's ub_tune has no effect on the normal velocity under 'modal': leave it off;
+  ! - apply_sponge_tune has no effect on the normal velocity under 'modal': leave it off;
   ! - start: a run that does not begin from the state its boundary data come from (a nest not initialised
   !   from its parent) should take its first ~10 days with imex_obc_mode = 'fixed' and switch to 'modal'
   !   at a restart (inexact by design: m restarts from the mismatch of that day); see obm_startnote;
@@ -239,7 +239,7 @@
     ! statistics as the CPU's (min/max of c_m over the domain, failed columns;
     ! first build: the reference filter and sponge notes).
     use gpu_state, only: f, visc2_r
-    use pflx_mod, only: ub_tune
+    use pflx_mod, only: apply_sponge_tune
     integer(ip) :: c, i, j, nx, ny, m
     integer :: nb
     real(rp) :: q, ycap, cmn(OBM_MMAX), cmx(OBM_MMAX), fmn, sdn, wt, hres
@@ -322,10 +322,10 @@
                // ' the near-inertial band at the lowest |f| of the open edges: a longer imex_obc_tref' &
                // ' radiates it; see the key description'
         endif
-        if (talk .and. ub_tune) write(*,'(1x,A)') "IMEX_IGW NOTE: SPONGE_TUNE ub_tune is active with" &
+        if (talk .and. apply_sponge_tune) write(*,'(1x,A)') "IMEX_IGW NOTE: apply_sponge_tune is active with" &
              // " imex_obc_mode 'modal': the modal condition sets the normal velocity at the open faces, so the" &
              // " tuned nudging acts on the tangential velocity and the tracers only (ub may drift to its clamp);" &
-             // " ub_tune = .false. is recommended"
+             // " apply_sponge_tune = .false. is recommended"
       endif
     endif
   end subroutine obm_build
