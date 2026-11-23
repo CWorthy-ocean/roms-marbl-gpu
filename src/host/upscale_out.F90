@@ -7,19 +7,21 @@ module upscale_out
   ! The open-boundary inflow term 0.5*(t_out - t_in)*inflow of the
   ! horizontal tracer fluxes, once the CPU's UPSCALING term, applies in every
   ! run on the open sides (gpu_state open_edge_codes). With do_upscale:
-  !  - every step (after step3d_t) the outward advective flux of ALK, DIC,
-  !    their ALT_CO2 twins and the CDR_LITE tracers through each open
-  !    boundary face (the corrector's UP3 faces with the term, recomputed
-  !    from the same operands), and the running mean of ALK - ALK_ALT_CO2,
-  !    DIC - DIC_ALT_CO2, each CDR_LITE flux and the layer thickness of the
-  !    boundary cells (corners included), as the CPU's calc_average:
-  !    avg*(1 - 1/n) + x/n;
-  !  - records as the CPU's wrt_upscale: one at the first step, then every
-  !    output_period_uscl, nrpf_uscl per file, at the time of the step's
-  !    start; main's final call adds the last step's fluxes once more and
-  !    writes when the period is due. Files <root>_uscl.<date>.nc
-  !    (his_io output_fname; double), written by compute rank 0 from a
-  !    sum over the ranks of the boundary lines.
+  !  - every step (after step3d_t) the outward flux of ALK, DIC, their
+  !    ALT_CO2 twins and the CDR_LITE tracers through each open boundary
+  !    face: the corrector's UP3 face with the term and the horizontal mixing
+  !    (t3dmix) face, recomputed from the same operands (slot nrhs, which
+  !    MARBL and t3dmix do not change); and the running mean of
+  !    ALK - ALK_ALT_CO2, DIC - DIC_ALT_CO2, each CDR_LITE flux and the layer
+  !    thickness of the boundary cells (corners included), as the CPU's
+  !    calc_average: avg*(1 - 1/n) + x/n;
+  !  - records as the CPU's wrt_upscale: each averages one window of
+  !    output_period_uscl, labelled by avg_begin_time and avg_end_time
+  !    (ocean_time is the end); windows are contiguous from the run start, and
+  !    the last one, if partial, is written at the end of the run. nrpf_uscl
+  !    per file. Files <root>_uscl.<date of the start of the first window>.nc
+  !    (his_io output_fname; double), written by compute rank 0 from a sum
+  !    over the ranks of the boundary lines.
   use kinds
   use his_io, only: output_fname, refdatestr
   use decomp_mod
@@ -30,7 +32,7 @@ module upscale_out
   use sponge_io, only: sponge_global_atts
   use formulas, only: coef_up3
   use comm_mod, only: comm_rank, comm_reduce_sum
-  use passive_mod, only: ntp, tp, passive_name, ncdr, cdr0
+  use passive_mod, only: ntp, tp, passive_name, ncdr, cdr0, tnu2_tp
   use marbl_gpu, only: marbl_on
   use arch_mod, only: sync_arch
 #ifdef USE_CUDA
@@ -49,7 +51,8 @@ module upscale_out
   character(len=512) :: root = './output', fname = ''
   integer :: record = 0, nfile = 0, navg = 0, nsel = 0, nv = 0
   integer :: nm = 0           ! MARBL additionality variables: 2 (ALK, DIC), or 0 without MARBL
-  real(rp) :: otime = 0.0_rp
+  real(rp) :: otime = 0.0_rp             ! time since the current window began
+  real(rp) :: avg_begin_time = 0.0_rp    ! start of the current window
   ! sides in the CPU's file order
   integer, parameter :: SN = 1, SS = 2, SE = 3, SW = 4
   character(len=5), parameter :: sname(4) = (/'north', 'south', 'east ', 'west '/)
@@ -130,8 +133,8 @@ contains
     enddo
     ncbuf = 2 * sum(nline, mask=side_on)
     allocate(hbuf(max(nbuf, ncbuf)), gbuf(max(nbuf, ncbuf)))
-    ! the CPU's start: a record at the first step
-    record = nrpf_uscl; nfile = 0; navg = 0; otime = output_period_uscl
+    ! the first window opens a file
+    record = nrpf_uscl; nfile = 0; navg = 0; otime = 0.0_rp
     on = .true.
     if (comm_rank() == 0) write(*,'(a,es12.4,a,i0,a,4l2)') 'upscale output: period ', output_period_uscl, &
          ' s, ', nrpf_uscl, ' records per file, sides N S E W', side_on
@@ -171,10 +174,12 @@ contains
   subroutine capture()
     ! The outward flux through the boundary faces of the interior edge
     ! cells: the corrector's UP3 face of up3_div (passive_column) from slot
-    ! nrhs, with the UPSCALING term; west/south -F, east/north F.
+    ! nrhs, with the open-boundary inflow term (west/south -F, east/north F),
+    ! and the mixing face fm of t3dmix_point, the gradient times the
+    ! diffusivity, which is minus the flux (west/south +fm, east/north -fm).
     integer :: i, j, k, q, nx, ny, nz, ns, nr
     integer(ip) :: itr, c0, cm, cp
-    real(rp) :: t0, xm, xp, fu, m0, m1, m2, m3, dc, dl, dr, de, ft, f
+    real(rp) :: t0, xm, xp, fu, m0, m1, m2, m3, dc, dl, dr, de, ft, f, fm, bg
     logical :: b1, b2, bo, bc
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ns = nsel; nr = nrhs
     if (decomp%edge_w .and. obc_west) then
@@ -208,7 +213,11 @@ contains
             f = 0.0_rp
             if (b1) f = ft * fu - coef_up3 * ((dc - dl) * m0 * m1 * max(fu, 0.0_rp) + (dr - dc) * m1 * m2 * min(fu, 0.0_rp))
             if (b1) f = f + 0.5_rp * (xm - t0) * max(fu, 0.0_rp)    ! the open-boundary inflow term
-            rw(j, k, q) = -f
+            bg = tnu2_tp(itr)
+            fm = 0.0_rp
+            if (b1) fm = 0.25_rp * ((bg + diff2_sp(1, j)) + (bg + diff2_sp(0, j))) * &
+                 pmon_u(1, j) * (Hz(1, j, k) + Hz(0, j, k)) * (t0 - xm)
+            rw(j, k, q) = -f + fm
           enddo
         enddo
       enddo
@@ -244,7 +253,11 @@ contains
             f = 0.0_rp
             if (b2) f = ft * fu - coef_up3 * ((dr - dc) * m1 * m2 * max(fu, 0.0_rp) + (de - dr) * m2 * m3 * min(fu, 0.0_rp))
             if (b2) f = f + 0.5_rp * (xp - t0) * min(fu, 0.0_rp)    ! the open-boundary inflow term
-            re(j, k, q) = f
+            bg = tnu2_tp(itr)
+            fm = 0.0_rp
+            if (b2) fm = 0.25_rp * ((bg + diff2_sp(nx + 1, j)) + (bg + diff2_sp(nx, j))) * &
+                 pmon_u(nx + 1, j) * (Hz(nx + 1, j, k) + Hz(nx, j, k)) * (xp - t0)
+            re(j, k, q) = f - fm
           enddo
         enddo
       enddo
@@ -280,7 +293,11 @@ contains
             f = 0.0_rp
             if (b1) f = ft * fu - coef_up3 * ((dc - dl) * m0 * m1 * max(fu, 0.0_rp) + (dr - dc) * m1 * m2 * min(fu, 0.0_rp))
             if (b1) f = f + 0.5_rp * (xm - t0) * max(fu, 0.0_rp)    ! the open-boundary inflow term
-            rs(i, k, q) = -f
+            bg = tnu2_tp(itr)
+            fm = 0.0_rp
+            if (b1) fm = 0.25_rp * ((bg + diff2_sp(i, 1)) + (bg + diff2_sp(i, 0))) * &
+                 pnom_v(i, 1) * (Hz(i, 1, k) + Hz(i, 0, k)) * (t0 - xm)
+            rs(i, k, q) = -f + fm
           enddo
         enddo
       enddo
@@ -316,7 +333,11 @@ contains
             f = 0.0_rp
             if (b2) f = ft * fu - coef_up3 * ((dr - dc) * m1 * m2 * max(fu, 0.0_rp) + (de - dr) * m2 * m3 * min(fu, 0.0_rp))
             if (b2) f = f + 0.5_rp * (xp - t0) * min(fu, 0.0_rp)    ! the open-boundary inflow term
-            rn(i, k, q) = f
+            bg = tnu2_tp(itr)
+            fm = 0.0_rp
+            if (b2) fm = 0.25_rp * ((bg + diff2_sp(i, ny + 1)) + (bg + diff2_sp(i, ny))) * &
+                 pnom_v(i, ny + 1) * (Hz(i, ny + 1, k) + Hz(i, ny, k)) * (xp - t0)
+            rn(i, k, q) = f - fm
           enddo
         enddo
       enddo
@@ -405,36 +426,43 @@ contains
   end subroutine average
 
   subroutine wrt_upscale()
-    ! After step3d_t (the CPU calls it at the end of its tracer loop): this
-    ! step's fluxes into the means, a record when due, at time n.
+    ! After step3d_t: add this step's boundary fluxes to the current window,
+    ! and write the window once it spans output_period_uscl (the CPU's
+    ! wrt_upscale).
+    real(rp) :: tstart
     if (.not. on) return
+    tstart = start_time + dt * real(iic - ntstart, rp)
+    if (navg == 0) then
+      avg_begin_time = tstart
+      ! a file is opened at the start of its first window and named after it
+      if (record == nrpf_uscl) then
+        nfile = nfile + 1
+        record = 0
+        call output_fname(root, 'uscl', tstart, fname)
+        call create_file(fname)
+      endif
+    endif
     call capture()
-    call advance(start_time + dt * real(iic - ntstart, rp))
+    call average()
+    otime = otime + dt
+    if (otime >= output_period_uscl) call end_window(tstart + dt)
   end subroutine wrt_upscale
 
   subroutine wrt_upscale_final()
-    ! main's final call: the last fluxes once more, at the end time.
+    ! After the time loop: write the last window if it is partial. Its steps
+    ! are already in the average.
     if (.not. on) return
-    call advance(start_time + dt * real(iic - ntstart + 1, rp))
+    if (navg > 0) call end_window(start_time + dt * real(iic - ntstart + 1, rp))
   end subroutine wrt_upscale_final
 
-  subroutine advance(tnow)
+  subroutine end_window(tnow)
+    ! Write the average over [avg_begin_time, tnow] and start a new window.
     real(rp), intent(in) :: tnow
-    call average()
-    otime = otime + dt
-    if (record == nrpf_uscl .and. otime >= output_period_uscl) then
-      nfile = nfile + 1
-      record = 0
-      call output_fname(root, 'uscl', tnow, fname)
-      call create_file(fname)
-    endif
-    if (otime >= output_period_uscl) then
-      record = record + 1
-      call write_record(tnow)
-      otime = 0.0_rp
-      navg = 0
-    endif
-  end subroutine advance
+    record = record + 1
+    call write_record(tnow)
+    otime = 0.0_rp
+    navg = 0
+  end subroutine end_window
 
   subroutine write_record(tnow)
     ! The means summed over the ranks into the global lines (each boundary
@@ -452,6 +480,8 @@ contains
     if (comm_rank() == 0) then
       call nc_open_write(trim(fname), ncid)
       call nc_put_1d_rec(ncid, 'ocean_time', tnow, record)
+      call nc_put_1d_rec(ncid, 'avg_begin_time', avg_begin_time, record)
+      call nc_put_1d_rec(ncid, 'avg_end_time', tnow, record)
       do s = 1, 4
         if (.not. side_on(s)) cycle
         do v = 1, nv
@@ -564,6 +594,12 @@ contains
     id = nc_def_var(ncid, 'ocean_time', (/d_t/))
     call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
+    id = nc_def_var(ncid, 'avg_begin_time', (/d_t/))
+    call nc_put_att_text(ncid, 'avg_begin_time', 'long_name', 'Time at beginning of averaging period')
+    call nc_put_att_text(ncid, 'avg_begin_time', 'units', 'second')
+    id = nc_def_var(ncid, 'avg_end_time', (/d_t/))
+    call nc_put_att_text(ncid, 'avg_end_time', 'long_name', 'Time at end of averaging period')
+    call nc_put_att_text(ncid, 'avg_end_time', 'units', 'second')
     do s = 1, 4
       if (.not. side_on(s)) cycle
       dl = merge(d_xi, d_eta, s == SN .or. s == SS)
@@ -572,17 +608,17 @@ contains
         id = nc_def_var(ncid, trim(vn), (/dl, d_s, d_t/))
         if (v == 1 .and. nm > 0) then
           call nc_put_att_text(ncid, trim(vn), 'long_name', 'ALK additionality on '//trim(sadj(s))//' boundary')
-          call nc_put_att_text(ncid, trim(vn), 'units', 'meq/m^3s-1')
+          call nc_put_att_text(ncid, trim(vn), 'units', 'meq/m^3 * m3/s')
         elseif (v == 2 .and. nm > 0) then
           call nc_put_att_text(ncid, trim(vn), 'long_name', 'DIC additionality on '//trim(sadj(s))//' boundary')
-          call nc_put_att_text(ncid, trim(vn), 'units', 'mmol/m^3s-1')
+          call nc_put_att_text(ncid, trim(vn), 'units', 'mmol/m^3 * m3/s')
         elseif (v == nv) then
           call nc_put_att_text(ncid, trim(vn), 'long_name', 'Layer thickness on '//trim(sadj(s))//' boundary')
           call nc_put_att_text(ncid, trim(vn), 'units', 'meters')
         else
           call nc_put_att_text(ncid, trim(vn), 'long_name', &
                trim(passive_name(cdr0 + v - nm))//' additionality on '//trim(sadj(s))//' boundary')
-          call nc_put_att_text(ncid, trim(vn), 'units', 'mMol m-3s-1')
+          call nc_put_att_text(ncid, trim(vn), 'units', 'mMol m-3 * m3/s')
         endif
       enddo
       vn = 'lat_'//trim(sname(s))

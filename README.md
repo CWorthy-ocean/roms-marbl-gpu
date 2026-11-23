@@ -359,6 +359,13 @@ v0.1.2-beta, bit for bit.
 - Upscaling (`do_upscale`) works without MARBL in runs with CDR_LITE
   tracers: the `_uscl` files then hold the fluxes of those tracers only, as
   in UCLA ROMS after 0.16.0.
+- Upscaling output follows current UCLA ROMS (it followed versions before
+  0.13.0), so `_uscl` files change. The fluxes include the horizontal mixing
+  across the open boundaries (sponge, `tnu2`); before, advection only. Each
+  record averages one window, with `avg_begin_time` and `avg_end_time`; there
+  is no extra record at the first step, the last step is counted once, and a
+  partial last window is written. A file is named after the start of its
+  first window. `uscl_to_cdr.py` of UCLA ROMS 0.13.0 and later reads them.
 
 ## Numerics
 
