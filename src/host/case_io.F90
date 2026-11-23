@@ -91,7 +91,7 @@ module case_io
   ! and C-Star writes them so. A fixed, generous length accepts any such list
   ! however the tracers are counted. Entries not given are 0, as on the CPU.
   integer, parameter :: nml_ntrc_max = 512
-  real(rp) :: case_tnu2(nml_ntrc_max) = 0.0_rp   ! &tracer_diff2 tnu2 (TS_DIF2 background)
+  real(rp) :: case_tnu2(nml_ntrc_max) = 0.0_rp   ! &tracer_diff2 tnu2 (background)
   integer(ip) :: case_nt_passive = 0             ! param_settings nt_passive (the CPU's count)
 
   public :: read_namelist
@@ -120,8 +120,9 @@ contains
     namelist /initial_conditions/ inifile, ininame, nrrec
     namelist /simulation_name_settings/ output_root_name, title
     namelist /ubind_settings/ ubind
+    logical  :: use_boundary_sponge
     real(rp) :: v_sponge, v_sponge_trc
-    namelist /v_sponge_settings/ v_sponge, v_sponge_trc
+    namelist /v_sponge_settings/ use_boundary_sponge, v_sponge, v_sponge_trc
     namelist /calc_pflx_settings/ calc_pflx, pflx_timescale
     namelist /sponge_tune_settings/ sponge_timescale, nrpf_sponge, output_period_sponge, ub_tune, wrt_sponge, &
                                     sponge_avg
@@ -173,15 +174,20 @@ contains
                                akv_bak_in, akt_bak_in, rho0_in)
     rewind(unit); read(unit, nml=ubind_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'UBIND_SETTINGS')
+    use_boundary_sponge = .true.
     v_sponge = 0.0_rp
     v_sponge_trc = -1.0_rp     ! the CPU's default: negative (or absent) = v_sponge
     rewind(unit); read(unit, nml=v_sponge_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'V_SPONGE_SETTINGS')
     if (ios /= 0) v_sponge = 0.0_rp
     if (v_sponge_trc < 0.0_rp) v_sponge_trc = v_sponge   ! as the CPU (scalars.F90)
+    if (v_sponge < 0.0_rp) error stop 'v_sponge_settings: v_sponge must not be negative'
+    call set_sponge_global_atts(use_boundary_sponge, v_sponge, v_sponge_trc)
+    if (.not. use_boundary_sponge) then   ! apply_sponge then adds nothing
+      v_sponge = 0.0_rp; v_sponge_trc = 0.0_rp
+    endif
     case_v_sponge = v_sponge
     case_v_sponge_trc = v_sponge_trc
-    call set_sponge_global_atts(v_sponge, v_sponge_trc)
     ! pressure fluxes for nesting (optional group; absent: off)
     calc_pflx = .false.; pflx_timescale = 0.0_rp
     rewind(unit); read(unit, nml=calc_pflx_settings, iostat=ios, iomsg=msg)
@@ -284,7 +290,7 @@ contains
   end subroutine read_tile_settings
 
   subroutine set_tnu2()
-    ! TS_DIF2 background diffusivity, CPU init_arrays_mixing: diff2 =
+    ! Background diffusivity, CPU init_arrays_mixing: diff2 =
     ! tnu2(itrc) for every tracer; apply_sponge then adds the sponge ramp
     ! (CPU set_nudgcof). T and S: diff2(:, :, itrc). Passives: tnu2_tp(itp),
     ! the entry of the CPU tracer each one is (passive.F90 tp layout). The
@@ -320,7 +326,7 @@ contains
   end subroutine set_tnu2
 
   subroutine apply_sponge()
-    ! CPU set_nudgcof (SPONGE, UV_VIS2, TS_DIF2, not PACIFIC): linear ramp
+    ! CPU set_nudgcof (use_boundary_sponge, not PACIFIC): linear ramp
     ! over isp = sponge_size+1 points from every open edge (the CPU's
     ! OBC_WEST/EAST/SOUTH/NORTH; here obc_*, set by init_bry and init_tides).
     ! A closed edge gets no sponge.
@@ -348,7 +354,7 @@ contains
       enddo
     enddo
 
-    if (case_v_sponge > 0.0_rp) then        ! momentum (the CPU's UV_VIS2 part)
+    if (case_v_sponge > 0.0_rp) then        ! momentum
       visc2_r = visc2_r + case_v_sponge * wrk
       do j = j_lo + 1, j_hi
         do i = i_lo + 1, i_hi
@@ -357,7 +363,7 @@ contains
         enddo
       enddo
     endif
-    ! tracers (the CPU's TS_DIF2 part, which the GPU always has): v_sponge_trc
+    ! tracers: v_sponge_trc
     do itrc = 1, size(diff2, 3)
       diff2(:, :, itrc) = diff2(:, :, itrc) + case_v_sponge_trc * wrk
     enddo

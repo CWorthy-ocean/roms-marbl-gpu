@@ -23,6 +23,14 @@
 #           gives a sponge on the tracers only. Output files carry the
 #           global attributes v_sponge, v_sponge_trc and their _units, as
 #           UCLA ROMS.
+#   after 0.16.0  &v_sponge_settings  use_boundary_sponge
+#           as UCLA ROMS (there it replaces the SPONGE cpp key): .true.
+#           (default) adds the sponge along the open boundaries with the
+#           maxima v_sponge and v_sponge_trc (no sponge if both are 0);
+#           .false. adds none, and the output files do not carry the
+#           v_sponge attributes. A negative v_sponge stops the run. UCLA
+#           ROMS 0.16.0 and earlier do not read the key: there the SPONGE
+#           cpp key decides, and a build without it ignores v_sponge.
 #
 # GPU-only additions: the optional group &tile_settings (tile balancing),
 # &passive_tracers (n_passive, init_mode, write_passive), and in
@@ -77,13 +85,12 @@
 # for the ALT_CO2 system), as UCLA ROMS without PCO2AIR_FORCING. Before,
 # the GPU read the key and used a fixed 284.7.
 #
-# Surface restoring: UCLA ROMS selects it with cpp keys, which the GPU model
-# cannot see; roms_gpu switches it on with logical keys in
-# &surf_frc_settings (default .false., bulk forcing only), and reads the
-# coefficient from the same group as UCLA ROMS. UCLA ROMS (after 0.16.0,
-# ucla-roms#475) also accepts these three keys and stops when one
-# disagrees with its cpp key, so a namelist can carry them for both models:
-#   CPU cpp key        roms_gpu &surf_frc_settings   coefficient group (cm/day)
+# Surface restoring: logical keys in &surf_frc_settings (default .false.,
+# bulk forcing only) switch it on, as in UCLA ROMS after 0.16.0; before,
+# UCLA ROMS selected it with cpp keys. The coefficient group of a switch
+# that is on must be present (the run stops otherwise; before, the GPU
+# used 7.777 cm/day), as in UCLA ROMS:
+#   old CPU cpp key    &surf_frc_settings             coefficient group (cm/day)
 #   SFLX_CORR          sflx_corr = .true.             &sss_correction dSSSdt
 #   QCORRECTION        qcorrection = .true.           &sst_correction dSSTdt
 #   CFLX_CORR (MARBL)  cflx_corr = .true.             &dic_alk_correction dCdt
@@ -168,7 +175,8 @@
 # accept one value per tracer, as in UCLA ROMS (up to 512), in its tracer
 # order (T, S, nt_passive generic, CDR_LITE, MARBL). Only akt_bak's T and S
 # entries are used (as on the CPU, the other tracers mix with salinity's
-# diffusivity). tnu2 is used per tracer, as UCLA ROMS with TS_DIF2: each
+# diffusivity). Values beyond the number of tracers are ignored, as in UCLA
+# ROMS after 0.16.0. tnu2 is used per tracer, as UCLA ROMS: each
 # tracer's harmonic diffusivity is its tnu2 plus the v_sponge_trc ramp. Generic
 # passives added by the GPU-only &passive_tracers n_passive beyond nt_passive
 # take salinity's tnu2.
