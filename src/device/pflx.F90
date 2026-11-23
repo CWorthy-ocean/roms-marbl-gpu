@@ -1,7 +1,7 @@
 #include "mem_attr.inc"
 module pflx_mod
   ! Depth-integrated baroclinic (internal-tide) energy flux for nesting:
-  ! UCLA ROMS calc_pflx_mod (DIAGNOSTICS + &calc_pflx_settings calc_pflx),
+  ! UCLA ROMS calc_pflx_mod (&calc_pflx_settings calc_pflx),
   ! with the internal-tide pressure of ucla-roms eae883ee (Kelly, Nash and
   ! Kunze 2010). Divided by rho0, in m^4/s^3 (multiply by rho0 for W/m):
   !   up = int u' p' dz at u-points, vp = int v' p' dz at v-points,
@@ -23,9 +23,8 @@ module pflx_mod
   ! by rounding only.
   !
   ! The running means are restart fields (u_slow, v_slow, p_slow; his_io,
-  ! case_io). The CPU computes the fluxes only when it is built with the
-  ! DIAGNOSTICS cpp key; the GPU model has no cpp keys and computes them
-  ! whenever calc_pflx is .true.
+  ! case_io). The fluxes are computed whenever
+  ! calc_pflx is .true., as on the CPU.
   use kinds
   use decomp_mod, only: decomp
   use gpu_state
@@ -36,8 +35,8 @@ module pflx_mod
   private
   public :: calc_pflx, pflx_timescale, init_pflx, calc_pressure_flux, pflx_fill_slow_halos
   public :: up, vp, u_slow, v_slow, p_slow
-  ! child side: SPONGE_TUNE (CPU sponge_tune.F90)
-  public :: ub_tune, sponge_timescale, nrpf_sponge, output_period_sponge, wrt_sponge, sponge_avg
+  ! child side: sponge tuning (CPU sponge_tune.F90)
+  public :: apply_sponge_tune, sponge_timescale, nrpf_sponge, output_period_sponge, wrt_sponge, sponge_avg
   public :: ub_w, ub_e, ub_s, ub_n, pf_w, pf_e, pf_s, pf_n, init_sponge_tune
 
   ! &calc_pflx_settings (the CPU's group)
@@ -51,18 +50,18 @@ module pflx_mod
   real(rp), WORK_ATTR allocatable :: p_fast(:,:,:), p_int(:,:)
   real(rp) :: alpha = 0.0_rp, beta = 1.0_rp
 
-  ! &sponge_tune_settings (the CPU's group and defaults). With ub_tune, the
+  ! &sponge_tune_settings (the CPU's group and defaults). With apply_sponge_tune, the
   ! inflow nudging coefficient of the 3-D Orlanski boundary conditions
   ! (u, v, tracers) is raised to min(ub, 1) at every boundary point, where
   ! ub is tuned every step by the difference between the parent's
   ! baroclinic energy flux (up/vp of the boundary file) and the child's
   ! own flux one point inside (sponge_io adjust_orlanski).
-  logical :: ub_tune = .false., wrt_sponge = .false., sponge_avg = .false.
+  logical :: apply_sponge_tune = .false., wrt_sponge = .false., sponge_avg = .true.
   real(rp) :: sponge_timescale = 24 * 3600.0_rp, output_period_sponge = 24 * 3600.0_rp
   integer :: nrpf_sponge = 7
   ! ub_<side>(j|i) and the parent flux pf_<side> at this tile's points along
   ! each physical edge (local index, allocated on every tile: the boundary
-  ! kernels index them only on edge tiles with ub_tune on)
+  ! kernels index them only on edge tiles with apply_sponge_tune on)
   real(rp), WORK_ATTR allocatable :: ub_w(:), ub_e(:), ub_s(:), ub_n(:)
   real(rp), WORK_ATTR allocatable :: pf_w(:), pf_e(:), pf_s(:), pf_n(:)
 
@@ -89,9 +88,9 @@ contains
     ! init_orlanski_tune / get_init_ub).
     integer(ip) :: is, ie, js, je
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
-    if (ub_tune .and. .not. calc_pflx) &
-      error stop 'sponge_tune: ub_tune needs &calc_pflx_settings calc_pflx = .true. (as UCLA ROMS)'
-    if (ub_tune .and. sponge_timescale <= 0.0_rp) error stop 'sponge_tune: sponge_timescale must be > 0'
+    if (apply_sponge_tune .and. .not. calc_pflx) &
+      error stop 'sponge_tune: apply_sponge_tune needs &calc_pflx_settings calc_pflx = .true. (as UCLA ROMS)'
+    if (apply_sponge_tune .and. sponge_timescale <= 0.0_rp) error stop 'sponge_tune: sponge_timescale must be > 0'
     if (allocated(ub_w)) return
     allocate(ub_w(js:je), ub_e(js:je), ub_s(is:ie), ub_n(is:ie))
     allocate(pf_w(js:je), pf_e(js:je), pf_s(is:ie), pf_n(is:ie))

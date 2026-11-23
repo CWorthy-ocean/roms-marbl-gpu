@@ -20,7 +20,7 @@ module passive_mod
   use time_state
   use passive_column_mod, only: passive_column_run, passive_horiz_run, passive_t3dmix_run
   use halo_mod, only: halo_fill_3d_tp, halo_tp_start, halo_tp_mid, halo_tp_finish, tp_overlap_on
-  use pflx_mod, only: ub_tune, ub_w, ub_e, ub_s, ub_n
+  use pflx_mod, only: apply_sponge_tune, ub_w, ub_e, ub_s, ub_n
   use rivers_mod, only: river_on, rivers_tp, RIV_PRE, RIV_COR
   use cdr_src_mod, only: cdr_on, cdr_apply_tp
   use cdr_lite_mod, only: cdrl_on, cdrl_psf, psf_cflx
@@ -404,7 +404,7 @@ contains
     ns = nstp; nn = nnew; nr = nrhs
     mir = passive_mirror
     mbry = passive_bry
-    ubt = ub_tune
+    ubt = apply_sponge_tune
     if (nnew == 3) then
       dtw = 0.5_rp * dt
     else
@@ -436,7 +436,7 @@ contains
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_west(j, k, isalt)
               if (mbry) text = tb_west(j, k, itr)
-              if (ubt) cext = max(cext, min(ub_w(j), 1.0_rp))   ! SPONGE_TUNE (CPU t3dbc ub_tune)
+              if (ubt) cext = max(cext, min(ub_w(j), 1.0_rp))   ! apply_sponge_tune (CPU t3dbc)
               tp(itr, tpcol(0, j), k, nn) = real(((1.0_rp - cext) * tn + cext * text) * rmask(0, j), pp)
             enddo
           enddo
@@ -481,7 +481,7 @@ contains
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_east(j, k, isalt)
               if (mbry) text = tb_east(j, k, itr)
-              if (ubt) cext = max(cext, min(ub_e(j), 1.0_rp))   ! SPONGE_TUNE (CPU t3dbc ub_tune)
+              if (ubt) cext = max(cext, min(ub_e(j), 1.0_rp))   ! apply_sponge_tune (CPU t3dbc)
               tp(itr, tpcol(nx + 1, j), k, nn) = real(((1.0_rp - cext) * tn + cext * text) * rmask(nx + 1, j), pp)
             enddo
           enddo
@@ -525,7 +525,7 @@ contains
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_south(i, k, isalt)
               if (mbry) text = tb_south(i, k, itr)
-              if (ubt) cext = max(cext, min(ub_s(i), 1.0_rp))   ! SPONGE_TUNE (CPU t3dbc ub_tune)
+              if (ubt) cext = max(cext, min(ub_s(i), 1.0_rp))   ! apply_sponge_tune (CPU t3dbc)
               tp(itr, tpcol(i, 0), k, nn) = real(((1.0_rp - cext) * tn + cext * text) * rmask(i, 0), pp)
             enddo
           enddo
@@ -570,7 +570,7 @@ contains
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_north(i, k, isalt)
               if (mbry) text = tb_north(i, k, itr)
-              if (ubt) cext = max(cext, min(ub_n(i), 1.0_rp))   ! SPONGE_TUNE (CPU t3dbc ub_tune)
+              if (ubt) cext = max(cext, min(ub_n(i), 1.0_rp))   ! apply_sponge_tune (CPU t3dbc)
               tp(itr, tpcol(i, ny + 1), k, nn) = real(((1.0_rp - cext) * tn + cext * text) * rmask(i, ny + 1), pp)
             enddo
           enddo
