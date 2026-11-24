@@ -393,6 +393,10 @@ v0.1.2-beta, bit for bit.
   earlier. Averaged CDR output (`_cdr`) with a MARBL timestep longer than
   `dt` adds MARBL's fields right after each MARBL step, and
   `output_period_cdr` must be a multiple of that timestep, as in UCLA ROMS.
+- `wrt_passive` in `&ts_output_settings` (default `.true.`), as in UCLA ROMS
+  after 0.16.0, puts the generic passive and CDR_LITE tracers in `_his`. It
+  replaces the GPU-only `&passive_tracers write_passive`; a namelist that
+  still has that key stops at the read.
 - History files name the salinity diffusivity `AKs`, as UCLA ROMS (before,
   `Aks`).
 

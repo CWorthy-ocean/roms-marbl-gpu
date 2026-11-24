@@ -148,6 +148,11 @@
     marbl_timestep = 3600.0
 /
 
-&passive_tracers
-    write_passive = .true.
+&bgc_settings
+    nrpf_bgc_his = 100
+    nrpf_bgc_his_dia = 100
+    output_period_bgc_his = 21600.0
+    output_period_bgc_his_dia = 21600.0
+    wrt_bgc_his = .true.
+    wrt_bgc_dia_his = .true.
 /

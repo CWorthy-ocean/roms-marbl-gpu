@@ -36,7 +36,7 @@ module passive_mod
   real(pp), WORK_ATTR public, allocatable :: tp(:, :, :, :)
   character(len=16), public :: passive_init = 'zero'           ! zero | blob | mirror_salt
   logical, public :: passive_mirror = .false.
-  logical, public :: wrt_passive = .true.
+  logical, public :: wrt_passive = .true.   ! in _his (&ts_output_settings, read by his_io)
   ! MARBL mode: the passives start with the MARBL tracers (names from
   ! MARBL, read from the initial file by name, external boundary values from
   ! the boundary data below instead of 0), followed by the generic tracers.
@@ -91,20 +91,25 @@ contains
     ! is the count unless overridden here.
     integer, intent(in) :: unit
     integer(ip), intent(in) :: n_from_param
-    integer :: ios
+    integer :: ios, i
     integer(ip) :: n_passive
     character(len=16) :: init_mode
-    logical :: write_passive
-    namelist /passive_tracers/ n_passive, init_mode, write_passive
+    character(len=512) :: msg
+    namelist /passive_tracers/ n_passive, init_mode
     n_passive = n_from_param
     init_mode = 'zero'
-    write_passive = .true.
     rewind(unit)
-    read(unit, nml=passive_tracers, iostat=ios)
-    if (ios > 0) error stop 'passive_tracers namelist: read error'
+    read(unit, nml=passive_tracers, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      do i = 1, len(msg)                     ! nvfortran pads iomsg with NULs (as nc_io's iomsg_text)
+        if (iachar(msg(i:i)) < 32) msg(i:i) = ' '
+      enddo
+      write(*,'(2a)') 'PASSIVE_TRACERS: ', trim(msg)
+      write(*,'(a)') '  (write_passive is now wrt_passive, in &ts_output_settings)'
+      error stop 'passive_tracers namelist: read error'
+    endif
     ntp = max(n_passive, 0_ip)
     passive_init = init_mode
-    wrt_passive = write_passive
     passive_mirror = (trim(passive_init) == 'mirror_salt')
     if (passive_mirror .and. ntp < 1) ntp = 1
     if (ntp > 0) write(*,'(a,i0,a,a,a,i0,a)') 'passive tracers: ', ntp, '  init = ', &
