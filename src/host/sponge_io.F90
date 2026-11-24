@@ -1,7 +1,7 @@
 #include "mem_attr.inc"
 module sponge_io
   ! Child side of the nesting pressure fluxes: UCLA ROMS sponge_tune.F90
-  ! (SPONGE_TUNE cpp key + &sponge_tune_settings ub_tune). After every
+  ! (&sponge_tune_settings apply_sponge_tune). After every
   ! step's outputs (the CPU's adjust_orlanski), the inflow nudging
   ! coefficient ub_<side> of each open side is moved toward matching the
   ! parent's baroclinic energy flux normal to the side (up_west, up_east,
@@ -22,7 +22,7 @@ module sponge_io
   use nc_io
   use io_server, only: io_stage8_line
   use bry_io, only: set_pflx_bry
-  use pflx_mod, only: ub_tune, sponge_timescale, up, vp, ub_w, ub_e, ub_s, ub_n, pf_w, pf_e, pf_s, pf_n, &
+  use pflx_mod, only: apply_sponge_tune, sponge_timescale, up, vp, ub_w, ub_e, ub_s, ub_n, pf_w, pf_e, pf_s, pf_n, &
                       wrt_sponge, sponge_avg
   use arch_mod, only: sync_arch
   use comm_mod, only: comm_rank
@@ -79,7 +79,7 @@ contains
   subroutine init_spn_arrays()
     ! After alloc_state; zero (the corners and the off-edge parts stay 0).
     integer(ip) :: is, ie, js, je
-    if (.not. ub_tune .or. allocated(cf_w)) return
+    if (.not. apply_sponge_tune .or. allocated(cf_w)) return
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     allocate(cf_w(js:je), cf_e(js:je), cf_s(is:ie), cf_n(is:ie))
     allocate(cfa_w(js:je), cfa_e(js:je), cfa_s(is:ie), cfa_n(is:ie))
@@ -102,7 +102,7 @@ contains
     integer(ip) :: i, j, nx, ny
     real(rp) :: tneed, a, pf, cf, c
     logical :: av
-    if (.not. ub_tune) return
+    if (.not. apply_sponge_tune) return
     nx = decomp%nx; ny = decomp%ny
     ! the CPU's set_frc_data time here: tdays = t(n+1), frc_time '1/2 fwd'
     tneed = (start_time + dt * real(iic - ntstart, rp) + dt) * sec2day + 0.5_rp * dt * sec2day
@@ -223,10 +223,10 @@ contains
   end subroutine line_range
 
   subroutine def_rst_ub(ncid, d_xi, d_eta, d_t)
-    ! The CPU's restart definitions (basic_output, SPONGE_TUNE + ub_tune).
+    ! The CPU's restart definitions (basic_output, apply_sponge_tune).
     integer, intent(in) :: ncid, d_xi, d_eta, d_t
     integer :: id
-    if (.not. ub_tune) return
+    if (.not. apply_sponge_tune) return
     id = nc_def_var(ncid, 'ub_west', (/d_eta, d_t/))
     call nc_put_att_text(ncid, 'ub_west', 'long_name', 'west bc tuning coeff')
     id = nc_def_var(ncid, 'ub_east', (/d_eta, d_t/))
@@ -240,7 +240,7 @@ contains
   subroutine stage_rst_ub()
     ! io_server path: every tile stages the four lines (empty off the edge).
     integer :: lo, hi, fp
-    if (.not. ub_tune) return
+    if (.not. apply_sponge_tune) return
     call line_range(1, lo, hi, fp)
     call io_stage8_line('ub_west', ub_w, int(decomp%js), int(decomp%je), lo, hi, fp)
     call line_range(2, lo, hi, fp)
@@ -254,7 +254,7 @@ contains
   subroutine put_rst_ub(ncid, rec)
     ! Serial-writer path (this tile's turn, the file open).
     integer, intent(in) :: ncid, rec
-    if (.not. ub_tune) return
+    if (.not. apply_sponge_tune) return
     call put1(1, ub_w, int(decomp%js), int(decomp%je))
     call put1(2, ub_e, int(decomp%js), int(decomp%je))
     call put1(3, ub_s, int(decomp%is), int(decomp%ie))
@@ -278,7 +278,7 @@ contains
     ! The CPU's get_init_ub: ub_<side> of the current record on the edge
     ! tiles' interior points; absent: 0 (with the CPU's warning).
     integer, intent(in) :: ncid, rec
-    if (.not. ub_tune) return
+    if (.not. apply_sponge_tune) return
     call sync_arch()
     call get1(1, ub_w, int(decomp%js), int(decomp%je), decomp%edge_w, int(decomp%ny), int(decomp%j0))
     call get1(2, ub_e, int(decomp%js), int(decomp%je), decomp%edge_e, int(decomp%ny), int(decomp%j0))

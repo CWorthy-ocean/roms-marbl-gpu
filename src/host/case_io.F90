@@ -30,7 +30,7 @@ module case_io
   use halo_mod, only: halo_fill_2d, halo_fill_2d_s, halo_fill_3d_s, halo_fill_3d_t, halo_fill_3d_tp
   use formulas, only: rho0_eos => rho0
   use pflx_mod, only: calc_pflx, pflx_timescale, init_pflx, pflx_fill_slow_halos, u_slow, v_slow, p_slow
-  use pflx_mod, only: ub_tune, sponge_timescale, nrpf_sponge, output_period_sponge, wrt_sponge, sponge_avg, &
+  use pflx_mod, only: apply_sponge_tune, sponge_timescale, nrpf_sponge, output_period_sponge, wrt_sponge, sponge_avg, &
                       init_sponge_tune
   use sponge_io, only: load_rst_ub, init_spn_arrays, set_sponge_global_atts
   use sponge_out, only: set_spn_root, init_spn_output
@@ -124,7 +124,7 @@ contains
     real(rp) :: v_sponge, v_sponge_trc
     namelist /v_sponge_settings/ use_boundary_sponge, v_sponge, v_sponge_trc
     namelist /calc_pflx_settings/ calc_pflx, pflx_timescale
-    namelist /sponge_tune_settings/ sponge_timescale, nrpf_sponge, output_period_sponge, ub_tune, wrt_sponge, &
+    namelist /sponge_tune_settings/ sponge_timescale, nrpf_sponge, output_period_sponge, apply_sponge_tune, wrt_sponge, &
                                     sponge_avg
 
     llm = 32; mmm = 32; nz = 0; n = 0
@@ -194,10 +194,10 @@ contains
     call nml_stop(ios, msg, 'CALC_PFLX_SETTINGS')
     if (ios /= 0) calc_pflx = .false.
     ! child side: sponge tuning (optional group; absent: off)
-    ub_tune = .false.; wrt_sponge = .false.; sponge_avg = .false.
+    apply_sponge_tune = .false.; wrt_sponge = .false.; sponge_avg = .true.   ! the CPU's defaults
     rewind(unit); read(unit, nml=sponge_tune_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'SPONGE_TUNE_SETTINGS')
-    if (ios /= 0) ub_tune = .false.
+    if (ios /= 0) apply_sponge_tune = .false.
     call read_forcing_namelist(unit, nml_dir)
     call read_tide_namelist(unit)
     call read_refdate_namelist(unit)
@@ -634,8 +634,8 @@ contains
     call read_namelist(nml_path)
     call alloc_state(nt)
     call init_pflx()                    ! calc_pflx: running means (restart fields) and fluxes
-    call init_sponge_tune()             ! ub_tune: boundary tuning coefficients (0 until read)
-    call init_spn_arrays()              ! ub_tune: fluxes and averages for the _spn output
+    call init_sponge_tune()             ! apply_sponge_tune: boundary tuning coefficients (0 until read)
+    call init_spn_arrays()              ! apply_sponge_tune: fluxes and averages for the _spn output
     if (marbl_on) call marbl_gpu_setup_tracers()
     call passive_finish_list()          ! without MARBL: generic + CDR_LITE tracers
 
@@ -722,7 +722,7 @@ contains
       error stop 'load_case'
     endif
     call load_init_records(ncid, i0, j0, nxi, neta, xi_u, eta_v)
-    call load_rst_ub(ncid, int(case_record))   ! ub_tune: the CPU's get_init_ub
+    call load_rst_ub(ncid, int(case_record))   ! apply_sponge_tune: the CPU's get_init_ub
     call nc_close(ncid)
     call mask_loaded_velocities()
     call fill_masked_velocity_halos()
@@ -801,7 +801,7 @@ contains
     call init_upscale_output()        ! after init_bry (open sides)
     call init_extract()               ! child-grid boundary extraction
     call set_spn_root(case_output_root)
-    call init_spn_output()            ! ub_tune + wrt_sponge: the _spn file (after init_bry: open sides)
+    call init_spn_output()            ! apply_sponge_tune + wrt_sponge: the _spn file (after init_bry: open sides)
     call wall_stamp('output init')
   end subroutine load_case
 

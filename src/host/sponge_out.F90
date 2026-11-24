@@ -21,7 +21,7 @@ module sponge_out
   use his_io, only: output_fname, refdatestr, wrt_file_rst, output_period_rst
   use comm_mod, only: comm_rank, comm_reduce_sum
   use arch_mod, only: sync_arch
-  use pflx_mod, only: ub_tune, wrt_sponge, nrpf_sponge, output_period_sponge
+  use pflx_mod, only: apply_sponge_tune, wrt_sponge, nrpf_sponge, output_period_sponge
   use sponge_io, only: sponge_global_atts
   use sponge_io, only: cfa_w, cfa_e, cfa_s, cfa_n, pfa_w, pfa_e, pfa_s, pfa_n, uba_w, uba_e, uba_s, uba_n, navg_spn
   implicit none
@@ -43,9 +43,9 @@ contains
   end subroutine set_spn_root
 
   subroutine init_spn_output()
-    call check_spn_divides_rst()
-    on = ub_tune .and. wrt_sponge
+    on = apply_sponge_tune .and. wrt_sponge
     if (.not. on) return
+    call check_spn_divides_rst()
     if (output_period_sponge <= 0.0_rp) error stop 'sponge_out: output_period_sponge must be > 0'
     if (nrpf_sponge < 1) error stop 'sponge_out: nrpf_sponge must be >= 1'
     gx = int(decomp%gnx) + 2; gy = int(decomp%gny) + 2
@@ -54,7 +54,7 @@ contains
 
   subroutine check_spn_divides_rst()
     ! The CPU's precheck check_output_divides_rst for the sponge file: with
-    ! restarts and wrt_sponge on, nrpf_sponge * output_period_sponge must be
+    ! restarts, apply_sponge_tune and wrt_sponge on, nrpf_sponge * output_period_sponge must be
     ! positive and evenly divide output_period_rst (a restart then never
     ! leaves a partial _spn file). Same condition and message; stops.
     real(8) :: newfile_freq

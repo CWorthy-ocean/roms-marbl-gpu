@@ -358,7 +358,7 @@ contains
         call io_stage8_3d('v_slow', v_slow(is, js, 1), 1, nz, ir0, ir1, jv0, jv1, ir0, 0)
         call io_stage8_3d('p_slow', p_slow(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
       endif
-      call stage_rst_ub()   ! ub_tune: ub_west, ub_east, ub_south, ub_north
+      call stage_rst_ub()   ! apply_sponge_tune: ub_west, ub_east, ub_south, ub_north
       call io_stage8_end()
       call wall_stamp('restart staged')
       if (comm_rank() == 0) write(*,'(a,es14.6,a,i0,a,i0)') 'staged restart t = ', twrite, &
