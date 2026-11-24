@@ -55,9 +55,6 @@ contains
     call need_off('surf_flx_output_settings', 'wrt_rstflx', 'surface restoring flux output')
     call need_off('surf_flx_output_settings', 'wrt_swflx', 'surface water flux (P-E) output')
     call need_off('basic_output_settings', 'monthly_restarts', 'monthly restarts')
-    call need_off('bgc_settings', 'wrt_bgc_dia_his', 'the BGC diagnostics history file (_bgc_dia;'// &
-                  ' the GPU writes a fixed set of MARBL diagnostics to _his)')
-    call need_off('bgc_settings', 'wrt_bgc_dia_avg', 'BGC diagnostic averages output')
     call need_off('ts_output_settings', 'wrt_temp_dia', 'temperature budget diagnostics output')
     call need_off('ts_output_settings', 'wrt_salt_dia', 'salinity budget diagnostics output')
     call need_off('tidal_frc_settings', 'ana_tides', 'analytical tides')

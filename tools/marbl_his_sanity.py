@@ -1,7 +1,7 @@
-"""Sanity check of a MARBL history file: ranges, NaNs and the change over
+"""Sanity check of a MARBL output file (_bgc or _bgc_dia): ranges, NaNs and the change over
 the run for every MARBL tracer and surface diagnostic.
 
-usage: python marbl_his_sanity.py <his.nc> [surface-level-only]
+usage: python marbl_his_sanity.py <bgc.nc> [surface-level-only]
 """
 import os
 import sys

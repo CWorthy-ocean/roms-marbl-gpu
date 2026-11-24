@@ -235,19 +235,24 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   MARBL DIC/ALK) is switched on with
   `&surf_frc_settings sflx_corr / qcorrection / cflx_corr` (see
   `NAMELIST_COMPAT`).
-- **MARBL output:** with `nt_bgc = 32` the history file carries every
-  MARBL tracer, the surface diagnostics PH, pCO2SURF, DpCO2, FG_CO2 and
-  their ALT_CO2 twins (PH_ALT_CO2, pCO2SURF_ALT_CO2, FG_ALT_CO2), the
-  saturation depths zsatcalc and zsatarag, and the 3-D CO3, CO3_ALT_CO2,
-  co3_sat_calc and co3_sat_arag; `_bgc_avg` averages the tracers named in
-  `marbl_tracers_to_write`. There is no separate `_bgc` or `_bgc_dia`
-  stream: `wrt_bgc_dia_his`, `wrt_bgc_dia_avg` and a
-  `marbl_diagnostics_to_write` entry outside the fields above stop the run.
+- **MARBL forcing:** `dust` and `iron` are always read, `xco2_air` and
+  `xco2_air_alt`, `nox` and `nhy` with `&bgc_settings use_xco2air_forcing`,
+  `use_nox_forcing` and `use_nhy_forcing` (default `.true.`); one that is in
+  no file stops the run.
+- **MARBL output** (`&bgc_settings`), in double as in UCLA ROMS: the tracers
+  named in `marbl_tracers_to_write` in `_bgc` (`wrt_bgc_his`) and, averaged,
+  in `_bgc_avg` (`wrt_bgc_avg`); the diagnostics named in
+  `marbl_diagnostics_to_write` in `_bgc_dia` (`wrt_bgc_dia_his`) and
+  `_bgc_dia_avg` (`wrt_bgc_dia_avg`). The GPU computes 13 of MARBL's
+  diagnostics: PH, pCO2SURF, DpCO2, FG_CO2, FG_ALT_CO2, PH_ALT_CO2,
+  pCO2SURF_ALT_CO2, zsatcalc, zsatarag, CO3, CO3_ALT_CO2, co3_sat_calc and
+  co3_sat_arag. An empty list writes these; a name of another MARBL
+  diagnostic stops a run that writes diagnostics.
 - **Namelist versions:** `NAMELIST_COMPAT` gives the UCLA ROMS namelist
   each release reads (0.11.0 so far) and the later keys it does not.
 - **Output files** are named as UCLA ROMS names them,
   `<output_root_name>_<stream>.<YYYYMMDDHHMMSS>.nc` (streams `his`, `rst`,
-  `avg`, `bgc_avg`, `cdr`, `cdrtrc`, `cdrgas`, `rnd`, `uscl`, and
+  `avg`, `bgc`, `bgc_avg`, `bgc_dia`, `bgc_dia_avg`, `cdr`, `cdrtrc`, `cdrgas`, `rnd`, `uscl`, and
   `<extract_root_name>_bry`), where the date is the model date at which the
   file is started, counted from `&reference_date_settings reference_date`
   (default 2000/1/1). `ocean_time` is in seconds, with `long_name = "Time
@@ -304,10 +309,8 @@ v0.1.2-beta, bit for bit.
 - Namelist: UCLA ROMS settings that the GPU model reads but cannot honour
   now stop the run at start-up, naming the key, instead of being ignored:
   `wrt_temp_dia`, `wrt_salt_dia`, `diag_uv`, `diag_trc` (before: a
-  warning), `wrt_swflx` and `wrt_bgc_dia_his` set to `.true.`,
-  `fs_selftest > 0` with the implicit free surface, a
-  `marbl_diagnostics_to_write` entry the GPU does not write, and a
-  `marbl_config_file` that does not exist (before, MARBL ran with its
+  warning) and `wrt_swflx` set to `.true.`, `fs_selftest > 0` with the
+  implicit free surface, and a `marbl_config_file` that does not exist (before, MARBL ran with its
   default settings; `marbl_config_file = ""` still does that).
 - Namelist: the UCLA ROMS keys `v_sponge_trc` (`&v_sponge_settings`),
   `cdr_carbonate_sensitivity_time_interpolation` (`&cdr_lite_settings`),
@@ -325,9 +328,14 @@ v0.1.2-beta, bit for bit.
   MARBL, `marbl_tracers_to_write` still selects them as before (an empty
   list averages every tracer), as in UCLA ROMS. Their default `.false.`
   leaves the output of existing namelists unchanged.
-- MARBL: `&bgc_settings xco2air_default` sets the atmospheric xCO2 where the
-  forcing holds no `xco2_air` (before, a fixed 284.7 ppm, which is also
-  the default, so results change only where a namelist sets another value).
+- MARBL forcing: `&bgc_settings use_xco2air_forcing`, `use_nox_forcing` and
+  `use_nhy_forcing` (default `.true.`) switch the reading of atmospheric xCO2
+  and of the NOx and NHy deposition, as in UCLA ROMS after 0.16.0. With
+  `use_xco2air_forcing = .false.`, both carbonate systems see
+  `xco2air_default` (default 284.7 ppm). A variable that is in no forcing
+  file stops the run, also `dust` and `iron`; before, xCO2 fell back to
+  284.7 ppm and the others to 0, and a file with `xco2_air` only gave the two
+  carbonate systems different xCO2.
 - Removed namelist keys (a namelist that sets them now stops at the read):
   `&param_settings nsub_x`, `nsub_e`, `ntrc_bio` and `&bgc_settings
   nbgc_flx`, all unused. The unused GPU-only groups `&flux_frc_settings`
@@ -1027,6 +1035,21 @@ v0.1.2-beta, bit for bit.
   is no extra record at the first step, the last step is counted once, and a
   partial last window is written. A file is named after the start of its
   first window. `uscl_to_cdr.py` of UCLA ROMS 0.13.0 and later reads them.
+- BGC output follows UCLA ROMS: the MARBL tracers and diagnostics are in the
+  `_bgc`, `_bgc_avg`, `_bgc_dia` and `_bgc_dia_avg` files (double), each with
+  its `&bgc_settings` switch, period and records per file, and no longer in
+  `_his`. A program that reads them from `_his` must read `_bgc` and
+  `_bgc_dia`, and the namelist must set `wrt_bgc_his` and `wrt_bgc_dia_his`.
+  A stream that is on needs its period and `nrpf_*` above 0 (before, 100 s and
+  20 for `_bgc_avg`), and `output_period_bgc_avg_dia` must be a multiple of
+  the MARBL timestep. A list that names no tracer, or no diagnostic, writes
+  all, as in UCLA ROMS.
+- Averages follow UCLA ROMS 0.16.0. `_avg` and `_bgc_avg` average `u`, `v`
+  and the tracers at the end of each step (before, one step earlier, at the
+  start), and both carry `avg_begin_time` and `avg_end_time`. The vertical velocity `w` in `_his`
+  and `_avg` uses `u` and `v` of the record's time.
+- History files name the salinity diffusivity `AKs`, as UCLA ROMS (before,
+  `Aks`).
 
 ## Numerics
 

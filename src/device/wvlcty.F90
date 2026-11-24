@@ -6,7 +6,7 @@ module wvlcty_mod
   ! plus the water of the CDR volume releases accumulated bottom-up as omega
   ! adds it to Wi (CPU wvlcty_tile since ucla-roms#TBD, which also adds pipes;
   ! the GPU has none), interpolated to the rho levels, plus the projection
-  ! of u, v (slot nstp)
+  ! of u, v (slot ns, time n+1 at the end of a step: nnew, the CPU's choice)
   ! along the slopes of the S surfaces; at the physical edges the gradient
   ! condition (the edge row/column and corners copy their neighbour).
   ! Computed on the interior 1:nx, 1:ny of each tile, the edges as above.
@@ -26,11 +26,12 @@ module wvlcty_mod
 
 contains
 
-  subroutine wvlcty_compute(wv)
+  subroutine wvlcty_compute(wv, slot)
     real(rp), WORK_ATTR intent(inout) :: wv(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz)
+    integer(ip), intent(in) :: slot
     integer(ip) :: i, j, k, nx, ny, nz, ns, w, e, s, n, cvo, cc, q, r
     real(rp) :: wxl, wxr, wes, wen, cfv
-    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ns = nstp
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ns = slot
     cvo = merge(1_ip, 0_ip, cdr_vol_on)
     if (nz < 3) error stop 'wvlcty_compute: nz < 3'
     if (.not. allocated(wrk)) allocate(wrk(decomp%is:decomp%ie, decomp%js:decomp%je, 0:nz))

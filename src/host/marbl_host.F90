@@ -119,6 +119,7 @@ module marbl_host
   end type marbl_par_t
 
   public :: marbl_host_init
+  public :: marbl_diag_info
   public :: marbl_host_fill_par
   public :: marbl_host_interior_column
   public :: marbl_host_print_log
@@ -249,6 +250,30 @@ contains
            mi%surface_flux_saved_state%saved_state_cnt, mi%interior_tendency_saved_state%saved_state_cnt
     endif
   end subroutine marbl_host_init
+
+  subroutine marbl_diag_info(name, found, lname, units)
+    ! Long name and units of a MARBL diagnostic; found = .false. if MARBL
+    ! has none of that name.
+    character(len=*), intent(in) :: name
+    logical, intent(out) :: found
+    character(len=*), intent(out) :: lname, units
+    integer :: m
+    found = .false.; lname = ''; units = ''
+    do m = 1, size(mi%surface_flux_diags%diags)
+      if (trim(mi%surface_flux_diags%diags(m)%short_name) /= trim(name)) cycle
+      found = .true.
+      lname = trim(mi%surface_flux_diags%diags(m)%long_name)
+      units = trim(mi%surface_flux_diags%diags(m)%units)
+      return
+    enddo
+    do m = 1, size(mi%interior_tendency_diags%diags)
+      if (trim(mi%interior_tendency_diags%diags(m)%short_name) /= trim(name)) cycle
+      found = .true.
+      lname = trim(mi%interior_tendency_diags%diags(m)%long_name)
+      units = trim(mi%interior_tendency_diags%diags(m)%units)
+      return
+    enddo
+  end subroutine marbl_diag_info
 
   subroutine marbl_host_print_log()
     use marbl_logging, only: marbl_status_log_entry_type
