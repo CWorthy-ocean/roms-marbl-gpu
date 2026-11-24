@@ -18,7 +18,7 @@ module bry_io
   use passive_mod, only: ntp, passive_bry, passive_name, tb_west, tb_east, tb_south, tb_north
   use nc_io
   use arch_mod, only: sync_arch
-  use pflx_mod, only: ub_tune, pf_w, pf_e, pf_s, pf_n
+  use pflx_mod, only: apply_sponge_tune, pf_w, pf_e, pf_s, pf_n
   use frc_reader, only: frc_reader_on, frc_reader_ahead
 #ifdef USE_CUDA
   use cudafor
@@ -101,7 +101,7 @@ contains
               obc_east .and. ser_ue%ready .and. ser_te%ready .and. ser_se%ready, &
               obc_south .and. ser_vs%ready .and. ser_ts%ready .and. ser_ss%ready, &
               obc_north .and. ser_vn%ready .and. ser_tn%ready .and. ser_sn%ready]
-    if (ub_tune) then
+    if (apply_sponge_tune) then
       call bind1(ser_upw, 'up_west', 'j'); call bind1(ser_upe, 'up_east', 'j')
       call bind1(ser_vps, 'vp_south', 'i'); call bind1(ser_vpn, 'vp_north', 'i')
       write(*,'(a,4l2)') 'sponge_tune: parent up_west, up_east, vp_south, vp_north found:', &
