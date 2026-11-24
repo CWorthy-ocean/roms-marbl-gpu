@@ -167,6 +167,8 @@ module frc_io
   public :: init_forcing
   public :: set_forces
   public :: init_bgc_forcing
+  ! &bgc_settings (read by bgc_out): the MARBL forcing read from the files
+  logical, public :: use_xco2air_forcing = .true., use_nox_forcing = .true., use_nhy_forcing = .true.
   public :: set_bgc_forces
   public :: init_cdr_lite_forcing, set_cdr_lite_forces
   public :: init_cflx_corr
@@ -1940,19 +1942,34 @@ contains
   ! MARBL surface forcing series. Names/units as the CPU model
   ! (bgc_shared_vars / marbl_driver): dust kg/m2/s, iron nmol/cm2/s ->
   ! mmol/m2/s (x0.01), nox/nhy kg N/m2/s -> mmol/m2/s (x71394.200220751),
-  ! xco2_air / xco2_air_alt ppm. Missing series leave the field as is.
+  ! xco2_air / xco2_air_alt ppm. dust and iron are always read, the others
+  ! with their switch (&bgc_settings, as the CPU); one that is in no file
+  ! stops the run. A switch that is off leaves the field as is.
   subroutine init_bgc_forcing()
-    bgc_frc_on = .false.
-    if (case_nfrc < 1) return
-    call bind_series(s_dust, 'dust', 'dust_time', 'r')
-    call bind_series(s_iron, 'iron', 'iron_time', 'r')
-    call bind_series(s_nox, 'nox', 'nox_time', 'r')
-    call bind_series(s_nhy, 'nhy', 'nhy_time', 'r')
-    call bind_series(s_xco2, 'xco2_air', 'xco2_time', 'r')
-    call bind_series(s_xco2a, 'xco2_air_alt', 'xco2_time', 'r')
-    bgc_frc_on = s_dust%ready .or. s_iron%ready .or. s_nox%ready .or. s_nhy%ready .or. s_xco2%ready
+    call bind_bgc(s_dust, 'dust', 'dust_time', '')
+    call bind_bgc(s_iron, 'iron', 'iron_time', '')
+    if (use_nox_forcing) call bind_bgc(s_nox, 'nox', 'nox_time', &
+         'or set use_nox_forcing = .false. in BGC_SETTINGS for no NOx deposition.')
+    if (use_nhy_forcing) call bind_bgc(s_nhy, 'nhy', 'nhy_time', &
+         'or set use_nhy_forcing = .false. in BGC_SETTINGS for no NHy deposition.')
+    if (use_xco2air_forcing) then
+      call bind_bgc(s_xco2, 'xco2_air', 'xco2_time', &
+           'or set use_xco2air_forcing = .false. in BGC_SETTINGS to use xco2air_default.')
+      call bind_bgc(s_xco2a, 'xco2_air_alt', 'xco2_time', &
+           'or set use_xco2air_forcing = .false. in BGC_SETTINGS to use xco2air_default.')
+    endif
+    bgc_frc_on = .true.
     write(*,'(a,6l2)') 'MARBL forcing series dust iron nox nhy xco2 xco2_alt ready =', s_dust%ready, &
          s_iron%ready, s_nox%ready, s_nhy%ready, s_xco2%ready, s_xco2a%ready
+  contains
+    subroutine bind_bgc(s, vname, tname, hint)
+      type(series2d), intent(inout) :: s
+      character(len=*), intent(in) :: vname, tname, hint
+      call bind_series(s, vname, tname, 'r')
+      if (s%ready) return
+      write(*,'(5a)') 'Could not find var: ', vname, ' in forcing files. Add it, ', hint
+      error stop 'init_bgc_forcing: missing MARBL forcing variable'
+    end subroutine bind_bgc
   end subroutine init_bgc_forcing
 
   subroutine set_bgc_forces(tneed, dust, iron, nox, nhy, xco2, xco2a)

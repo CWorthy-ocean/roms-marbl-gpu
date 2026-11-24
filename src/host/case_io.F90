@@ -25,6 +25,7 @@ module case_io
   use implicit_fs_gpu, only: fs_read_namelist
   use his_io, only: read_output_namelist, read_refdate_namelist, set_output_root, init_output
   use avg_out, only: read_avg_namelist, set_avg_root, init_avg_output
+  use bgc_out, only: read_bgc_namelist, set_bgc_root, init_bgc_output
   use extract_out, only: read_extract_namelist, init_extract
   use comm_mod, only: comm_rank, comm_size, comm_min_real
   use arch_mod, only: sync_arch
@@ -228,6 +229,7 @@ contains
     call read_refdate_namelist(unit)
     call read_output_namelist(unit)
     call read_avg_namelist(unit)
+    call read_bgc_namelist(unit)
     call read_extract_namelist(unit)
     call read_passive_namelist(unit, nt_passive)
     call read_marbl_namelist(unit, nml_dir, nt_bgc)
@@ -897,6 +899,8 @@ contains
     call wall_stamp('history/restart output init')
     call set_avg_root(case_output_root)
     call init_avg_output()            ! before the outputs that write a double record at start-up
+    call set_bgc_root(case_output_root)
+    call init_bgc_output()            ! writes its start-up records
     call init_cdr_lite_output()       ! after the history/restart staging is sized
     call init_random_output()         ! surface passive tracers (random_output_settings)
     call init_cdr_gas_output()        ! writes its start (bracket) record

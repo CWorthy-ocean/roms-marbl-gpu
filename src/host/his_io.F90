@@ -13,13 +13,12 @@ module his_io
   use comm_mod, only: have_io_server
   use comm_mod, only: comm_rank, comm_size, compute_barrier
   use run_timers, only: rt_tic, rt_toc, rt_mark_rst, RT_HIS, RT_RST
-  use passive_mod, only: ntp, tp, wrt_passive, passive_name
+  use passive_mod, only: ntp, n_marbl, tp, wrt_passive, passive_name
   use rivers_mod, only: river_on
   use pflx_mod, only: calc_pflx, u_slow, v_slow, p_slow
   use sponge_io, only: def_rst_ub, stage_rst_ub, put_rst_ub, sponge_global_atts
   use wvlcty_mod, only: wvlcty_compute
-  use marbl_gpu, only: marbl_on, marbl_gpu_nhis, marbl_gpu_nhis3, marbl_gpu_define_his, marbl_gpu_stage_his, &
-                       marbl_gpu_define_rst, marbl_gpu_write_rst, marbl_gpu_stage_rst8
+  use marbl_gpu, only: marbl_on, marbl_gpu_define_rst, marbl_gpu_write_rst, marbl_gpu_stage_rst8
   use fs_data, only: fs_on, udu, udv, gru, grv, qd, xx, mg_on, fs_mg_lag, mg_se0, mg_scu, mg_scv, fs_nsc
   use implicit_fs_gpu, only: fs_rst_prepare, fs_rst_scal_vals, fs_global_atts
   use imex_igw, only: imex_rst_has, imex_rst_prepare, imex_rst_scal_vals, imex_nsc, imex_stage_on, &
@@ -73,6 +72,7 @@ module his_io
   public :: read_output_namelist
   public :: read_refdate_namelist
   public :: output_fname
+  public :: def_avg_times
   public :: output_period_rst   ! sponge_out: the CPU's file-length check
   public :: set_output_root
   public :: init_output
@@ -104,7 +104,8 @@ contains
          wrt_avg_Hbls, wrt_avg_Hbbl
     ! wrt_temp_dia, wrt_salt_dia: read so that a CPU namelist reads; .true.
     ! stops the run (feature_guard)
-    namelist /ts_output_settings/ wrt_temp, wrt_salt, wrt_avg_temp, wrt_avg_salt, wrt_temp_dia, wrt_salt_dia
+    namelist /ts_output_settings/ wrt_temp, wrt_salt, wrt_avg_temp, wrt_avg_salt, wrt_temp_dia, wrt_salt_dia, &
+         wrt_passive
 
     output_period_his = 100.0_rp
     output_period_rst = 2000.0_rp
@@ -128,6 +129,7 @@ contains
     wrt_temp = .true.; wrt_salt = .true.
     wrt_avg_temp = .false.; wrt_avg_salt = .false.
     wrt_temp_dia = .false.; wrt_salt_dia = .false.
+    wrt_passive = .true.   ! generic passive and CDR_LITE tracers in _his, as the CPU
 
     rewind(unit)
     read(unit, nml=basic_output_settings, iostat=ios, iomsg=msg)
@@ -266,24 +268,23 @@ contains
     if (wrt_V)  call io_stage_3d('v', v(is, js, 1, n3), 1, nz, ir0, ir1, jv0, jv1, ir0, 0)
     if (wrt_temp) call io_stage_3d('temp', t(is, js, 1, n3, itemp), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
     if (wrt_salt) call io_stage_3d('salt', t(is, js, 1, n3, isalt), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
-    if (wrt_passive) then
-      do itp = 1, ntp
+    if (wrt_passive) then          ! the MARBL tracers are in the _bgc file (bgc_out)
+      do itp = n_marbl + 1, ntp
         call io_stage_3d_pt(trim(passive_name(itp)), tp(1, 0, 1, n3), ntp, itp, 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
       enddo
     endif
     if (wrt_R)    call io_stage_3d('rho', rho1(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
     if (wrt_O)    call io_stage_omega('omega', ir0, ir1, jr0, jr1, ir0, jr0)
-    if (wrt_W) then                ! true vertical velocity (CPU wvlcty, slot nstp)
+    if (wrt_W) then                ! true vertical velocity (CPU wvlcty)
       if (.not. allocated(wvl)) allocate(wvl(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz))
-      call wvlcty_compute(wvl)
+      call wvlcty_compute(wvl, int(n3, ip))
       call io_stage_3d('w', wvl(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
     endif
     if (wrt_Akv)  call io_stage_3d('Akv', Akv(is, js, 0), 0, nz, ir0, ir1, jr0, jr1, ir0, jr0)
     if (wrt_Akt)  call io_stage_3d('Akt', Akt(is, js, 0, itemp), 0, nz, ir0, ir1, jr0, jr1, ir0, jr0)
-    if (wrt_Aks)  call io_stage_3d('Aks', Akt(is, js, 0, isalt), 0, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+    if (wrt_Aks)  call io_stage_3d('AKs', Akt(is, js, 0, isalt), 0, nz, ir0, ir1, jr0, jr1, ir0, jr0)
     if (wrt_Hbls) call io_stage_2d('hbls', hbls(is, js), ir0, ir1, jr0, jr1, ir0, jr0)
     if (wrt_Hbbl) call io_stage_2d('hbbl', hbbl(is, js), ir0, ir1, jr0, jr1, ir0, jr0)
-    if (marbl_on) call marbl_gpu_stage_his(ir0, ir1, jr0, jr1, ir0, jr0)
     call io_stage_end()
     write(*,'(a,es14.6,a,i0,a,i0)') 'staged history t = ', twrite, &
          '  rec = ', rec_his, '  file ', nfile_his
@@ -522,7 +523,7 @@ contains
     if (wrt_temp) id = nc_def_var_f(ncid, 'temp', (/d_xi, d_eta, d_s, d_t/))
     if (wrt_salt) id = nc_def_var_f(ncid, 'salt', (/d_xi, d_eta, d_s, d_t/))
     if (wrt_passive) then
-      do itp = 1, ntp
+      do itp = n_marbl + 1, ntp
         id = nc_def_var_f(ncid, trim(passive_name(itp)), (/d_xi, d_eta, d_s, d_t/))
       enddo
     endif
@@ -531,10 +532,9 @@ contains
     if (wrt_W)    id = nc_def_var_f(ncid, 'w', (/d_xi, d_eta, d_s, d_t/))
     if (wrt_Akv)  id = nc_def_var_f(ncid, 'Akv', (/d_xi, d_eta, d_w, d_t/))
     if (wrt_Akt)  id = nc_def_var_f(ncid, 'Akt', (/d_xi, d_eta, d_w, d_t/))
-    if (wrt_Aks)  id = nc_def_var_f(ncid, 'Aks', (/d_xi, d_eta, d_w, d_t/))
+    if (wrt_Aks)  id = nc_def_var_f(ncid, 'AKs', (/d_xi, d_eta, d_w, d_t/))
     if (wrt_Hbls) id = nc_def_var_f(ncid, 'hbls', (/d_xi, d_eta, d_t/))
     if (wrt_Hbbl) id = nc_def_var_f(ncid, 'hbbl', (/d_xi, d_eta, d_t/))
-    if (marbl_on) call marbl_gpu_define_his(ncid, d_xi, d_eta, d_s, d_t)
     call nc_put_att_text(ncid, '', 'title', output_title)
     call fs_global_atts(ncid)   ! barotropic scheme (&implicit_fs)
     call sponge_global_atts(ncid)   ! sponge layer (&v_sponge_settings)
@@ -660,10 +660,9 @@ contains
     nxy = max(nxi, nxi_u) * max(neta, neta_v)
     nh = decomp%nz
     nhw = decomp%nz + 1
-    n2d = count((/wrt_Z, wrt_Ub, wrt_Vb, wrt_Hbls, wrt_Hbbl/)) + marbl_gpu_nhis()
+    n2d = count((/wrt_Z, wrt_Ub, wrt_Vb, wrt_Hbls, wrt_Hbbl/))
     n3d = count((/wrt_U, wrt_V, wrt_temp, wrt_salt, wrt_R, wrt_W/))
-    if (wrt_passive) n3d = n3d + ntp
-    n3d = n3d + marbl_gpu_nhis3()
+    if (wrt_passive) n3d = n3d + (ntp - n_marbl)
     n3w = count((/wrt_O, wrt_Akv, wrt_Akt, wrt_Aks/))
     cap_rec = n2d * nxy + n3d * nxy * nh + n3w * nxy * nhw
     cap_field = nxy * nhw
@@ -898,6 +897,19 @@ contains
     call sec2date(t, date)
     write(path, '(A,"_",A,".",I4,5I0.2,".nc")') trim(root), trim(stream), date
   end subroutine output_fname
+
+  subroutine def_avg_times(ncid, d_t)
+    ! The CPU's def_avg_window_times: the bounds of a record's window. It
+    ! averages the states at the ends of the steps in (begin, end].
+    integer, intent(in) :: ncid, d_t
+    integer :: id
+    id = nc_def_var(ncid, 'avg_begin_time', (/d_t/))
+    call nc_put_att_text(ncid, 'avg_begin_time', 'long_name', 'Time at beginning of averaging period')
+    call nc_put_att_text(ncid, 'avg_begin_time', 'units', 'second')
+    id = nc_def_var(ncid, 'avg_end_time', (/d_t/))
+    call nc_put_att_text(ncid, 'avg_end_time', 'long_name', 'Time at end of averaging period')
+    call nc_put_att_text(ncid, 'avg_end_time', 'units', 'second')
+  end subroutine def_avg_times
 
   subroutine ensure_parent(path)
     character(len=*), intent(in) :: path
