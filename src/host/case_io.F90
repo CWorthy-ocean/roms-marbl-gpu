@@ -11,7 +11,7 @@ module case_io
   use par_read, only: pr_begin, pr_flush, pr_take, pr_end, pr_taking, pr_store_2d, pr_store_3d, pr_store_3d_pt
   use frc_io, only: read_forcing_namelist, init_forcing, set_forces, close_frc_cache, init_cflx_corr, &
                     frc_warm_start, frc_warm_flush, frc_warm_end
-  use bry_io, only: init_bry, set_bry_all
+  use bry_io, only: init_bry, set_bry_all, read_open_boundary_namelist
   use tide_io, only: read_tide_namelist, init_tides, set_tides
   use river_io, only: read_river_namelist, init_rivers, set_rivers
   use cdr_io, only: read_cdr_namelist, init_cdr, set_cdr_pred
@@ -200,6 +200,7 @@ contains
                                akv_bak_in, akt_bak_in, rho0_in)
     rewind(unit); read(unit, nml=ubind_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'UBIND_SETTINGS')
+    call read_open_boundary_namelist(unit)
     use_boundary_sponge = .true.
     v_sponge = 0.0_rp
     v_sponge_trc = -1.0_rp     ! the CPU's default: negative (or absent) = v_sponge
@@ -374,7 +375,7 @@ contains
   subroutine apply_sponge()
     ! CPU set_nudgcof (use_boundary_sponge, not PACIFIC): linear ramp
     ! over isp = sponge_size+1 points from every open edge (the CPU's
-    ! OBC_WEST/EAST/SOUTH/NORTH; here obc_*, set by init_bry and init_tides).
+    ! OBC_WEST/EAST/SOUTH/NORTH; here obc_*, set by init_bry).
     ! A closed edge gets no sponge.
     integer(ip), parameter :: sponge_size = 15_ip
     integer(ip) :: i, j, ig, jg, isp, ibnd, itrc, i_lo, i_hi, j_lo, j_hi
@@ -1435,7 +1436,7 @@ contains
     ! normal velocity on the boundary face is set to zero, for an initial file
     ! that was not made for a closed side: u and ubar on the west (i = 1) and
     ! east (i = nx+1) faces, v and vbar on the south (j = 1) and north (j = ny+1)
-    ! faces. Here after init_bry/init_tides, which set obc_*, so every slot the
+    ! faces. Here after init_bry, which sets obc_*, so every slot the
     ! load and copy_initial_slots filled is zeroed, and the cold-start barotropic
     ! fluxes are recomputed. A closed side whose boundary faces are land (CCS
     ! east) is already zero.
@@ -2021,6 +2022,9 @@ contains
     write(unit,'(a)') '&vertical_mixing_settings'
     write(unit,'(a)') '    akt_bak = 0.0, 0.0'
     write(unit,'(a)') '    akv_bak = 0.0'
+    write(unit,'(a)') '/'
+    write(unit,'(a)') '&open_boundary_settings'
+    write(unit,'(a)') '    obc_west = .false., obc_east = .false., obc_south = .false., obc_north = .false.'
     write(unit,'(a)') '/'
     write(unit,'(a)') '&lateral_visc_settings'
     write(unit,'(a)') '    visc2 = 0.0'

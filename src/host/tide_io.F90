@@ -157,13 +157,7 @@ contains
       endif
     enddo
     call nc_close(ncid)
-    ! Boundary tides act on the open sides only. With boundary files, those
-    ! are the sides init_bry found data for (a closed side, the CPU's
-    ! undefined OBC_<side>, stays closed); without any, every side is open.
-    if (bry_tides .and. .not. have_bry) then
-      obc_west = .true.; obc_east = .true.
-      obc_south = .true.; obc_north = .true.
-    endif
+    ! Boundary tides act on the open sides only (obc_*, set by init_bry).
     tides_ready = .true.
     write(*,'(a,i0,a,2l2)') 'tides: n = ', ntides, '  pot,bry =', pot_tides, bry_tides
   end subroutine init_tides

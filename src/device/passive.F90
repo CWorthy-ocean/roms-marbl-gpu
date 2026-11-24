@@ -62,8 +62,8 @@ module passive_mod
   integer(ip), public :: ntp_base = 0      ! MARBL + generic tracers, before the CDR_LITE block
   integer(ip), public :: n_marbl = 0       ! MARBL tracers (tp 1 .. n_marbl; 0 without MARBL)
   integer(ip), public :: n_generic = 0     ! generic passives (tp n_marbl+1 .. ntp_base)
-  ! external boundary values from the boundary data (MARBL and CDR_LITE
-  ! tracers; missing ones are 0), else 0 (generic tracers)
+  ! external boundary values from the boundary data (MARBL tracers, which
+  ! must be there, and CDR_LITE tracers; missing ones are 0), else 0 (generic)
   logical, public :: passive_bry = .false.
   real(rp), WORK_ATTR public, allocatable :: tb_west(:,:,:), tb_east(:,:,:)    ! (js:je, nz, ntp)
   real(rp), WORK_ATTR public, allocatable :: tb_south(:,:,:), tb_north(:,:,:)  ! (is:ie, nz, ntp)
