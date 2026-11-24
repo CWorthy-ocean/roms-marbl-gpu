@@ -104,7 +104,8 @@ contains
          wrt_avg_Hbls, wrt_avg_Hbbl
     ! wrt_temp_dia, wrt_salt_dia: read so that a CPU namelist reads; .true.
     ! stops the run (feature_guard)
-    namelist /ts_output_settings/ wrt_temp, wrt_salt, wrt_avg_temp, wrt_avg_salt, wrt_temp_dia, wrt_salt_dia
+    namelist /ts_output_settings/ wrt_temp, wrt_salt, wrt_avg_temp, wrt_avg_salt, wrt_temp_dia, wrt_salt_dia, &
+         wrt_passive
 
     output_period_his = 100.0_rp
     output_period_rst = 2000.0_rp
@@ -128,6 +129,7 @@ contains
     wrt_temp = .true.; wrt_salt = .true.
     wrt_avg_temp = .false.; wrt_avg_salt = .false.
     wrt_temp_dia = .false.; wrt_salt_dia = .false.
+    wrt_passive = .true.   ! generic passive and CDR_LITE tracers in _his, as the CPU
 
     rewind(unit)
     read(unit, nml=basic_output_settings, iostat=ios, iomsg=msg)

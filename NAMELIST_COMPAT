@@ -49,7 +49,7 @@
 #
 # GPU-only additions: the optional groups &tile_settings (tile balancing),
 # &periodic_settings (periodicity, below), &passive_tracers (n_passive,
-# init_mode, write_passive), and in &param_settings the key n. Removed
+# init_mode), and in &param_settings the key n. Removed
 # after v0.1.3-beta (unused; a namelist that sets them now stops at the
 # read): &param_settings nsub_x, nsub_e and ntrc_bio (not UCLA ROMS keys),
 # &bgc_settings nbgc_flx (UCLA ROMS still reads it, unused, and its
@@ -86,6 +86,11 @@
 # fluxes the units attribute of qair must be 'kg/kg' and of rain 'cm/day'
 # in the file of the record read last; otherwise the run stops. No effect
 # with flux forcing.
+#
+# Passive tracers in history files: &ts_output_settings wrt_passive (default
+# .true.), as UCLA ROMS after 0.16.0, puts the generic passive and CDR_LITE
+# tracers in _his. It replaces write_passive in the GPU-only group
+# &passive_tracers; a namelist that still has that key stops at the read.
 #
 # Averages of temperature and salinity: &ts_output_settings wrt_avg_temp
 # and wrt_avg_salt (default .false., as UCLA ROMS) put temp and salt in the

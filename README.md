@@ -1048,6 +1048,10 @@ v0.1.2-beta, bit for bit.
   and the tracers at the end of each step (before, one step earlier, at the
   start), and both carry `avg_begin_time` and `avg_end_time`. The vertical velocity `w` in `_his`
   and `_avg` uses `u` and `v` of the record's time.
+- `wrt_passive` in `&ts_output_settings` (default `.true.`), as in UCLA ROMS
+  after 0.16.0, puts the generic passive and CDR_LITE tracers in `_his`. It
+  replaces the GPU-only `&passive_tracers write_passive`; a namelist that
+  still has that key stops at the read.
 - History files name the salinity diffusivity `AKs`, as UCLA ROMS (before,
   `Aks`).
 
