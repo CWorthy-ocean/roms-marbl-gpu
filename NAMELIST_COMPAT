@@ -103,6 +103,23 @@
 # diagnostics were in _his and only wrt_bgc_avg was honoured. Without MARBL
 # (nt_bgc = 0) the switches do nothing, as on UCLA ROMS.
 #
+# Open boundaries: the optional group &open_boundary_settings, as UCLA ROMS
+# after 0.16.0; before, UCLA ROMS selected all of it with cpp keys (OBC_WEST,
+# ...) and the GPU opened the sides it found zeta or barotropic velocity data
+# for (with bry_tides and no boundary files, all four):
+#   obc_west, obc_east, obc_south, obc_north   the open sides (default
+#       .true.; ignored, with a start-up line, in a periodic direction). The
+#       data of a closed side are ignored. A variable that is missing on an
+#       open side (zeta, ubar, vbar, u, v, temp, salt) stops the run; before,
+#       missing u, v, temp and salt were 0. So does a missing MARBL tracer
+#       (before, 0 on inflow); CDR_LITE and generic passive tracers may be
+#       absent and are then 0, as on UCLA ROMS. A namelist of a domain whose
+#       boundary files hold only some sides must set the others to .false.
+#   obc_m2, obc_m3, obc_t, obc_rad, use_m3_boundary_data,
+#   use_t_boundary_data   the GPU has only the defaults ('flather',
+#       'orlanski', 'orlanski', 'oblique', .true., .true.): with an open side,
+#       any other value of UCLA ROMS stops the run.
+#
 # Surface restoring: logical keys in &surf_frc_settings (default .false.,
 # bulk forcing only) switch it on, as in UCLA ROMS after 0.16.0; before,
 # UCLA ROMS selected it with cpp keys. The coefficient group of a switch
