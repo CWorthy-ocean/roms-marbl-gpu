@@ -53,7 +53,7 @@ SRC_DEV    = src/device/implicit_fs_mgk.F90 src/device/gpu_state.F90 src/device/
              src/device/implicit_fs_chol.F90 src/device/implicit_fs_host.F90 src/device/implicit_fs_ipc.F90 src/device/implicit_fs_data.F90 src/device/implicit_fs_mgg.F90 src/device/implicit_fs_mg.F90 src/device/implicit_fs.F90
 SRC_HOST   = src/host/step_driver.F90 src/host/feature_guard.F90
 SRC_IO     = src/host/nc_io.F90 src/host/host_buf.F90 src/host/par_read.F90 src/host/frc_io.F90 \
-             src/host/river_io.F90 src/host/cdr_io.F90 src/host/cdr_lite_io.F90 src/host/bry_io.F90 src/host/tide_io.F90 src/host/io_server.F90 src/host/sponge_io.F90 src/host/marbl_step.F90 src/host/his_io.F90 src/host/cdr_lite_out.F90 src/host/random_out.F90 src/host/cdr_gas_out.F90 src/host/cdr_out.F90 src/host/upscale_out.F90 src/host/avg_out.F90 src/host/extract_out.F90 src/host/sponge_out.F90 \
+             src/host/river_io.F90 src/host/cdr_io.F90 src/host/cdr_lite_io.F90 src/host/bry_io.F90 src/host/tide_io.F90 src/host/io_server.F90 src/host/sponge_io.F90 src/host/marbl_step.F90 src/host/his_io.F90 src/host/cdr_lite_out.F90 src/host/random_out.F90 src/host/cdr_gas_out.F90 src/host/cdr_out.F90 src/host/upscale_out.F90 src/host/avg_out.F90 src/host/bgc_out.F90 src/host/extract_out.F90 src/host/sponge_out.F90 \
              src/host/case_io.F90
 MODDIR     = build
 GPUDIR     = build_gpu

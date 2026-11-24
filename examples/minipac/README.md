@@ -38,7 +38,9 @@ tools/submit_gpu.sh examples/minipac/run_minipac.pbs
 ```
 
 Output goes to `output/`: `minipac_marbl_his.20100330000000.nc` (6-hourly
-history, single precision) and `minipac_marbl_rst.20100402000000.nc`
+history, single precision), `minipac_marbl_bgc.20100330000000.nc` and
+`minipac_marbl_bgc_dia.20100330000000.nc` (6-hourly MARBL tracers and
+diagnostics, double precision) and `minipac_marbl_rst.20100402000000.nc`
 (double precision, two records at day 3 for an exact restart). As in UCLA
 ROMS, each file is named by the model date at which it is started, counted
 from `reference_date`. To restart, set `inifile` to the restart file.

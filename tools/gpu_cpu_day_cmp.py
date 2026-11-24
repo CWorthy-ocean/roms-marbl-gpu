@@ -68,7 +68,8 @@ class Source:
         return np.array(d.variables[v][r], dtype=np.float64), t
 
 
-gpu = Source([opts['--gpu']])
+# the MARBL fields are in the _bgc and _bgc_dia files next to _his
+gpu = Source([opts['--gpu']] + [opts['--gpu'].replace('_his', s) for s in ('_bgc', '_bgc_dia') if '_his' in opts['--gpu']])
 cpu = Source(opts['--cpu'])
 
 

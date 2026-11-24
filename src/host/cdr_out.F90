@@ -11,9 +11,11 @@ module cdr_out
   ! cdr_source) and the averaged thickness-weighted ALK/DIC.
   ! With wrt_cdr_avg the CPU's sums: every step after the step c0*sum + x
   ! (c0 = 0 on the window's first step); the fields MARBL changes only on
-  ! its steps are added once, weighted by the steps they were held, before
-  ! each MARBL step and at the write; at the write sum/navg. Not on the GPU
-  ! yet: cdr_monthly_averages (stops at start-up).
+  ! its steps are added right after each MARBL step, weighted by the steps
+  ! since the previous addition (MARBL's flux covers those steps); at the
+  ! write sum/navg. output_period_cdr must be a multiple of the MARBL
+  ! timestep, so every window ends on a MARBL step. Not on the GPU yet:
+  ! cdr_monthly_averages (stops at start-up).
   use kinds
   use his_io, only: output_fname, refdatestr
   use decomp_mod
@@ -94,11 +96,21 @@ contains
 
   subroutine init_cdr_output()
     integer :: nxy, is, ie, js, je, nz
+    real(rp) :: r
     on = .false.
     if (.not. do_cdr_output) return
     if (.not. marbl_on) error stop 'init_cdr_output: the CDR output needs MARBL'
     if (cdr_monthly_averages) error stop 'init_cdr_output: cdr_monthly_averages is not on the GPU model yet'
     if (nrpf_cdr < 1) error stop 'init_cdr_output: nrpf_cdr must be >= 1'
+    if (wrt_cdr_avg) then
+      ! the CPU's check_avg_ends_on_marbl_step
+      r = output_period_cdr / (dt * real(marbl_timestep_ratio, rp))
+      if (abs(r - anint(r)) > 1.0e-9_rp) then
+        write(*,'(a,es14.6,a,es14.6)') 'CDR_OUTPUT_SETTINGS: output_period_cdr = ', output_period_cdr, &
+             ' is not a whole multiple of the MARBL timestep used, ', dt * real(marbl_timestep_ratio, rp)
+        error stop 'init_cdr_output: output_period_cdr'
+      endif
+    endif
     ialk = pidx('ALK'); idic = pidx('DIC'); ialka = pidx('ALK_ALT_CO2'); idica = pidx('DIC_ALT_CO2')
     ipo4 = pidx('PO4'); isio3 = pidx('SiO3')
     ispchl = pidx('spChl'); idiatchl = pidx('diatChl'); idiazchl = pidx('diazChl')
@@ -380,8 +392,8 @@ contains
       call sum_step(c0)
       if (wsrc) call sum_sources()
       nheld = nheld + 1
-      ! the MARBL-held fields before the next MARBL step changes them
-      if (modulo(iic + 1, marbl_timestep_ratio) == 0) call sum_marbl()
+      ! the MARBL-held fields this step computed (if it was a MARBL step)
+      if (modulo(iic, marbl_timestep_ratio) == 0) call sum_marbl()
       if (writing) call finalize()
     endif
     if (writing) then

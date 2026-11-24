@@ -33,7 +33,7 @@
 #           cpp key decides, and a build without it ignores v_sponge.
 #
 # GPU-only additions: the optional group &tile_settings (tile balancing),
-# &passive_tracers (n_passive, init_mode, write_passive), and in
+# &passive_tracers (n_passive, init_mode), and in
 # &param_settings the key n. Removed after v0.1.3-beta (unused; a namelist
 # that sets them now stops at the read): &param_settings nsub_x, nsub_e and
 # ntrc_bio (not UCLA ROMS keys), &bgc_settings nbgc_flx (UCLA ROMS still
@@ -47,16 +47,15 @@
 #   &ts_output_settings        wrt_temp_dia, wrt_salt_dia = .true.
 #   &diagnostics_settings      diag_uv, diag_trc = .true.
 #   &surf_flx_output_settings  wrt_swflx = .true.
-#   &bgc_settings              wrt_bgc_dia_his = .true. (no _bgc_dia file;
-#                              wrt_bgc_dia_avg = .true. already stopped)
 #   &implicit_fs               fs_selftest > 0 with fs_mode = 'implicit'
 #                              (UCLA ROMS runs the self-test only there)
 #   &marbl_biogeochemistry_settings
-#     marbl_diagnostics_to_write: a name outside the fixed set the GPU
-#     writes to _his (PH, pCO2SURF, DpCO2, FG_CO2, FG_ALT_CO2, PH_ALT_CO2,
+#     marbl_diagnostics_to_write: in a run with wrt_bgc_dia_his or
+#     wrt_bgc_dia_avg, the name of a MARBL diagnostic outside the set the
+#     GPU computes (PH, pCO2SURF, DpCO2, FG_CO2, FG_ALT_CO2, PH_ALT_CO2,
 #     pCO2SURF_ALT_CO2, zsatcalc, zsatarag, CO3, CO3_ALT_CO2,
-#     co3_sat_calc, co3_sat_arag). An empty list (UCLA ROMS: all) is
-#     accepted. On UCLA ROMS the list selects the _bgc_dia files' fields.
+#     co3_sat_calc, co3_sat_arag). An empty list writes that set (UCLA
+#     ROMS: all of MARBL's). do_cdr_output does not need the list.
 #     marbl_config_file: a non-empty name of a file that does not exist
 #     (before, the GPU ran MARBL with its default settings); "" runs MARBL
 #     with its defaults, as UCLA ROMS. The path is relative to the
@@ -72,6 +71,11 @@
 # in the file of the record read last; otherwise the run stops. No effect
 # with flux forcing.
 #
+# Passive tracers in history files: &ts_output_settings wrt_passive (default
+# .true.), as UCLA ROMS after 0.16.0, puts the generic passive and CDR_LITE
+# tracers in _his. It replaces write_passive in the GPU-only group
+# &passive_tracers; a namelist that still has that key stops at the read.
+#
 # Averages of temperature and salinity: &ts_output_settings wrt_avg_temp
 # and wrt_avg_salt (default .false., as UCLA ROMS) put temp and salt in the
 # _avg file. As on UCLA ROMS, with MARBL the tracers selected by
@@ -80,10 +84,24 @@
 # wrt_avg_salt say. Before, the GPU averaged T and S only through that
 # list (without MARBL, never), which the default .false. keeps.
 #
-# Atmospheric xCO2 for MARBL: &bgc_settings xco2air_default (ppm, default
-# 284.7) is used where the forcing files hold no xco2_air (xco2_air_alt
-# for the ALT_CO2 system), as UCLA ROMS without PCO2AIR_FORCING. Before,
-# the GPU read the key and used a fixed 284.7.
+# MARBL forcing: logical keys in &bgc_settings (default .true.) switch the
+# reading of atmospheric xCO2 and nitrogen deposition from the forcing
+# files, as in UCLA ROMS after 0.16.0; before, UCLA ROMS selected them with
+# cpp keys (PCO2AIR_FORCING, NOX_FORCING, NHY_FORCING) and the GPU read what
+# the files held:
+#   use_xco2air_forcing   xco2_air and xco2_air_alt; .false.: both are
+#                         xco2air_default (ppm, default 284.7)
+#   use_nox_forcing       nox; .false.: 0
+#   use_nhy_forcing       nhy; .false.: 0
+# A variable that is on and in no file stops the run; so do dust and iron,
+# which have no switch.
+#
+# BGC output: &bgc_settings wrt_bgc_his, wrt_bgc_avg, wrt_bgc_dia_his and
+# wrt_bgc_dia_avg (default .false.) write _bgc, _bgc_avg, _bgc_dia and
+# _bgc_dia_avg with their output_period_bgc_* and nrpf_bgc_* (default 0: the
+# run stops if the stream is on), as UCLA ROMS. Before, the MARBL tracers and
+# diagnostics were in _his and only wrt_bgc_avg was honoured. Without MARBL
+# (nt_bgc = 0) the switches do nothing, as on UCLA ROMS.
 #
 # Surface restoring: logical keys in &surf_frc_settings (default .false.,
 # bulk forcing only) switch it on, as in UCLA ROMS after 0.16.0; before,
