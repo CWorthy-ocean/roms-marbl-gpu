@@ -71,12 +71,9 @@ nt_bgc = int(val('nt_bgc', 0))
 cells = (llm + 2) * (mmm + 2)
 n2d = sum(1 for k in ('wrt_z', 'wrt_ub', 'wrt_vb', 'wrt_hbls', 'wrt_hbbl') if val(k, False))
 n3d = sum(1 for k in ('wrt_u', 'wrt_v', 'wrt_temp', 'wrt_salt', 'wrt_akv', 'wrt_akt', 'wrt_r') if val(k, False))
-if val('write_passive', True) and nt_bgc > 0:
-    n3d += nt_bgc
-if nt_bgc > 0:
-    n2d += 8      # MARBL surface diagnostics (PH, pCO2, FG_CO2, zsat, ...)
-    n3d += 4      # MARBL 3-D carbonate diagnostics
 record_gb = 4.0 * cells * (n3d * nz + n2d) / 1e9
+if nt_bgc > 0 and val('wrt_bgc_his', False):
+    record_gb = max(record_gb, 8.0 * cells * nt_bgc * nz / 1e9)   # _bgc (double)
 his = val('wrt_file_his', True)
 rst = val('wrt_file_rst', True)
 per_group = 1

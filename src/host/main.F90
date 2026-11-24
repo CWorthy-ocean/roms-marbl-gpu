@@ -10,7 +10,8 @@ program roms_gpu
   use random_out, only: wrt_random
   use cdr_gas_out, only: wrt_cdr_gas, wrt_cdr_gas_final
   use cdr_out, only: wrt_cdr
-  use avg_out, only: wrt_avg, step_bgc_avg
+  use avg_out, only: wrt_avg
+  use bgc_out, only: wrt_bgc
   use extract_out, only: wrt_extract
   use sponge_io, only: adjust_orlanski
   use sponge_out, only: wrt_spn
@@ -100,7 +101,7 @@ program roms_gpu
         call wrt_random()
         call wrt_cdr_gas()
         call wrt_cdr()
-        call step_bgc_avg()
+        call wrt_bgc()
         call rt_toc(RT_OUTPUT)
         rt_nsteps = rt_nsteps + 1
         call rt_step_end()

@@ -53,11 +53,14 @@ module io_server
   ! IO_KIND_CDROUT: the CDR output (cdr_output, _cdr, double).
   integer, parameter, public :: IO_KIND_HIS = 1, IO_KIND_RST = 2, IO_KIND_CDR = 3, IO_KIND_CDRGAS = 4
   integer, parameter, public :: IO_KIND_CDROUT = 5
-  ! IO_KIND_AVG / IO_KIND_BGCAVG: averaged history and BGC averages (avg_out, double).
+  ! IO_KIND_AVG / IO_KIND_BGCAVG: averaged history (avg_out) and BGC averages (bgc_out), double.
   integer, parameter, public :: IO_KIND_AVG = 6, IO_KIND_BGCAVG = 7
   ! IO_KIND_RND: the random output (random_out, _rnd; surface passive tracers).
   integer, parameter, public :: IO_KIND_RND = 8
-  integer, parameter :: NKIND = 8
+  ! IO_KIND_BGC, IO_KIND_BGCDIA, IO_KIND_BGCDIAAVG: BGC tracers, MARBL diagnostics
+  ! and their averages (bgc_out, double).
+  integer, parameter, public :: IO_KIND_BGC = 9, IO_KIND_BGCDIA = 10, IO_KIND_BGCDIAAVG = 11
+  integer, parameter :: NKIND = 11
   integer, parameter :: CMD_OPEN = 1, CMD_PUT = 2, CMD_QUIT = 3
   integer, parameter :: TAG_CMD = 900, TAG_STR = 901, TAG_TIME = 902, TAG_DATA = 910
   integer, parameter :: MAXV = 256, NAMELEN = 32, PATHLEN = 512   ! variables per record: up to ~240 tracers
@@ -103,11 +106,11 @@ module io_server
   ! into one global array and written once at full extent (no tile waits
   ! behind another tile's write, no partial-chunk rewrites). Several record
   ! slots so records can arrive while earlier ones are being written. A step
-  ! where every output falls due (restart, averages, BGC averages, _cdrtrc,
-  ! _cdrgas average and end bracket: six records) must fit: with several
+  ! where every output falls due (restart, averages, _bgc, _bgc_avg, _bgc_dia,
+  ! _bgc_dia_avg, _cdrtrc, _cdrgas average and end bracket: nine records) must fit: with several
   ! writers an overrun stops the run. A slot's buffers grow to the largest
   ! record it has held, so idle slots cost little.
-  integer, parameter :: NSLOT = 8                  ! records assembled at once (per-tile buffers)
+  integer, parameter :: NSLOT = 12                 ! records assembled at once (per-tile buffers)
   type :: tile_buf_t
     real(4), allocatable :: b(:)
     real(8), allocatable :: b8(:)
@@ -140,7 +143,7 @@ module io_server
   ! Announced files not yet opened: (kind, nfile) and path. A kind has at
   ! most a few files announced ahead of its writes (each compute rank holds
   ! at most NSET staged records).
-  integer, parameter :: NANN = 16
+  integer, parameter :: NANN = 24
   integer :: ann_key(2, NANN) = -1
   character(len=PATHLEN) :: ann_path(NANN) = ''
 
@@ -1097,6 +1100,15 @@ contains
            '  rec = ', r%rec, '  file ', r%nfile
     elseif (r%fkind == IO_KIND_BGCAVG) then
       write(*,'(a,es14.6,a,i0,a,i0)') 'wrote BGC averages t = ', r%time, &
+           '  rec = ', r%rec, '  file ', r%nfile
+    elseif (r%fkind == IO_KIND_BGC) then
+      write(*,'(a,es14.6,a,i0,a,i0)') 'wrote BGC history t = ', r%time, &
+           '  rec = ', r%rec, '  file ', r%nfile
+    elseif (r%fkind == IO_KIND_BGCDIA) then
+      write(*,'(a,es14.6,a,i0,a,i0)') 'wrote BGC diagnostics t = ', r%time, &
+           '  rec = ', r%rec, '  file ', r%nfile
+    elseif (r%fkind == IO_KIND_BGCDIAAVG) then
+      write(*,'(a,es14.6,a,i0,a,i0)') 'wrote BGC diagnostic averages t = ', r%time, &
            '  rec = ', r%rec, '  file ', r%nfile
     elseif (r%fkind == IO_KIND_RND) then
       write(*,'(a,es14.6,a,i0,a,i0)') 'wrote random t = ', r%time, &

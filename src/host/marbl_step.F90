@@ -23,7 +23,6 @@ module marbl_gpu
   use marbl_host
   use marbl_sflux_mod
   use marbl_interior_mod
-  use io_server, only: io_stage_2d, io_stage_3d
 #ifdef USE_CUDA
   use cudafor
 #endif
@@ -35,8 +34,8 @@ module marbl_gpu
   character(len=512), public :: marbl_config_file = 'marbl_in'
   real(rp), public :: marbl_timestep = 3600.0_rp
   integer(ip), public :: marbl_timestep_ratio = 1
-  ! ppm where the forcing has no xco2_air / xco2_air_alt: &bgc_settings
-  ! xco2air_default (set by avg_out, which reads the group)
+  ! ppm, with use_xco2air_forcing = .false.: &bgc_settings xco2air_default
+  ! (set by bgc_out, which reads the group)
   real(rp), public :: xco2_default = 284.7_rp
   ! Constant iron (CPU marbl_driver): with use_constant_Fe, MARBL's Fe is held
   ! at constant_Fe_value (mmol/m3) at every wet point (passive_hold): after
@@ -45,28 +44,26 @@ module marbl_gpu
   logical, public :: use_constant_Fe = .false.
   real(rp), public :: constant_Fe_value = 3.0e-3_rp
   integer(ip) :: ncalls = 0
-  ! The saturation depths (zsatcalc/zsatarag) are read only by the history
-  ! staging. A run that writes history stages its initial record before the
-  ! first MARBL call (init_output), so his_staged tells whether any record
-  ! can ever need them; without history they are not computed.
-  logical :: his_staged = .false.
-  ! The CDR output (cdr_out) averages them too: computed at every MARBL call.
+  ! The saturation depths (zsatcalc/zsatarag) are computed at every MARBL
+  ! call only for an output that has them: the BGC diagnostics (bgc_out) or
+  ! the CDR output (cdr_out).
   logical, public :: marbl_need_zsat = .false.
   ! marbl_tracers_to_write as read: the CPU writes (and averages) the named
   ! tracers, or every tracer when the list is empty (avg_out)
   character(len=32), public :: marbl_trc_list(64) = ''
+  ! marbl_diagnostics_to_write as read (bgc_out)
+  character(len=400), public :: marbl_dia_list(64) = ''
   real(rp), parameter :: Cp = 3985.0_rp
 
-  ! history diagnostics (2-D, surface flux module slots)
-  integer, parameter :: NHIS = 7
-  character(len=16), parameter :: his_name(NHIS) = [character(len=16) :: &
-       'PH', 'pCO2SURF', 'DpCO2', 'FG_CO2', 'FG_ALT_CO2', 'PH_ALT_CO2', 'pCO2SURF_ALT_CO2']
-  integer, parameter :: his_slot(NHIS) = [D_PH, D_PCO2, D_DPCO2, D_FGCO2, D_FGCO2_ALT, D_PH_ALT, D_PCO2_ALT]
-  ! history diagnostics from the interior carbonate kernel: 2-D saturation
-  ! depths and 3-D carbonate fields (CPU names, mmol/m^3 and m)
-  integer, parameter :: NHIS2I = 2, NHIS3 = 4
-  character(len=16), parameter :: his2i_name(NHIS2I) = [character(len=16) :: 'zsatcalc', 'zsatarag']
-  character(len=16), parameter :: his3_name(NHIS3) = [character(len=16) :: &
+  ! The MARBL diagnostics the GPU computes (bgc_out writes them): 2-D, from
+  ! the surface flux module (sf_diag slot dia2_slot) and the saturation
+  ! depths, and the 3-D carbonate fields (it_co3, it_co3a, it_co3sat,
+  ! it_co3sata). MARBL's names.
+  integer, parameter, public :: NDIA2 = 9, NDIA3 = 4, DIA2_ZSATC = 8, DIA2_ZSATA = 9
+  character(len=32), parameter, public :: dia2_name(NDIA2) = [character(len=32) :: &
+       'PH', 'pCO2SURF', 'DpCO2', 'FG_CO2', 'FG_ALT_CO2', 'PH_ALT_CO2', 'pCO2SURF_ALT_CO2', 'zsatcalc', 'zsatarag']
+  integer, parameter, public :: dia2_slot(NDIA2) = [D_PH, D_PCO2, D_DPCO2, D_FGCO2, D_FGCO2_ALT, D_PH_ALT, D_PCO2_ALT, 0, 0]
+  character(len=32), parameter, public :: dia3_name(NDIA3) = [character(len=32) :: &
        'CO3', 'CO3_ALT_CO2', 'co3_sat_calc', 'co3_sat_arag']
 
   public :: read_marbl_namelist
@@ -75,10 +72,6 @@ module marbl_gpu
   public :: marbl_gpu_load_state
   public :: marbl_gpu_step
   public :: marbl_gpu_init_diagnostics
-  public :: marbl_gpu_nhis
-  public :: marbl_gpu_nhis3
-  public :: marbl_gpu_define_his
-  public :: marbl_gpu_stage_his
   public :: marbl_gpu_define_rst
   public :: marbl_gpu_write_rst
   public :: marbl_gpu_stage_rst8
@@ -91,10 +84,10 @@ contains
     integer, intent(in) :: unit
     character(len=*), intent(in) :: nml_dir
     integer(ip), intent(in) :: nt_bgc
-    integer :: ios, l, k
+    integer :: ios
     character(len=512) :: cfg
     real(rp) :: tstep
-    logical :: exists, ok
+    logical :: exists
     character(len=32) :: marbl_tracers_to_write(64)
     character(len=400) :: marbl_diagnostics_to_write(64)
     namelist /marbl_biogeochemistry_settings/ marbl_config_file, marbl_timestep, &
@@ -111,22 +104,7 @@ contains
     read(unit, nml=marbl_biogeochemistry_settings, iostat=ios)
     if (ios > 0) error stop 'marbl_biogeochemistry_settings: read error'
     marbl_trc_list = marbl_tracers_to_write
-    ! The CPU writes the listed MARBL diagnostics ("" = all) to its _bgc_dia
-    ! files; the GPU writes a fixed set to _his (his_name, his2i_name,
-    ! his3_name). An empty list is accepted; a named diagnostic outside the
-    ! fixed set stops the run.
-    do l = 1, size(marbl_diagnostics_to_write)
-      if (len_trim(marbl_diagnostics_to_write(l)) == 0) exit
-      ok = any(his_name == marbl_diagnostics_to_write(l)) .or. any(his2i_name == marbl_diagnostics_to_write(l)) &
-           .or. any(his3_name == marbl_diagnostics_to_write(l))
-      if (.not. ok) then
-        write(*,'(3a)') 'MARBL_BIOGEOCHEMISTRY_SETTINGS: marbl_diagnostics_to_write names ', &
-             trim(marbl_diagnostics_to_write(l)), ', which the GPU model does not write. It writes'
-        write(*,'(a,*(1x,a))') '  these MARBL diagnostics (to _his):', (trim(his_name(k)), k = 1, NHIS), &
-             (trim(his2i_name(k)), k = 1, NHIS2I), (trim(his3_name(k)), k = 1, NHIS3)
-        error stop 'read_marbl_namelist: marbl_diagnostics_to_write not available'
-      endif
-    enddo
+    marbl_dia_list = marbl_diagnostics_to_write
     if (use_constant_Fe) then
       if (constant_Fe_value < 0.0_rp) error stop 'use_constant_Fe: constant_Fe_value must be non-negative'
       write(*,'(a,es12.5,a)') 'MARBL Fe held constant at ', constant_Fe_value, ' (use_constant_Fe)'
@@ -245,7 +223,7 @@ contains
     enddo
     ! interior: carbonate chemistry, then the column ecosystem/sinking sweep
     call marbl_carbonate_compute(ntp, nz, nn, 3_ip, tp, nt, t, z_r, rmask)
-    if (his_staged .or. marbl_need_zsat) call marbl_zsat_compute(nz, z_r, z_w, rmask)
+    if (marbl_need_zsat) call marbl_zsat_compute(nz, z_r, z_w, rmask)
     call marbl_interior_compute(ntp, nz, nn, 3_ip, tp, nt, t, z_r, z_w, Hz, rmask, sf_dust, dtm, .false.)
     call rt_dev_end()
     ncalls = ncalls + 1
@@ -375,50 +353,6 @@ contains
 
   ! Debug: NaN census of the surface-flux inputs/outputs after the first
   ! call, plus one sample point.
-
-  integer function marbl_gpu_nhis()
-    ! number of 2-D MARBL history fields (staging capacity)
-    marbl_gpu_nhis = 0
-    if (marbl_on) marbl_gpu_nhis = NHIS + NHIS2I
-  end function marbl_gpu_nhis
-
-  integer function marbl_gpu_nhis3()
-    ! number of 3-D (nz-level) MARBL history fields (staging capacity)
-    marbl_gpu_nhis3 = 0
-    if (marbl_on) marbl_gpu_nhis3 = NHIS3
-  end function marbl_gpu_nhis3
-
-  subroutine marbl_gpu_define_his(ncid, d_xi, d_eta, d_s, d_t)
-    integer, intent(in) :: ncid, d_xi, d_eta, d_s, d_t
-    integer :: n, id
-    if (.not. marbl_on) return
-    do n = 1, NHIS
-      id = nc_def_var_f(ncid, trim(his_name(n)), (/d_xi, d_eta, d_t/))
-    enddo
-    do n = 1, NHIS2I
-      id = nc_def_var_f(ncid, trim(his2i_name(n)), (/d_xi, d_eta, d_t/))
-    enddo
-    do n = 1, NHIS3
-      id = nc_def_var_f(ncid, trim(his3_name(n)), (/d_xi, d_eta, d_s, d_t/))
-    enddo
-  end subroutine marbl_gpu_define_his
-
-  subroutine marbl_gpu_stage_his(i0, i1, j0, j1, di, dj)
-    integer, intent(in) :: i0, i1, j0, j1, di, dj
-    integer :: n, nz
-    if (.not. marbl_on) return
-    his_staged = .true.
-    nz = decomp%nz
-    do n = 1, NHIS
-      call io_stage_2d(trim(his_name(n)), sf_diag(decomp%is, decomp%js, his_slot(n)), i0, i1, j0, j1, di, dj)
-    enddo
-    call io_stage_2d(trim(his2i_name(1)), it_zsatc(decomp%is, decomp%js), i0, i1, j0, j1, di, dj)
-    call io_stage_2d(trim(his2i_name(2)), it_zsata(decomp%is, decomp%js), i0, i1, j0, j1, di, dj)
-    call io_stage_3d(trim(his3_name(1)), it_co3(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1, di, dj)
-    call io_stage_3d(trim(his3_name(2)), it_co3a(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1, di, dj)
-    call io_stage_3d(trim(his3_name(3)), it_co3sat(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1, di, dj)
-    call io_stage_3d(trim(his3_name(4)), it_co3sata(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1, di, dj)
-  end subroutine marbl_gpu_stage_his
 
   subroutine marbl_gpu_define_rst(ncid, d_xi, d_eta, d_s, d_t)
     integer, intent(in) :: ncid, d_xi, d_eta, d_s, d_t

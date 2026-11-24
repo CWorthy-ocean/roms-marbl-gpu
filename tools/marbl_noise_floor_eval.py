@@ -90,7 +90,7 @@ class Source:
 
 G = GPU_OUT + (TAG if GTAG is None else GTAG)
 C = CPU_OUT + TAG
-gpu = Source([G + "_his.nc", G + "_his_[0-9][0-9][0-9][0-9].nc"])
+gpu = Source([G + "_bgc.*.nc", G + "_bgc_dia.*.nc", G + "_his.*.nc", G + "_his.nc", G + "_his_[0-9][0-9][0-9][0-9].nc"])
 ref = Source([C + "_bgc.*.nc", C + "_bgc_dia.*.nc", C + "_his.*.nc"])
 pert = Source([C + "_pert_bgc.*.nc", C + "_pert_bgc_dia.*.nc", C + "_pert_his.*.nc"])
 print("gpu files:", [os.path.basename(f) for f in gpu.files])
