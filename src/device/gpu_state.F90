@@ -349,7 +349,7 @@ contains
   subroutine open_edge_codes(west, east, south, north)
     ! Edge codes of this tile's sides for the horizontal tracer fluxes:
     ! 0 interior or periodic seam, 1 physical edge, 2 physical edge of an
-    ! open boundary (obc_*, set by init_bry / init_tides). On code 2 the
+    ! open boundary (obc_*, set by init_bry). On code 2 the
     ! face gets 0.5*(t_ghost - t_in)*inflow, which makes the inflow face
     ! first-order upwind from the boundary value in the UP3 corrector
     ! (CPU compute_horiz_tracer_fluxes.h: OBC_<side> on the edge rank,
