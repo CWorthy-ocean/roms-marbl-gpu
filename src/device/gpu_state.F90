@@ -77,9 +77,6 @@ module gpu_state
   logical,  public :: obc_east = .false.
   logical,  public :: obc_south = .false.
   logical,  public :: obc_north = .false.
-  ! the open sides W, E, S, N with 3-D boundary data (normal velocity, temperature, salinity; init_bry):
-  ! the CPU's M3_FRC_BRY and T_FRC_BRY for IMEX_IGW's 'modal' open boundary
-  logical,  public :: obc_3d(4) = .false.
   logical,  public :: have_flux = .false.
   logical,  public :: have_bry = .false.
   logical,  public :: have_bulk = .false.
@@ -428,7 +425,7 @@ contains
   subroutine open_edge_codes(west, east, south, north)
     ! Edge codes of this tile's sides for the horizontal tracer fluxes:
     ! 0 interior or periodic seam, 1 physical edge, 2 physical edge of an
-    ! open boundary (obc_*, set by init_bry / init_tides). On code 2 the
+    ! open boundary (obc_*, set by init_bry). On code 2 the
     ! face gets 0.5*(t_ghost - t_in)*inflow, which makes the inflow face
     ! first-order upwind from the boundary value in the UP3 corrector
     ! (CPU compute_horiz_tracer_fluxes.h: OBC_<side> on the edge rank,

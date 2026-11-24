@@ -1011,6 +1011,13 @@ v0.1.2-beta, bit for bit.
   the depth mean of the viscous increment: the sponge did not damp
   `ubar`, `vbar` and `zeta`. Runs without lateral viscosity are unchanged
   bit for bit.
+- Namelist: `&open_boundary_settings` (`obc_west`, `obc_east`, `obc_south`,
+  `obc_north`, default `.true.`) sets the open sides, as in UCLA ROMS after
+  0.16.0. Before, the sides with `zeta` or barotropic velocity data in the
+  boundary files were open; a domain whose files hold only some sides must
+  now set the others to `.false.`. Boundary data missing on an open side stop
+  the run (before, missing `u`, `v`, `temp`, `salt` and MARBL tracers were
+  0), and so do the schemes the GPU does not have.
 - Namelist: `use_boundary_sponge` (`&v_sponge_settings`, default `.true.`)
   switches the sponge along the open boundaries, as in UCLA ROMS after
   0.16.0, where it replaces the `SPONGE` cpp key. Runs without the key are

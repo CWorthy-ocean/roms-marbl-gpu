@@ -65,30 +65,23 @@
     ! Once, at the first IMEX step (the open sides and the boundary data are
     ! known; init_bry runs after the initial file is read): 'modal' or 'fixed'
     ! as the CPU (check_settings): 'auto' selects 'modal' with an open edge
-    ! and 3-D boundary data (the CPU's M3_FRC_BRY and T_FRC_BRY: normal
-    ! velocity, temperature and salinity on every open side). The GPU's own
+    ! (which has boundary data for u, v, T and S: init_bry). The GPU's own
     ! conditions (check_settings, obm_gpu_ok): with 'auto' a NOTE and
     ! 'fixed', with 'modal' a stop. A restart whose IMEX state was written
     ! with another boundary mode is turned into the inexact restart, as the
     ! CPU does (rst_mode, obc_mode_change).
-    use gpu_state, only: obc_west, obc_east, obc_south, obc_north, obc_3d
-    logical :: opn, d3, cpu_modal
+    use gpu_state, only: obc_west, obc_east, obc_south, obc_north
+    logical :: opn, cpu_modal
     character(len=256) :: why
     if (obm_decided) return
     obm_decided = .true.
     if (.not. (imex_on .and. imex_solver_enabled)) return
     opn = obc_west .or. obc_east .or. obc_south .or. obc_north
-    d3 = opn
-    if (obc_west .and. .not. obc_3d(1)) d3 = .false.
-    if (obc_east .and. .not. obc_3d(2)) d3 = .false.
-    if (obc_south .and. .not. obc_3d(3)) d3 = .false.
-    if (obc_north .and. .not. obc_3d(4)) d3 = .false.
-    cpu_modal = trim(imex_obc_mode) == 'modal' .or. (trim(imex_obc_mode) == 'auto' .and. d3)
+    cpu_modal = trim(imex_obc_mode) == 'modal' .or. (trim(imex_obc_mode) == 'auto' .and. opn)
     imex_obc_modal = .false.
     if (cpu_modal) then
-      if (trim(imex_obc_mode) == 'modal' .and. .not. d3) then
-        if (talk) write(*,'(a)') "ERROR: &imex_igw_settings: imex_obc_mode = 'modal' needs an open edge with 3-D" &
-             // ' boundary data (normal velocity, temperature, salinity) on every open side'
+      if (trim(imex_obc_mode) == 'modal' .and. .not. opn) then
+        if (talk) write(*,'(a)') "ERROR: &imex_igw_settings: imex_obc_mode = 'modal' needs an open edge"
         error stop 'imex_igw: unsupported &imex_igw_settings (see above)'
       endif
       if (obm_gpu_ok) then

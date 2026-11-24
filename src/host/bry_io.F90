@@ -15,7 +15,7 @@ module bry_io
   use time_state
   use frc_io, only: case_frcfiles, case_nfrc, cyc_bracket, frc_file_ncid, cached_times, frc_run_ncid_path, &
                     frc_warm_series
-  use passive_mod, only: ntp, passive_bry, passive_name, tb_west, tb_east, tb_south, tb_north
+  use passive_mod, only: ntp, n_marbl, passive_bry, passive_name, tb_west, tb_east, tb_south, tb_north
   use nc_io
   use arch_mod, only: sync_arch
   use pflx_mod, only: apply_sponge_tune, pf_w, pf_e, pf_s, pf_n
@@ -67,6 +67,13 @@ module bry_io
   ! (extracted by the parent as up_<side>/vp_<side>)
   type(series1d) :: ser_upw, ser_upe, ser_vps, ser_vpn
 
+  ! &open_boundary_settings: the sides the namelist asks to be open, and the
+  ! scheme names, checked in init_bry (the GPU has one scheme)
+  logical :: want_west = .true., want_east = .true., want_south = .true., want_north = .true.
+  logical :: want_m3_data = .true., want_t_data = .true.
+  character(len=16) :: scheme_m2 = 'flather', scheme_m3 = 'orlanski', scheme_t = 'orlanski', scheme_rad = 'oblique'
+
+  public :: read_open_boundary_namelist
   public :: init_bry
   public :: set_bry_all
   public :: set_pflx_bry
@@ -75,32 +82,111 @@ module bry_io
 
 contains
 
+  subroutine read_open_boundary_namelist(unit)
+    ! Optional group &open_boundary_settings (absent: every side open, with
+    ! the schemes of the GPU), as the CPU (open_boundary_mod.F90).
+    integer, intent(in) :: unit
+    integer :: ios
+    character(len=512) :: msg
+    logical :: obc_west, obc_east, obc_south, obc_north, use_m3_boundary_data, use_t_boundary_data
+    character(len=16) :: obc_m2, obc_m3, obc_t, obc_rad
+    namelist /open_boundary_settings/ obc_west, obc_east, obc_south, obc_north, &
+                                      obc_m2, obc_m3, obc_t, obc_rad, use_m3_boundary_data, use_t_boundary_data
+    obc_west = .true.; obc_east = .true.; obc_south = .true.; obc_north = .true.
+    obc_m2 = 'flather'; obc_m3 = 'orlanski'; obc_t = 'orlanski'; obc_rad = 'oblique'
+    use_m3_boundary_data = .true.; use_t_boundary_data = .true.
+    rewind(unit)
+    read(unit, nml=open_boundary_settings, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'OPEN_BOUNDARY_SETTINGS: ', trim(iomsg_text(msg))
+      error stop 'read_open_boundary_namelist'
+    endif
+    call check_choice('obc_m2', obc_m2, [character(len=16) :: 'flather', 'specified', 'gradient'])
+    call check_choice('obc_m3', obc_m3, [character(len=16) :: 'orlanski', 'gradient'])
+    call check_choice('obc_t', obc_t, [character(len=16) :: 'orlanski', 'gradient'])
+    call check_choice('obc_rad', obc_rad, [character(len=16) :: 'oblique', 'normal', 'npo'])
+    want_west = obc_west; want_east = obc_east; want_south = obc_south; want_north = obc_north
+    scheme_m2 = obc_m2; scheme_m3 = obc_m3; scheme_t = obc_t; scheme_rad = obc_rad
+    want_m3_data = use_m3_boundary_data; want_t_data = use_t_boundary_data
+
+  contains
+
+    subroutine check_choice(key, val, allowed)
+      character(len=*), intent(in) :: key, val, allowed(:)
+      if (any(allowed == val)) return
+      write(*,'(5a)') 'OPEN_BOUNDARY_SETTINGS: ', key, " = '", trim(val), "' is not a choice"
+      error stop 'read_open_boundary_namelist'
+    end subroutine check_choice
+
+  end subroutine read_open_boundary_namelist
+
+  subroutine check_schemes()
+    ! With an open side, stop on a scheme of the CPU that the GPU does not have.
+    character(len=24) :: key
+    key = ''
+    if (scheme_m2 /= 'flather') then
+      key = 'obc_m2'
+    elseif (scheme_m3 /= 'orlanski') then
+      key = 'obc_m3'
+    elseif (scheme_t /= 'orlanski') then
+      key = 'obc_t'
+    elseif (scheme_rad /= 'oblique') then
+      key = 'obc_rad'
+    elseif (.not. want_m3_data) then
+      key = 'use_m3_boundary_data'
+    elseif (.not. want_t_data) then
+      key = 'use_t_boundary_data'
+    endif
+    if (len_trim(key) == 0) return
+    write(*,'(3a)') 'OPEN_BOUNDARY_SETTINGS: ', trim(key), ' is not at its default: the GPU model has only'
+    write(*,'(a)') "  obc_m2 = 'flather', obc_m3 = 'orlanski', obc_t = 'orlanski', obc_rad = 'oblique' and boundary data for all"
+    error stop 'open_boundary_settings: scheme not available on the GPU (see above)'
+  end subroutine check_schemes
+
   subroutine init_bry()
     integer(ip) :: m, nmiss
-    have_bry = .false.
-    obc_west = .false.; obc_east = .false.; obc_south = .false.; obc_north = .false.; obc_3d = .false.
-    if (case_nfrc < 1) return
-    call bind1(ser_zw, 'zeta_west', 'j'); call bind1(ser_ubw, 'ubar_west', 'j'); call bind1(ser_vbw, 'vbar_west', 'j')
-    call bind1(ser_ze, 'zeta_east', 'j'); call bind1(ser_ube, 'ubar_east', 'j'); call bind1(ser_vbe, 'vbar_east', 'j')
-    call bind1(ser_zs, 'zeta_south', 'i'); call bind1(ser_ubs, 'ubar_south', 'i'); call bind1(ser_vbs, 'vbar_south', 'i')
-    call bind1(ser_zn, 'zeta_north', 'i'); call bind1(ser_ubn, 'ubar_north', 'i'); call bind1(ser_vbn, 'vbar_north', 'i')
-    call bindz(ser_uw, 'u_west', 'j'); call bindz(ser_vw, 'v_west', 'j')
-    call bindz(ser_tw, 'temp_west', 'j'); call bindz(ser_sw, 'salt_west', 'j')
-    call bindz(ser_ue, 'u_east', 'j'); call bindz(ser_ve, 'v_east', 'j')
-    call bindz(ser_te, 'temp_east', 'j'); call bindz(ser_se, 'salt_east', 'j')
-    call bindz(ser_us, 'u_south', 'i'); call bindz(ser_vs, 'v_south', 'i')
-    call bindz(ser_ts, 'temp_south', 'i'); call bindz(ser_ss, 'salt_south', 'i')
-    call bindz(ser_un, 'u_north', 'i'); call bindz(ser_vn, 'v_north', 'i')
-    call bindz(ser_tn, 'temp_north', 'i'); call bindz(ser_sn, 'salt_north', 'i')
-    obc_west  = ser_zw%ready .or. ser_ubw%ready
-    obc_east  = ser_ze%ready .or. ser_ube%ready
-    obc_south = ser_zs%ready .or. ser_vbs%ready
-    obc_north = ser_zn%ready .or. ser_vbn%ready
+    integer :: nabsent
+    ! the open sides: as asked (&open_boundary_settings), never in a periodic direction
+    obc_west  = want_west .and. .not. decomp%periodic_x
+    obc_east  = want_east .and. .not. decomp%periodic_x
+    obc_south = want_south .and. .not. decomp%periodic_y
+    obc_north = want_north .and. .not. decomp%periodic_y
+    if (decomp%periodic_x .and. (want_west .or. want_east)) &
+         write(*,'(a)') 'OPEN_BOUNDARY_SETTINGS: obc_west and obc_east ignored (periodic in the west-east direction)'
+    if (decomp%periodic_y .and. (want_south .or. want_north)) &
+         write(*,'(a)') 'OPEN_BOUNDARY_SETTINGS: obc_south and obc_north ignored (periodic in the south-north direction)'
     have_bry = obc_west .or. obc_east .or. obc_south .or. obc_north
-    obc_3d = [obc_west .and. ser_uw%ready .and. ser_tw%ready .and. ser_sw%ready, &
-              obc_east .and. ser_ue%ready .and. ser_te%ready .and. ser_se%ready, &
-              obc_south .and. ser_vs%ready .and. ser_ts%ready .and. ser_ss%ready, &
-              obc_north .and. ser_vn%ready .and. ser_tn%ready .and. ser_sn%ready]
+    if (have_bry) call check_schemes()
+    ! the data of the open sides, all of which must be there (as on the CPU)
+    nabsent = 0
+    if (obc_west) then
+      call bind1(ser_zw, 'zeta_west', 'j'); call bind1(ser_ubw, 'ubar_west', 'j'); call bind1(ser_vbw, 'vbar_west', 'j')
+      call bindz(ser_uw, 'u_west', 'j'); call bindz(ser_vw, 'v_west', 'j')
+      call bindz(ser_tw, 'temp_west', 'j'); call bindz(ser_sw, 'salt_west', 'j')
+      call need1(ser_zw); call need1(ser_ubw); call need1(ser_vbw)
+      call needz(ser_uw); call needz(ser_vw); call needz(ser_tw); call needz(ser_sw)
+    endif
+    if (obc_east) then
+      call bind1(ser_ze, 'zeta_east', 'j'); call bind1(ser_ube, 'ubar_east', 'j'); call bind1(ser_vbe, 'vbar_east', 'j')
+      call bindz(ser_ue, 'u_east', 'j'); call bindz(ser_ve, 'v_east', 'j')
+      call bindz(ser_te, 'temp_east', 'j'); call bindz(ser_se, 'salt_east', 'j')
+      call need1(ser_ze); call need1(ser_ube); call need1(ser_vbe)
+      call needz(ser_ue); call needz(ser_ve); call needz(ser_te); call needz(ser_se)
+    endif
+    if (obc_south) then
+      call bind1(ser_zs, 'zeta_south', 'i'); call bind1(ser_ubs, 'ubar_south', 'i'); call bind1(ser_vbs, 'vbar_south', 'i')
+      call bindz(ser_us, 'u_south', 'i'); call bindz(ser_vs, 'v_south', 'i')
+      call bindz(ser_ts, 'temp_south', 'i'); call bindz(ser_ss, 'salt_south', 'i')
+      call need1(ser_zs); call need1(ser_ubs); call need1(ser_vbs)
+      call needz(ser_us); call needz(ser_vs); call needz(ser_ts); call needz(ser_ss)
+    endif
+    if (obc_north) then
+      call bind1(ser_zn, 'zeta_north', 'i'); call bind1(ser_ubn, 'ubar_north', 'i'); call bind1(ser_vbn, 'vbar_north', 'i')
+      call bindz(ser_un, 'u_north', 'i'); call bindz(ser_vn, 'v_north', 'i')
+      call bindz(ser_tn, 'temp_north', 'i'); call bindz(ser_sn, 'salt_north', 'i')
+      call need1(ser_zn); call need1(ser_ubn); call need1(ser_vbn)
+      call needz(ser_un); call needz(ser_vn); call needz(ser_tn); call needz(ser_sn)
+    endif
     if (apply_sponge_tune) then
       call bind1(ser_upw, 'up_west', 'j'); call bind1(ser_upe, 'up_east', 'j')
       call bind1(ser_vps, 'vp_south', 'i'); call bind1(ser_vpn, 'vp_north', 'i')
@@ -112,16 +198,46 @@ contains
       allocate(ser_tbw(ntp), ser_tbe(ntp), ser_tbs(ntp), ser_tbn(ntp))
       nmiss = 0
       do m = 1, ntp
-        call bindz(ser_tbw(m), trim(passive_name(m))//'_west', 'j')
-        call bindz(ser_tbe(m), trim(passive_name(m))//'_east', 'j')
-        call bindz(ser_tbs(m), trim(passive_name(m))//'_south', 'i')
-        call bindz(ser_tbn(m), trim(passive_name(m))//'_north', 'i')
+        if (obc_west) call bindz(ser_tbw(m), trim(passive_name(m))//'_west', 'j')
+        if (obc_east) call bindz(ser_tbe(m), trim(passive_name(m))//'_east', 'j')
+        if (obc_south) call bindz(ser_tbs(m), trim(passive_name(m))//'_south', 'i')
+        if (obc_north) call bindz(ser_tbn(m), trim(passive_name(m))//'_north', 'i')
+        if (m <= n_marbl) then   ! the MARBL tracers must be there (as on the CPU); CDR_LITE and generic ones may be absent
+          if (obc_west) call needz(ser_tbw(m))
+          if (obc_east) call needz(ser_tbe(m))
+          if (obc_south) call needz(ser_tbs(m))
+          if (obc_north) call needz(ser_tbn(m))
+        endif
         if (.not. (ser_tbw(m)%ready .or. ser_tbe(m)%ready .or. ser_tbs(m)%ready .or. ser_tbn(m)%ready)) &
              nmiss = nmiss + 1
       enddo
       write(*,'(a,i0,a,i0,a)') 'passive (MARBL, CDR_LITE) boundary data bound for ', ntp - nmiss, ' of ', ntp, &
            ' tracers (missing ones use 0 on inflow)'
     endif
+    if (nabsent > 0) then
+      write(*,'(a)') 'OPEN_BOUNDARY_SETTINGS: a side is open (obc_west, obc_east, obc_south, obc_north; default .true.)'
+      write(*,'(a)') '  but its boundary data above are in no forcing file; close the side (.false.) or add the data'
+      error stop 'init_bry: boundary data missing (see above)'
+    endif
+
+  contains
+
+    subroutine need1(s)
+      type(series1d), intent(in) :: s
+      if (.not. s%ready) call report_absent(s%vname)
+    end subroutine need1
+
+    subroutine needz(s)
+      type(series_z), intent(in) :: s
+      if (.not. s%ready) call report_absent(s%vname)
+    end subroutine needz
+
+    subroutine report_absent(vname)
+      character(len=*), intent(in) :: vname
+      nabsent = nabsent + 1
+      write(*,'(3a)') 'boundary data missing: ', trim(vname), ' is in no forcing file'
+    end subroutine report_absent
+
   end subroutine init_bry
 
   subroutine set_bry_all()
