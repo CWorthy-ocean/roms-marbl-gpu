@@ -552,8 +552,8 @@ contains
     hbls = 0.0_rp; hbbl = 0.0_rp; srflx = 0.0_rp
     ghat = 0.0_rp; swr_frac = 0.0_rp
     ! zob, akv_bak and akt_bak keep their values: load_case reads the
-    ! namelist (read_namelist) before this call, and infer_layout calls it
-    ! again for a periodic grid; the defaults are the module initialisers.
+    ! namelist (read_namelist) before this call; the defaults are the
+    ! module initialisers.
     rufrc = 0.0_rp; rvfrc = 0.0_rp
     rufrc_bak = 0.0_rp; rvfrc_bak = 0.0_rp
     DU_avg1 = 0.0_rp; DV_avg1 = 0.0_rp

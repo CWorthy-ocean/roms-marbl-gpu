@@ -103,6 +103,20 @@
 # diagnostics were in _his and only wrt_bgc_avg was honoured. Without MARBL
 # (nt_bgc = 0) the switches do nothing, as on UCLA ROMS.
 #
+# Periodic grids: the optional group &periodic_settings with the logicals
+# ew_periodic, ns_periodic (default .false.; one direction may be periodic
+# alone), as UCLA ROMS after 0.16.0; before, UCLA ROMS selected them with
+# its cpp keys EW_PERIODIC and NS_PERIODIC. The size of the grid file no
+# longer sets the periodicity: a grid file of LLm x MMm points (doubly
+# periodic, the GPU's layout) now needs both keys, and stops the run without
+# them. The grid file and the initial or restart file are each checked
+# against the keys: a closed direction needs LLm+2 (MMm+2) rho points; a
+# periodic one takes UCLA ROMS's layout, LLm+2 with the periodic copies as
+# first and last points (only the interior is read), or roms_gpu's LLm
+# (MMm). Any other size stops the run with the expected sizes. Output
+# files keep roms_gpu's layout (no boundary points in a periodic
+# direction), which UCLA ROMS cannot read.
+#
 # Open boundaries: the optional group &open_boundary_settings, as UCLA ROMS
 # after 0.16.0; before, UCLA ROMS selected all of it with cpp keys (OBC_WEST,
 # ...) and the GPU opened the sides it found zeta or barotropic velocity data
