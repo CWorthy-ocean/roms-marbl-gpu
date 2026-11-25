@@ -349,6 +349,10 @@ v0.1.2-beta, bit for bit.
   the depth mean of the viscous increment: the sponge did not damp
   `ubar`, `vbar` and `zeta`. Runs without lateral viscosity are unchanged
   bit for bit.
+- Namelist: `salinity` and `mpi_masking` (`&param_settings`), as in UCLA
+  ROMS after 0.16.0. `salinity = .false.` (a temperature-only run) stops
+  the run; `mpi_masking` is read and ignored (it only sets how UCLA ROMS
+  splits the domain).
 - Namelist: `sponge_profile` (`&v_sponge_settings`: `'linear'`, the
   default, or `'cosine'`) and `linear_drag` (`&bottom_drag_settings`,
   default `.false.`), as in UCLA ROMS after 0.16.0. `ana_grid`,
