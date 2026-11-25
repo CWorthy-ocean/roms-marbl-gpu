@@ -125,8 +125,9 @@ contains
     real(rp) :: akt_bak_in(2)
     character(len=512) :: grdname, inifile, ininame, title, output_root_name
 
+    logical :: salinity, mpi_masking
     namelist /param_settings/ np_xi, np_eta, llm, mmm, nz, n, &
-                              nt_passive, nt_bgc, nt_cdr_oae, nt_cdr_dor
+                              nt_passive, nt_bgc, nt_cdr_oae, nt_cdr_dor, salinity, mpi_masking
     logical :: ana_grid, ana_initial
     namelist /grid_settings/ grdname, ana_grid
     namelist /initial_conditions/ inifile, ininame, nrrec, ana_initial
@@ -143,6 +144,7 @@ contains
     llm = 32; mmm = 32; nz = 0; n = 0
     np_xi = 1; np_eta = 1
     nt_passive = 0; nt_bgc = 0; nt_cdr_oae = 0; nt_cdr_dor = 0; nrrec = -1
+    salinity = .true.; mpi_masking = .false.
     ininame = ''
     dt_in = 100.0_rp; ndtfast_in = 60; ntimes_in = 1; ninfo = 1
     theta_s_in = 6.0_rp; theta_b_in = 6.0_rp; hc_in = 250.0_rp
@@ -166,6 +168,13 @@ contains
       write(*,*) 'PARAM_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_namelist'
     endif
+    if (.not. salinity) then   ! UCLA ROMS: temperature-only runs
+      write(*,'(a)') 'ERROR: PARAM_SETTINGS salinity = .false.: temperature-only runs are UCLA ROMS only;'// &
+                     ' the GPU always carries salinity'
+      error stop 'read_namelist: salinity'
+    endif
+    ! mpi_masking (UCLA ROMS: drop all-land tiles and choose its tiling) is
+    ! read and ignored: it only sets how UCLA ROMS splits the domain
     call read_periodic_settings(unit)
     call set_cdr_lite(nt_cdr_oae, nt_cdr_dor)
     case_nt_passive = max(nt_passive, 0_ip)
