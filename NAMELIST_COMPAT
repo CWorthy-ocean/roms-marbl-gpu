@@ -128,6 +128,18 @@
 # A multi-tile 'wet' run without MARBL and without the key gets new tile
 # cuts; tile_land_weight = 0.10 keeps the old ones.
 #
+# Surface forcing: &surf_frc_settings surf_frc_type, as UCLA ROMS after
+# 0.16.0 (there it replaces the cpp keys BULK_FRC and ANA_SMFLUX, ANA_STFLUX,
+# ANA_SSFLUX, ANA_SRFLUX): 'bulk' (the default), 'flux' or 'none' (no surface
+# fluxes). It alone decides; before, the GPU used bulk forcing when the files
+# held its variables, flux forcing when they held sustr, svstr and shflux,
+# and none otherwise. Every variable of the chosen type must be in the
+# forcing files, as on UCLA ROMS (bulk: uwnd, vwnd, Tair, qair, rain, lwrad,
+# swrad; flux: sustr, svstr, shflux, swflux, swrad); before, rain, lwrad and
+# swrad (bulk) and swflux and swrad (flux) were 0 when missing. A flux-forced
+# case must set surf_frc_type = 'flux', and one without surface forcing
+# 'none'. The restoring switches need 'bulk'.
+#
 # Periodic grids: the optional group &periodic_settings with the logicals
 # ew_periodic, ns_periodic (default .false.; one direction may be periodic
 # alone), as UCLA ROMS after 0.16.0; before, UCLA ROMS selected them with

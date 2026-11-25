@@ -1973,6 +1973,9 @@ contains
     write(unit,'(a)') '    akt_bak = 0.0, 0.0'
     write(unit,'(a)') '    akv_bak = 0.0'
     write(unit,'(a)') '/'
+    write(unit,'(a)') '&surf_frc_settings'
+    write(unit,'(a)') "    surf_frc_type = 'none'"
+    write(unit,'(a)') '/'
     write(unit,'(a)') '&open_boundary_settings'
     write(unit,'(a)') '    obc_west = .false., obc_east = .false., obc_south = .false., obc_north = .false.'
     write(unit,'(a)') '/'
