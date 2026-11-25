@@ -313,8 +313,7 @@ v0.1.2-beta, bit for bit.
     tilings are 0.3-1.3 times the CPU model's own 2x2 against 4x1
     difference (hbbl 1.8 times), and the GPU against the CPU at the same
     tiling 0.6-1.05 times (hbbl 1.8).
-  - Not tested on the GPU: periodic domains (the GPU model cannot write
-    output on a periodic grid), `fs_drag_implicit`, sponge tuning
+  - Not tested on the GPU: `fs_drag_implicit`, sponge tuning
     (`apply_sponge_tune`) together with the implicit free surface, more than two
     nodes. A closed basin and river and CDR volume sources were checked
     during the port's development, not on this branch's gate cases, of
@@ -350,6 +349,20 @@ v0.1.2-beta, bit for bit.
   the depth mean of the viscous increment: the sponge did not damp
   `ubar`, `vbar` and `zeta`. Runs without lateral viscosity are unchanged
   bit for bit.
+- Namelist: `&periodic_settings` (`ew_periodic`, `ns_periodic`, default
+  `.false.`) sets the periodic directions, as in UCLA ROMS after 0.16.0.
+  The size of the grid file no longer does: a grid file of LLm x MMm points
+  (doubly periodic) needs both keys, and stops the run without them. The
+  grid, initial and restart files may use UCLA ROMS's layout (LLm+2 x MMm+2;
+  the interior is read) or the GPU's (no boundary points in a periodic
+  direction).
+- Periodic grids (ported from dev): history, average and restart files are
+  written, and a restart from them is exact. Before, the first record
+  stopped the run ("NetCDF: Start+count exceeds dimension bound"), and `u`
+  and `v` were read one point off in a periodic direction. The forcing halo
+  in a periodic direction, on the grid and 2x coarse, is the periodic copy
+  of the interior, as UCLA ROMS's exchanges make it; before, the fluxes
+  next to the seam were wrong. Non-periodic runs are unchanged, bit for bit.
 - Namelist: `&open_boundary_settings` (`obc_west`, `obc_east`, `obc_south`,
   `obc_north`, default `.true.`) sets the open sides, as in UCLA ROMS after
   0.16.0. Before, the sides with `zeta` or barotropic velocity data in the
