@@ -140,6 +140,12 @@
 # case must set surf_frc_type = 'flux', and one without surface forcing
 # 'none'. The restoring switches need 'bulk'.
 #
+# Salinity and MPI masking, as UCLA ROMS after 0.16.0 (there they replace
+# the cpp keys SALINITY and MPI_MASKING): &param_settings salinity (default
+# .true.) is read, and .false. (a temperature-only run) stops: the GPU always
+# carries salinity. &param_settings mpi_masking (default .false.; UCLA ROMS
+# drops all-land tiles and chooses its tiling) is read and ignored.
+#
 # Analytical cases and small switches, as UCLA ROMS after 0.16.0 (there
 # they replace the cpp keys ANA_GRID, ANA_INITIAL, ANA_VMIX, PACIFIC and
 # LINEAR_DRAG_ONLY): &grid_settings ana_grid, &initial_conditions
