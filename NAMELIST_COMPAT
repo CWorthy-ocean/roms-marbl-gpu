@@ -140,6 +140,16 @@
 # case must set surf_frc_type = 'flux', and one without surface forcing
 # 'none'. The restoring switches need 'bulk'.
 #
+# Analytical cases and small switches, as UCLA ROMS after 0.16.0 (there
+# they replace the cpp keys ANA_GRID, ANA_INITIAL, ANA_VMIX, PACIFIC and
+# LINEAR_DRAG_ONLY): &grid_settings ana_grid, &initial_conditions
+# ana_initial and &vertical_mixing_settings ana_vmix (default .false.) are
+# read, and .true. stops the run: the GPU has no analytical grid, initial
+# state or vertical mixing. &v_sponge_settings sponge_profile = 'linear'
+# (the default, as before) or 'cosine' (UCLA ROMS's former PACIFIC); another
+# value stops. &bottom_drag_settings linear_drag = .true. (default .false.)
+# uses the linear drag rdrg even when zob > 0.
+#
 # Periodic grids: the optional group &periodic_settings with the logicals
 # ew_periodic, ns_periodic (default .false.; one direction may be periodic
 # alone), as UCLA ROMS after 0.16.0; before, UCLA ROMS selected them with

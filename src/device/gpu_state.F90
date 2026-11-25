@@ -68,6 +68,7 @@ module gpu_state
   real(rp), public :: zob = 0.01_rp
   real(rp), public :: rdrg = 0.0_rp
   real(rp), public :: rdrg2 = 0.0_rp
+  logical,  public :: linear_drag_on = .false.   ! &bottom_drag_settings linear_drag
   real(rp), public :: visc2 = 0.0_rp
   real(rp), public :: akv_bak = 0.0_rp
   real(rp), public :: akt_bak(2) = 0.0_rp
