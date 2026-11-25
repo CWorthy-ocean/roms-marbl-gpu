@@ -349,6 +349,10 @@ v0.1.2-beta, bit for bit.
   the depth mean of the viscous increment: the sponge did not damp
   `ubar`, `vbar` and `zeta`. Runs without lateral viscosity are unchanged
   bit for bit.
+- Namelist: `sponge_profile` (`&v_sponge_settings`: `'linear'`, the
+  default, or `'cosine'`) and `linear_drag` (`&bottom_drag_settings`,
+  default `.false.`), as in UCLA ROMS after 0.16.0. `ana_grid`,
+  `ana_initial` and `ana_vmix` are read and stop the run when `.true.`.
 - Namelist: `surf_frc_type` (`&surf_frc_settings`: `'bulk'`, the default,
   `'flux'` or `'none'`) chooses the surface forcing, as in UCLA ROMS after
   0.16.0. Before, the forcing files' variables chose it. Every variable of
