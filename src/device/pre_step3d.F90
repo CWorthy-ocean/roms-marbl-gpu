@@ -429,11 +429,13 @@ contains
 
   subroutine set_bottom_drag()
     ! CPU pre_step3d "rd" -> r_D at rho points from bottom-level u,v(nstp):
-    ! finite-volume log layer if zob > 0, else rdrg capped by 0.8*Hz/dt.
+    ! finite-volume log layer if zob > 0 (and not linear_drag), else rdrg
+    ! capped by 0.8*Hz/dt.
     ! step3d_uv1 needs r_D(i-1,j) and r_D(i,j-1), so cover 0:nx, 0:ny.
     real(rp), parameter :: vonkar = 0.41_rp
     integer(ip) :: i, j, nx, ny, n_stp
     real(rp) :: cff, zob_loc, rdrg_loc, dt_loc
+    logical :: loglaw
 
     nx = decomp%nx
     ny = decomp%ny
@@ -441,6 +443,7 @@ contains
     zob_loc = zob
     rdrg_loc = rdrg
     dt_loc = dt
+    loglaw = zob_loc > 0.0_rp .and. .not. linear_drag_on   ! the CPU's compute_rd_bott_drag.h
     ! u, v(nstp) are current (step3d_uv2's exchange): no exchange.
 
 #ifdef USE_CUDA
@@ -450,7 +453,7 @@ contains
       do i = 0, nx
         if (Hz(i, j, 1) <= 0.0_rp) then
           r_D(i, j) = 0.0_rp
-        elseif (zob_loc > 0.0_rp) then
+        elseif (loglaw) then
           cff = sqrt(0.333333333333_rp * ( &
                 u(i, j, 1, n_stp)**2 + u(i + 1, j, 1, n_stp)**2 + &
                 u(i, j, 1, n_stp) * u(i + 1, j, 1, n_stp) + &

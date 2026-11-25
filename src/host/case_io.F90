@@ -84,6 +84,7 @@ module case_io
   integer(ip), public :: case_tile_xcut(64) = 0, case_tile_ycut(64) = 0
   integer(ip), public :: case_record = 1
   integer(ip), public :: case_nrrec = -1
+  character(len=8) :: case_sponge_profile = 'linear'   ! &v_sponge_settings sponge_profile
   logical,     public :: case_exact_restart = .false.
   logical :: ncid_has_uslow = .false., ncid_has_vslow = .false.   ! calc_pflx restart fields present
   logical :: case_have_prev = .false.
@@ -126,13 +127,15 @@ contains
 
     namelist /param_settings/ np_xi, np_eta, llm, mmm, nz, n, &
                               nt_passive, nt_bgc, nt_cdr_oae, nt_cdr_dor
-    namelist /grid_settings/ grdname
-    namelist /initial_conditions/ inifile, ininame, nrrec
+    logical :: ana_grid, ana_initial
+    namelist /grid_settings/ grdname, ana_grid
+    namelist /initial_conditions/ inifile, ininame, nrrec, ana_initial
     namelist /simulation_name_settings/ output_root_name, title
     namelist /ubind_settings/ ubind
     logical  :: use_boundary_sponge
     real(rp) :: v_sponge, v_sponge_trc
-    namelist /v_sponge_settings/ use_boundary_sponge, v_sponge, v_sponge_trc
+    character(len=8) :: sponge_profile
+    namelist /v_sponge_settings/ use_boundary_sponge, v_sponge, v_sponge_trc, sponge_profile
     namelist /calc_pflx_settings/ calc_pflx, pflx_timescale
     namelist /sponge_tune_settings/ sponge_timescale, nrpf_sponge, output_period_sponge, apply_sponge_tune, wrt_sponge, &
                                     sponge_avg
@@ -146,6 +149,7 @@ contains
     zob_in = 0.01_rp; rdrg_in = 0.0_rp; rdrg2_in = 0.0_rp; visc2_in = 0.0_rp
     akv_bak_in = 0.0_rp; akt_bak_in = 0.0_rp; rho0_in = 1025.0_rp
     grdname = ''; inifile = ''
+    ana_grid = .false.; ana_initial = .false.
     title = 'roms_gpu'; output_root_name = './output'
 
     case_nml = trim(path)
@@ -171,11 +175,21 @@ contains
       write(*,*) 'GRID_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_namelist'
     endif
+    if (ana_grid) then   ! UCLA ROMS: the case's ana_grid.h
+      write(*,'(a)') 'ERROR: GRID_SETTINGS ana_grid = .true.: analytical grids (ana_grid.h) are UCLA ROMS only;'// &
+                     ' the GPU reads the grid from grdname'
+      error stop 'read_namelist: ana_grid'
+    endif
 
     rewind(unit); read(unit, nml=initial_conditions, iostat=ios, iomsg=msg)
     if (ios /= 0) then
       write(*,*) 'INITIAL_CONDITIONS: ', trim(iomsg_text(msg))
       error stop 'read_namelist'
+    endif
+    if (ana_initial) then   ! UCLA ROMS: the case's ana_init.h
+      write(*,'(a)') 'ERROR: INITIAL_CONDITIONS ana_initial = .true.: analytical initial states (ana_init.h) are'// &
+                     ' UCLA ROMS only; the GPU reads the initial state from inifile'
+      error stop 'read_namelist: ana_initial'
     endif
 
     call read_s_coord(unit, theta_s_in, theta_b_in, hc_in)
@@ -189,11 +203,18 @@ contains
     use_boundary_sponge = .true.
     v_sponge = 0.0_rp
     v_sponge_trc = -1.0_rp     ! the CPU's default: negative (or absent) = v_sponge
+    sponge_profile = 'linear'
     rewind(unit); read(unit, nml=v_sponge_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'V_SPONGE_SETTINGS')
     if (ios /= 0) v_sponge = 0.0_rp
     if (v_sponge_trc < 0.0_rp) v_sponge_trc = v_sponge   ! as the CPU (scalars.F90)
     if (v_sponge < 0.0_rp) error stop 'v_sponge_settings: v_sponge must not be negative'
+    if (sponge_profile /= 'linear' .and. sponge_profile /= 'cosine') then
+      write(*,'(3a)') "ERROR: V_SPONGE_SETTINGS sponge_profile = '", trim(sponge_profile), &
+                      "' is not a choice: use 'linear' or 'cosine'"
+      error stop 'read_namelist: sponge_profile'
+    endif
+    case_sponge_profile = sponge_profile
     call set_sponge_global_atts(use_boundary_sponge, v_sponge, v_sponge_trc)
     if (.not. use_boundary_sponge) then   ! apply_sponge then adds nothing
       v_sponge = 0.0_rp; v_sponge_trc = 0.0_rp
@@ -356,18 +377,22 @@ contains
   end subroutine set_tnu2
 
   subroutine apply_sponge()
-    ! CPU set_nudgcof (use_boundary_sponge, not PACIFIC): linear ramp
-    ! over isp = sponge_size+1 points from every open edge (the CPU's
+    ! CPU set_nudgcof (use_boundary_sponge): a linear ramp, or with
+    ! sponge_profile = 'cosine' a cosine one, over isp = sponge_size+1
+    ! points from every open edge (the CPU's
     ! OBC_WEST/EAST/SOUTH/NORTH; here obc_*, set by init_bry).
     ! A closed edge gets no sponge.
     integer(ip), parameter :: sponge_size = 15_ip
     integer(ip) :: i, j, ig, jg, isp, ibnd, itrc, i_lo, i_hi, j_lo, j_hi
     real(rp), allocatable :: wrk(:,:)
+    real(rp), parameter :: pi_sp = 3.14159265358979323_rp   ! the CPU's pi (scalars.F90)
+    logical :: cosine
 
     ! The CPU adds both terms whatever the values (0 adds nothing): with
     ! v_sponge = 0 and v_sponge_trc > 0 the tracers alone get a sponge.
     if (case_v_sponge <= 0.0_rp .and. case_v_sponge_trc <= 0.0_rp) return
     isp = sponge_size + 1_ip
+    cosine = case_sponge_profile == 'cosine'
     i_lo = lbound(visc2_r, 1); i_hi = ubound(visc2_r, 1)
     j_lo = lbound(visc2_r, 2); j_hi = ubound(visc2_r, 2)
     allocate(wrk(i_lo:i_hi, j_lo:j_hi))
@@ -380,7 +405,11 @@ contains
         if (obc_east)  ibnd = min(ibnd, decomp%gnx + 1_ip - ig)
         if (obc_south) ibnd = min(ibnd, jg)
         if (obc_north) ibnd = min(ibnd, decomp%gny + 1_ip - jg)
-        wrk(i, j) = real(isp - ibnd, rp) / real(isp, rp)
+        if (cosine) then
+          wrk(i, j) = 0.5_rp + 0.5_rp * cos(pi_sp * real(ibnd, rp) / real(isp, rp))
+        else
+          wrk(i, j) = real(isp - ibnd, rp) / real(isp, rp)
+        endif
       enddo
     enddo
 
@@ -633,8 +662,9 @@ contains
     character(len=512) :: msg
     real(rp) :: rdrg, rdrg2, zob, visc2, akv_bak, rho0
     real(rp) :: akt_bak(nml_ntrc_max), tnu2(nml_ntrc_max)
-    namelist /bottom_drag_settings/ rdrg, rdrg2, zob
-    namelist /vertical_mixing_settings/ akv_bak, akt_bak
+    logical :: linear_drag, ana_vmix
+    namelist /bottom_drag_settings/ rdrg, rdrg2, zob, linear_drag
+    namelist /vertical_mixing_settings/ akv_bak, akt_bak, ana_vmix
     namelist /lateral_visc_settings/ visc2
     namelist /tracer_diff2/ tnu2
     namelist /rho0_settings/ rho0
@@ -642,10 +672,16 @@ contains
     visc2 = visc2_in; akv_bak = akv_bak_in
     akt_bak = 0.0_rp; akt_bak(1:2) = akt_bak_in
     tnu2 = 0.0_rp; rho0 = rho0_in
+    linear_drag = .false.; ana_vmix = .false.
     rewind(unit); read(unit, nml=bottom_drag_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'BOTTOM_DRAG_SETTINGS')
     rewind(unit); read(unit, nml=vertical_mixing_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'VERTICAL_MIXING_SETTINGS')
+    if (ana_vmix) then   ! UCLA ROMS: the case's ana_vmix.h
+      write(*,'(a)') 'ERROR: VERTICAL_MIXING_SETTINGS ana_vmix = .true.: analytical vertical mixing (ana_vmix.h)'// &
+                     ' is UCLA ROMS only'
+      error stop 'read_namelist: ana_vmix'
+    endif
     rewind(unit); read(unit, nml=lateral_visc_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'LATERAL_VISC_SETTINGS')
     rewind(unit); read(unit, nml=tracer_diff2, iostat=ios, iomsg=msg)
@@ -653,6 +689,7 @@ contains
     rewind(unit); read(unit, nml=rho0_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'RHO0_SETTINGS')
     zob_in = zob; rdrg_in = rdrg; rdrg2_in = rdrg2; visc2_in = visc2
+    linear_drag_on = linear_drag
     akv_bak_in = akv_bak; akt_bak_in = akt_bak(1:2)
     case_tnu2 = tnu2
     rho0_in = rho0
