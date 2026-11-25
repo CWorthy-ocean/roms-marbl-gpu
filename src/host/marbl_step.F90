@@ -31,6 +31,7 @@ module marbl_gpu
   private
 
   logical, public :: marbl_on = .false.
+  integer(ip), save :: marbl_nt_bgc = 0   ! param_settings nt_bgc, checked against MARBL's tracer count
   character(len=512), public :: marbl_config_file = 'marbl_in'
   real(rp), public :: marbl_timestep = 3600.0_rp
   integer(ip), public :: marbl_timestep_ratio = 1
@@ -79,8 +80,10 @@ module marbl_gpu
 contains
 
   subroutine read_marbl_namelist(unit, nml_dir, nt_bgc)
-    ! &marbl_biogeochemistry_settings as the CPU model; MARBL is on when
-    ! nt_bgc > 0 in param_settings.
+    ! &marbl_biogeochemistry_settings as the CPU model, read in every run;
+    ! use_marbl (default .false.; a missing group is .false.) alone switches
+    ! MARBL on. nt_bgc (param_settings) must be 0 without it and MARBL's
+    ! tracer count with it (checked in marbl_gpu_setup_tracers).
     integer, intent(in) :: unit
     character(len=*), intent(in) :: nml_dir
     integer(ip), intent(in) :: nt_bgc
@@ -90,10 +93,10 @@ contains
     logical :: exists
     character(len=32) :: marbl_tracers_to_write(64)
     character(len=400) :: marbl_diagnostics_to_write(64)
-    namelist /marbl_biogeochemistry_settings/ marbl_config_file, marbl_timestep, &
+    logical :: use_marbl
+    namelist /marbl_biogeochemistry_settings/ use_marbl, marbl_config_file, marbl_timestep, &
          marbl_tracers_to_write, marbl_diagnostics_to_write, use_constant_Fe, constant_Fe_value
-    marbl_on = (nt_bgc > 0)
-    if (.not. marbl_on) return
+    use_marbl = .false.
     marbl_config_file = 'marbl_in'
     marbl_timestep = 3600.0_rp
     marbl_tracers_to_write = ''
@@ -103,6 +106,16 @@ contains
     rewind(unit)
     read(unit, nml=marbl_biogeochemistry_settings, iostat=ios)
     if (ios > 0) error stop 'marbl_biogeochemistry_settings: read error'
+    marbl_on = use_marbl
+    marbl_nt_bgc = nt_bgc
+    if (.not. marbl_on) then
+      if (nt_bgc > 0) then
+        write(*,'(a,i0,a)') 'ERROR: PARAM_SETTINGS nt_bgc = ', nt_bgc, ' but MARBL_BIOGEOCHEMISTRY_SETTINGS'// &
+             ' use_marbl = .false.: set use_marbl = .true. to run MARBL, or nt_bgc = 0'
+        error stop 'read_marbl_namelist: nt_bgc without use_marbl'
+      endif
+      return
+    endif
     marbl_trc_list = marbl_tracers_to_write
     marbl_dia_list = marbl_diagnostics_to_write
     if (use_constant_Fe) then
@@ -133,6 +146,12 @@ contains
     integer(ip) :: m
     if (.not. marbl_on) return
     call marbl_host_init(decomp%nz, trim(marbl_config_file), .true.)
+    if (nt_marbl /= marbl_nt_bgc) then   ! as the CPU's marbl_driver
+      write(*,'(a,i0,a,i0,a,i0,a)') 'ERROR: PARAM_SETTINGS nt_bgc = ', marbl_nt_bgc, &
+           ' does not match the number of MARBL tracers, ', nt_marbl, ': set nt_bgc = ', nt_marbl, &
+           ' (use_marbl = .true.)'
+      error stop 'marbl_gpu_setup_tracers: nt_bgc /= MARBL tracers'
+    endif
     call set_passive_marbl(marbl_tracer_names)
     if (use_constant_Fe) then
       do m = 1, ntp

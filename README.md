@@ -138,7 +138,8 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
 - **Environment:** set `MPICH_GPU_SUPPORT_ENABLED=1` to use GPU-to-GPU halo
   exchange (CUDA-aware MPI required); leave it unset otherwise.
 - **Namelist:** the same groups and keys as UCLA ROMS, plus `np_xi` and
-  `np_eta` (GPU tiles), `nt_bgc` (32 with MARBL) and `nt_passive`. Paths are
+  `np_eta` (GPU tiles), `nt_bgc` (32 with MARBL) and `nt_passive`. MARBL runs
+  with `use_marbl = .true.` in `&marbl_biogeochemistry_settings`. Paths are
   relative to the namelist file. A group with a key the GPU model does not
   know stops the run at start-up, naming the group.
 - **Surface forcing:** bulk (COARE 3.0) when the forcing files hold
@@ -349,6 +350,10 @@ v0.1.2-beta, bit for bit.
   the depth mean of the viscous increment: the sponge did not damp
   `ubar`, `vbar` and `zeta`. Runs without lateral viscosity are unchanged
   bit for bit.
+- Namelist: `use_marbl` (`&marbl_biogeochemistry_settings`, default
+  `.false.`) switches MARBL on, as in UCLA ROMS after 0.16.0; before,
+  `nt_bgc > 0` did. `nt_bgc` must be 0 without it and MARBL's tracer count
+  with it, or the run stops. A MARBL case must add `use_marbl = .true.`.
 - Namelist: `salinity` and `mpi_masking` (`&param_settings`), as in UCLA
   ROMS after 0.16.0. `salinity = .false.` (a temperature-only run) stops
   the run; `mpi_masking` is read and ignored (it only sets how UCLA ROMS

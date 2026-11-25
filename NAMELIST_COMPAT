@@ -101,7 +101,7 @@
 # _bgc_dia_avg with their output_period_bgc_* and nrpf_bgc_* (default 0: the
 # run stops if the stream is on), as UCLA ROMS. Before, the MARBL tracers and
 # diagnostics were in _his and only wrt_bgc_avg was honoured. Without MARBL
-# (nt_bgc = 0) the switches do nothing, as on UCLA ROMS.
+# (use_marbl = .false.) the switches do nothing, as on UCLA ROMS.
 #
 # Surface forcing: &surf_frc_settings surf_frc_type, as UCLA ROMS after
 # 0.16.0 (there it replaces the cpp keys BULK_FRC and ANA_SMFLUX, ANA_STFLUX,
@@ -114,6 +114,14 @@
 # swrad (bulk) and swflux and swrad (flux) were 0 when missing. A flux-forced
 # case must set surf_frc_type = 'flux', and one without surface forcing
 # 'none'. The restoring switches need 'bulk'.
+#
+# MARBL on or off: &marbl_biogeochemistry_settings use_marbl (default .false.;
+# a missing group is .false.), as UCLA ROMS after 0.16.0 (there it goes with
+# the build option make MARBL=yes, which replaces the cpp key MARBL). The
+# group is read in every run, and use_marbl alone switches MARBL on; before,
+# nt_bgc > 0 did. nt_bgc (&param_settings) must be 0 without use_marbl and
+# MARBL's tracer count (32 with the default settings) with it; otherwise the
+# run stops. A MARBL case must add use_marbl = .true.
 #
 # Salinity and MPI masking, as UCLA ROMS after 0.16.0 (there they replace
 # the cpp keys SALINITY and MPI_MASKING): &param_settings salinity (default

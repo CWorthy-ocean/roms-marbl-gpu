@@ -106,7 +106,7 @@ contains
     on = .false.
     if (.not. do_upscale) return
     if (.not. marbl_on .and. ncdr == 0) error stop 'init_upscale_output: do_upscale needs MARBL tracers '// &
-         '(nt_bgc > 0) or CDR_LITE tracers (nt_cdr_oae or nt_cdr_dor > 0)'
+         '(use_marbl) or CDR_LITE tracers (nt_cdr_oae or nt_cdr_dor > 0)'
     if (nrpf_uscl < 1) error stop 'init_upscale_output: nrpf_uscl must be >= 1'
     nm = merge(2, 0, marbl_on)
     nsel = 2 * nm + int(ncdr)
