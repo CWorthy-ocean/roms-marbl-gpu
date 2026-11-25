@@ -48,7 +48,7 @@
 #     PR for the imex_igw key, branch imex-igw-key).
 #
 # GPU-only additions: the optional groups &tile_settings (tile balancing),
-# &periodic_settings (periodicity, below), &passive_tracers (n_passive,
+# &passive_tracers (n_passive,
 # init_mode), and in &param_settings the key n. Removed
 # after v0.1.3-beta (unused; a namelist that sets them now stops at the
 # read): &param_settings nsub_x, nsub_e and ntrc_bio (not UCLA ROMS keys),
@@ -128,21 +128,19 @@
 # A multi-tile 'wet' run without MARBL and without the key gets new tile
 # cuts; tile_land_weight = 0.10 keeps the old ones.
 #
-# Periodic grids: the optional GPU-only group &periodic_settings with the
-# logicals ew_periodic, ns_periodic (UCLA ROMS sets the same with its cpp
-# keys EW_PERIODIC and NS_PERIODIC, param.F90 ew_periodic / ns_periodic,
-# and ignores the group, so one namelist serves both models). Group
-# absent: the periodicity is inferred from the grid file's size as before
-# (LLm+2 x MMm+2 closed, LLm x MMm doubly periodic), and a start-up line
-# names it. Group present: it sets the periodicity (a key left out is
-# .false.; one direction may be periodic alone), and the grid file and
-# the initial or
-# restart file are each checked against it: a closed direction needs
-# LLm+2 (MMm+2) rho points; a periodic one takes UCLA ROMS's layout,
-# LLm+2 with the periodic copies as first and last points (only the
-# interior is read), or roms_gpu's LLm (MMm). Any other size stops the
-# run with the expected sizes. Output files keep roms_gpu's layout (no
-# boundary points in a periodic direction), which UCLA ROMS cannot read.
+# Periodic grids: the optional group &periodic_settings with the logicals
+# ew_periodic, ns_periodic (default .false.; one direction may be periodic
+# alone), as UCLA ROMS after 0.16.0; before, UCLA ROMS selected them with
+# its cpp keys EW_PERIODIC and NS_PERIODIC. The size of the grid file no
+# longer sets the periodicity: a grid file of LLm x MMm points (doubly
+# periodic, the GPU's layout) now needs both keys, and stops the run without
+# them. The grid file and the initial or restart file are each checked
+# against the keys: a closed direction needs LLm+2 (MMm+2) rho points; a
+# periodic one takes UCLA ROMS's layout, LLm+2 with the periodic copies as
+# first and last points (only the interior is read), or roms_gpu's LLm
+# (MMm). Any other size stops the run with the expected sizes. Output
+# files keep roms_gpu's layout (no boundary points in a periodic
+# direction), which UCLA ROMS cannot read.
 #
 # &rho0_settings rho0: read at run time and required, as in UCLA ROMS (a
 # namelist without the group stops the run). Up to v0.1.3-beta roms_gpu fixed
