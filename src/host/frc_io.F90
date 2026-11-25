@@ -151,6 +151,9 @@ module frc_io
   ! &surf_frc_settings check_bulk_frc_units: the units attributes of qair and
   ! rain are checked once, at the first bulk forcing step (bulk_units_check)
   logical :: check_bulk_frc_units = .false.
+  ! &surf_frc_settings surf_frc_type, as UCLA ROMS: 'bulk' (the default), 'flux' or 'none' (no
+  ! surface fluxes). It alone decides; the variables it needs must be in the forcing files.
+  character(len=8) :: surf_frc_type = 'bulk'
   real(rp), public :: dsssdt = 7.777_rp, dsstdt = 7.777_rp, dcdt = 7.777_rp
   real(rp)         :: dsssdt_ms = 0.0_rp, dsstdt_ms = 0.0_rp, dcdt_ms = 0.0_rp   ! piston velocities, m/s
   integer(ip)      :: ic_dic = 0, ic_dica = 0, ic_alk = 0, ic_alka = 0          ! CFLX_CORR passive indices
@@ -179,8 +182,8 @@ contains
     character(len=512) :: frcfiles(max_frc), frcfile(max_frc)
     logical :: interp_bulk_frc
     namelist /forcing_files/ frcfiles, frcfile
-    namelist /surf_frc_settings/ interp_flux_frc, interp_bulk_frc, check_bulk_frc_units, sflx_corr, &
-                                 qcorrection, cflx_corr
+    namelist /surf_frc_settings/ surf_frc_type, interp_flux_frc, interp_bulk_frc, check_bulk_frc_units, &
+                                 sflx_corr, qcorrection, cflx_corr
     namelist /sss_correction/ dsssdt
     namelist /sst_correction/ dsstdt
     namelist /dic_alk_correction/ dcdt
@@ -188,6 +191,7 @@ contains
     namelist /gamma2_settings/ gamma2
 
     frcfiles = ''; frcfile = ''
+    surf_frc_type = 'bulk'
     interp_bulk_frc = .false.; check_bulk_frc_units = .false.
     interp_flux_frc = .false.
     rewind(unit)
@@ -202,6 +206,12 @@ contains
       write(*,*) 'SURF_FRC_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
+    if (surf_frc_type /= 'bulk' .and. surf_frc_type /= 'flux' .and. surf_frc_type /= 'none') then
+      write(*,'(3a)') "SURF_FRC_SETTINGS: surf_frc_type = '", trim(surf_frc_type), "' is not a choice: use 'bulk', 'flux' or 'none'"
+      error stop 'read_forcing_namelist'
+    endif
+    if ((sflx_corr .or. qcorrection .or. cflx_corr) .and. surf_frc_type /= 'bulk') &
+      error stop "SURF_FRC_SETTINGS: sflx_corr, qcorrection and cflx_corr need surf_frc_type = 'bulk'"
     rewind(unit)
     read(unit, nml=sss_correction, iostat=ios, iomsg=msg)
     if (ios > 0) then
@@ -255,79 +265,93 @@ contains
     integer :: nmiss
     have_flux = .false.
     have_bulk = .false.
-    if (case_nfrc < 1) return
-    call prefetch_time_axes()
-    call bind_series(s_uwnd, 'uwnd', 'time', 'r')
-    call bind_series(s_vwnd, 'vwnd', 'time', 'r')
-    call bind_series(s_tair, 'Tair', 'time', 'r')
-    call bind_series(s_qair, 'qair', 'time', 'r')
-    call bind_series(s_prate, 'rain', 'time', 'r')
-    call bind_series(s_lwrad, 'lwrad', 'time', 'r')
-    call bind_series(s_bswrad, 'swrad', 'time', 'r')
-    have_bulk = s_uwnd%ready .and. s_vwnd%ready .and. s_tair%ready .and. s_qair%ready
-    if (have_bulk) then
-      if (.not. allocated(uwnd)) then
-        allocate(uwnd(decomp%is:decomp%ie, decomp%js:decomp%je))
-        allocate(vwnd(decomp%is:decomp%ie, decomp%js:decomp%je))
-        allocate(qair(decomp%is:decomp%ie, decomp%js:decomp%je))
-        allocate(prate(decomp%is:decomp%ie, decomp%js:decomp%je))
-        allocate(lwrad_in(decomp%is:decomp%ie, decomp%js:decomp%je))
-      endif
-      uwnd = 0.0_rp; vwnd = 0.0_rp; tair = 0.0_rp
-      qair = 0.0_rp; prate = 0.0_rp; lwrad_in = 0.0_rp
-      write(*,'(a,i0,a,2es14.6)') 'bulk/COARE forcing, Tair records = ', s_tair%ntot, &
-           '  days ', s_tair%times(1), s_tair%times(s_tair%ntot)
-      ! SFLX_CORR: sea-surface salinity restoring data (bulk forcing only)
-      if (.not. allocated(sss)) allocate(sss(decomp%is:decomp%ie, decomp%js:decomp%je))
-      sss = 0.0_rp
-      if (sflx_corr) then
-        call bind_series(s_sss, 'sss', 'sss_time', 'r')
-        if (.not. s_sss%ready) error stop 'sflx_corr: sss / sss_time not found in the forcing files'
-        write(*,'(a,f8.3,a,es12.4,a)') 'SSS restoring on: dSSSdt =', dsssdt, ' cm/day (', dsssdt_ms, ' m/s)'
-      endif
-      ! QCORRECTION: sea-surface temperature restoring data
-      if (.not. allocated(sst)) allocate(sst(decomp%is:decomp%ie, decomp%js:decomp%je))
-      sst = 0.0_rp
-      if (qcorrection) then
-        call bind_series(s_sst, 'sst', 'sst_time', 'r')
-        if (.not. s_sst%ready) error stop 'qcorrection: sst / sst_time not found in the forcing files'
-        write(*,'(a,f8.3,a,es12.4,a)') 'SST restoring on: dSSTdt =', dsstdt, ' cm/day (', dsstdt_ms, ' m/s)'
-      endif
-      ! CFLX_CORR: sea-surface DIC and ALK restoring data (the tracers: init_cflx_corr)
-      if (.not. allocated(sdic)) allocate(sdic(decomp%is:decomp%ie, decomp%js:decomp%je), &
-                                          salk(decomp%is:decomp%ie, decomp%js:decomp%je))
-      sdic = 0.0_rp; salk = 0.0_rp
-      if (cflx_corr) then
-        call bind_series(s_sdic, 'sDIC', 'sDIC_time', 'r')
-        call bind_series(s_salk, 'sALK', 'sALK_time', 'r')
-        if (.not. (s_sdic%ready .and. s_salk%ready)) &
-          error stop 'cflx_corr: sDIC / sDIC_time or sALK / sALK_time not found in the forcing files'
-        write(*,'(a,f8.3,a,es12.4,a)') 'DIC/ALK restoring on: dCdt =', dcdt, ' cm/day (', dcdt_ms, ' m/s)'
-      endif
+    write(*,'(3a)') "surface forcing: surf_frc_type = '", trim(surf_frc_type), "'"
+    if (surf_frc_type == 'none') then
       call warn_unused_restoring()
       return
     endif
-    if (sflx_corr) error stop 'sflx_corr needs bulk forcing (as roms_bugfix SFLX_CORR with BULK_FRC)'
-    if (qcorrection) error stop 'qcorrection needs bulk forcing (as roms_bugfix QCORRECTION with BULK_FRC)'
-    if (cflx_corr) error stop 'cflx_corr needs bulk forcing (as roms_bugfix CFLX_CORR with BULK_FRC)'
-    call warn_unused_restoring()
-    nmiss = 0
-    if (s_uwnd%ready .or. s_vwnd%ready .or. s_tair%ready .or. s_qair%ready) then
-      if (.not. s_uwnd%ready) nmiss = nmiss + 1
-      if (.not. s_vwnd%ready) nmiss = nmiss + 1
-      if (.not. s_tair%ready) nmiss = nmiss + 1
-      if (.not. s_qair%ready) nmiss = nmiss + 1
-      write(*,'(a,i0,a)') 'ERROR: incomplete bulk forcing (', nmiss, &
-           ' of uwnd/vwnd/Tair/qair missing); flux fallback is disabled'
-      error stop 'init_forcing: bulk is the default; will not use flux forcing'
+    if (case_nfrc < 1) then
+      write(*,'(3a)') "ERROR: surf_frc_type = '", trim(surf_frc_type), "' needs forcing files (&forcing_files)"
+      error stop 'init_forcing: no forcing files'
+    endif
+    call prefetch_time_axes()
+    if (surf_frc_type == 'bulk') then
+      call bind_series(s_uwnd, 'uwnd', 'time', 'r')
+      call bind_series(s_vwnd, 'vwnd', 'time', 'r')
+      call bind_series(s_tair, 'Tair', 'time', 'r')
+      call bind_series(s_qair, 'qair', 'time', 'r')
+      call bind_series(s_prate, 'rain', 'time', 'r')
+      call bind_series(s_lwrad, 'lwrad', 'time', 'r')
+      call bind_series(s_bswrad, 'swrad', 'time', 'r')
+      ! every bulk variable must be there, as on the CPU (set_bulk_frc)
+      nmiss = 0
+      call need(s_uwnd); call need(s_vwnd); call need(s_tair); call need(s_qair)
+      call need(s_prate); call need(s_lwrad); call need(s_bswrad)
+      if (nmiss > 0) error stop "init_forcing: surf_frc_type = 'bulk': variables missing (see above)"
+      have_bulk = .true.
+      if (have_bulk) then
+        if (.not. allocated(uwnd)) then
+          allocate(uwnd(decomp%is:decomp%ie, decomp%js:decomp%je))
+          allocate(vwnd(decomp%is:decomp%ie, decomp%js:decomp%je))
+          allocate(qair(decomp%is:decomp%ie, decomp%js:decomp%je))
+          allocate(prate(decomp%is:decomp%ie, decomp%js:decomp%je))
+          allocate(lwrad_in(decomp%is:decomp%ie, decomp%js:decomp%je))
+        endif
+        uwnd = 0.0_rp; vwnd = 0.0_rp; tair = 0.0_rp
+        qair = 0.0_rp; prate = 0.0_rp; lwrad_in = 0.0_rp
+        write(*,'(a,i0,a,2es14.6)') 'bulk/COARE forcing, Tair records = ', s_tair%ntot, &
+             '  days ', s_tair%times(1), s_tair%times(s_tair%ntot)
+        ! SFLX_CORR: sea-surface salinity restoring data (bulk forcing only)
+        if (.not. allocated(sss)) allocate(sss(decomp%is:decomp%ie, decomp%js:decomp%je))
+        sss = 0.0_rp
+        if (sflx_corr) then
+          call bind_series(s_sss, 'sss', 'sss_time', 'r')
+          if (.not. s_sss%ready) error stop 'sflx_corr: sss / sss_time not found in the forcing files'
+          write(*,'(a,f8.3,a,es12.4,a)') 'SSS restoring on: dSSSdt =', dsssdt, ' cm/day (', dsssdt_ms, ' m/s)'
+        endif
+        ! QCORRECTION: sea-surface temperature restoring data
+        if (.not. allocated(sst)) allocate(sst(decomp%is:decomp%ie, decomp%js:decomp%je))
+        sst = 0.0_rp
+        if (qcorrection) then
+          call bind_series(s_sst, 'sst', 'sst_time', 'r')
+          if (.not. s_sst%ready) error stop 'qcorrection: sst / sst_time not found in the forcing files'
+          write(*,'(a,f8.3,a,es12.4,a)') 'SST restoring on: dSSTdt =', dsstdt, ' cm/day (', dsstdt_ms, ' m/s)'
+        endif
+        ! CFLX_CORR: sea-surface DIC and ALK restoring data (the tracers: init_cflx_corr)
+        if (.not. allocated(sdic)) allocate(sdic(decomp%is:decomp%ie, decomp%js:decomp%je), &
+                                            salk(decomp%is:decomp%ie, decomp%js:decomp%je))
+        sdic = 0.0_rp; salk = 0.0_rp
+        if (cflx_corr) then
+          call bind_series(s_sdic, 'sDIC', 'sDIC_time', 'r')
+          call bind_series(s_salk, 'sALK', 'sALK_time', 'r')
+          if (.not. (s_sdic%ready .and. s_salk%ready)) &
+            error stop 'cflx_corr: sDIC / sDIC_time or sALK / sALK_time not found in the forcing files'
+          write(*,'(a,f8.3,a,es12.4,a)') 'DIC/ALK restoring on: dCdt =', dcdt, ' cm/day (', dcdt_ms, ' m/s)'
+        endif
+        call warn_unused_restoring()
+        return
+      endif
     endif
     call bind_series(s_sustr, 'sustr', 'sms_time', 'u')
     call bind_series(s_svstr, 'svstr', 'sms_time', 'v')
     call bind_series(s_shflx, 'shflux', 'shf_time', 'r')
     call bind_series(s_swflx, 'swflux', 'swf_time', 'r')
     call bind_series(s_swrad, 'swrad', 'srf_time', 'r')
-    have_flux = s_sustr%ready .and. s_svstr%ready .and. s_shflx%ready
-    if (have_flux) write(*,'(a,i0,a)') 'flux forcing (no bulk vars): ', case_nfrc, ' files'
+    ! every flux variable must be there, as on the CPU (set_flux_frc)
+    nmiss = 0
+    call need(s_sustr); call need(s_svstr); call need(s_shflx); call need(s_swflx); call need(s_swrad)
+    if (nmiss > 0) error stop "init_forcing: surf_frc_type = 'flux': variables missing (see above)"
+    have_flux = .true.
+    write(*,'(a,i0,a)') 'flux forcing: ', case_nfrc, ' files'
+
+  contains
+
+    subroutine need(s)
+      type(series2d), intent(in) :: s
+      if (s%ready) return
+      nmiss = nmiss + 1
+      write(*,'(3a)') "ERROR: surf_frc_type = '", trim(surf_frc_type), "': "//trim(s%vname)//" is in no forcing file"
+    end subroutine need
   end subroutine init_forcing
 
   subroutine bulk_units_check(s, units)
