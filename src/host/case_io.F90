@@ -99,15 +99,10 @@ module case_io
   logical :: case_have_prev = .false.
   logical,     public :: case_periodic_x = .false.
   logical,     public :: case_periodic_y = .false.
-  ! GPU-only group &periodic_settings (ew_periodic, ns_periodic) present:
-  ! the periodicity is the namelist's and every file's layout is checked
-  ! (set_file_layout); absent: inferred from the grid file size
-  ! (infer_layout), as before.
-  logical :: case_periodic_set = .false.
   ! Local index of the first u (v) point of a file window, relative to the
   ! window's first rho point i0 (j0): the file's u point 1 is the tile's
   ! u point i0 + 1 next to a boundary rho column (i0 = 0), and i0 itself in
-  ! a periodic direction, which has no boundary column (infer_layout).
+  ! a periodic direction, which has no boundary column (set_grid_layout).
   integer :: case_du = 1, case_dv = 1
   real(rp),    public :: case_v_sponge = 0.0_rp
   real(rp),    public :: case_v_sponge_trc = 0.0_rp   ! resolved: v_sponge when negative
@@ -177,7 +172,7 @@ contains
       write(*,*) 'PARAM_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_namelist'
     endif
-    call read_periodic_settings(unit)   ! optional GPU-only group
+    call read_periodic_settings(unit)
     call set_cdr_lite(nt_cdr_oae, nt_cdr_dor)
     case_nt_passive = max(nt_passive, 0_ip)
 
@@ -285,12 +280,9 @@ contains
   end subroutine read_namelist
 
   subroutine read_periodic_settings(unit)
-    ! Optional GPU-only group &periodic_settings: ew_periodic, ns_periodic,
-    ! UCLA ROMS's cpp keys EW_PERIODIC / NS_PERIODIC (param.F90). Present:
-    ! the periodicity is set here (a key left out is .false.) and each file's
-    ! layout is checked (set_file_layout). Absent: inferred from the grid
-    ! file size (infer_layout). UCLA ROMS does not read the group, so one
-    ! namelist serves both models.
+    ! Optional group &periodic_settings (ew_periodic, ns_periodic, default
+    ! .false.), as the CPU (open_boundary_mod.F90). Each file's layout is
+    ! checked against it (set_file_layout).
     integer, intent(in) :: unit
     integer :: ios
     character(len=512) :: msg
@@ -300,9 +292,8 @@ contains
     rewind(unit)
     read(unit, nml=periodic_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'PERIODIC_SETTINGS')
-    case_periodic_set = (ios == 0)
-    case_periodic_x = case_periodic_set .and. ew_periodic
-    case_periodic_y = case_periodic_set .and. ns_periodic
+    case_periodic_x = ew_periodic
+    case_periodic_y = ns_periodic
   end subroutine read_periodic_settings
 
   subroutine read_tile_settings(unit)
@@ -735,7 +726,7 @@ contains
     call nc_open_read(case_grdname, ncid)
     xi_rho = nc_dim_len(ncid, 'xi_rho')
     eta_rho = nc_dim_len(ncid, 'eta_rho')
-    call infer_layout(ncid, xi_rho, eta_rho, i0, j0, nxi, neta)
+    call set_grid_layout(ncid, i0, j0, nxi, neta)
     write(*,'(a,a)') 'grid file: ', trim(case_grdname)
     write(*,'(a,2i6,a,2i4)') '  xi_rho, eta_rho =', xi_rho, eta_rho, '  mapped i0,j0 =', i0, j0
 
@@ -807,7 +798,7 @@ contains
     call nc_open_read(case_inifile, ncid)
     write(*,'(a,a)') 'init file: ', trim(case_inifile)
     ! the initial or restart file may have the other periodic layout
-    if (case_periodic_set) call set_file_layout(ncid, 'initial', case_inifile)
+    call set_file_layout(ncid, 'initial', case_inifile)
     ! tile extents of the staggered fields (the file dims are global)
     xi_u = merge(nxi, nxi - 1, case_periodic_x)
     eta_v = merge(neta, neta - 1, case_periodic_y)
@@ -1298,64 +1289,23 @@ contains
     rvfrc_bak(:, :, tindx) = rvfrc_bak(:, :, tindx) * vmask
   end subroutine load_rufrc_slot
 
-  subroutine infer_layout(ncid, xi_rho, eta_rho, i0, j0, nxi, neta)
+  subroutine set_grid_layout(ncid, i0, j0, nxi, neta)
     ! The window of the grid file each tile reads (i0, j0: local start of the
-    ! rho window; nxi, neta: its size) and the periodicity.
-    ! Without &periodic_settings (ew_periodic, ns_periodic): inferred from
-    ! the file size, LLm+2 x MMm+2 = closed, LLm x MMm = doubly periodic.
-    ! Otherwise the namelist's, with the file's layout checked
-    ! (set_file_layout).
-    integer, intent(in)  :: ncid, xi_rho, eta_rho
+    ! rho window; nxi, neta: its size), with the file's layout checked
+    ! (set_file_layout). decomp was made with the namelist's periodicity
+    ! (apply_decomp).
+    integer, intent(in)  :: ncid
     integer, intent(out) :: i0, j0, nxi, neta
-    if (case_periodic_set) then
-      ! decomp was made with the namelist's periodicity (apply_decomp)
-      i0 = merge(1, 0, case_periodic_x); j0 = merge(1, 0, case_periodic_y)
-      case_du = merge(0, 1, case_periodic_x); case_dv = merge(0, 1, case_periodic_y)
-      nxi = int(decomp%nx) + merge(0, 2, case_periodic_x)
-      neta = int(decomp%ny) + merge(0, 2, case_periodic_y)
-      call set_file_layout(ncid, 'grid', case_grdname)
-      return
-    endif
-    nxi = xi_rho
-    neta = eta_rho
-    if (xi_rho == case_llm + 2 .and. eta_rho == case_mmm + 2) then
-      i0 = 0; j0 = 0
-      case_periodic_x = .false.
-      case_periodic_y = .false.
-      case_du = 1; case_dv = 1
-      nxi = int(decomp%nx) + 2; neta = int(decomp%ny) + 2   ! this tile's window of the global grid
-    elseif (xi_rho == case_llm .and. eta_rho == case_mmm) then
-      i0 = 1; j0 = 1
-      case_periodic_x = .true.
-      case_periodic_y = .true.
-      case_du = 0; case_dv = 0
-      nxi = int(decomp%nx); neta = int(decomp%ny)
-    else
-      write(*,*) 'grid dims', xi_rho, eta_rho, 'do not match LLm,MMm', case_llm, case_mmm
-      error stop 'infer_layout'
-    endif
-    if (comm_rank() == 0) then
-      if (case_periodic_x) then
-        write(*,'(a,2(i0,a))') 'grid layout inferred from the grid file size (', xi_rho, ' x ', eta_rho, &
-             '): doubly periodic (LLm x MMm)'
-      else
-        write(*,'(a,2(i0,a))') 'grid layout inferred from the grid file size (', xi_rho, ' x ', eta_rho, &
-             '): closed (LLm+2 x MMm+2)'
-      endif
-      write(*,'(a)') '  (ew_periodic / ns_periodic in &periodic_settings state the periodicity instead)'
-    endif
-    ! decomp already created as non-periodic default; re-init if periodic.
-    if (case_periodic_x .or. case_periodic_y) then
-      call free_state()
-      call apply_decomp(case_periodic_x, case_periodic_y)
-      call alloc_state(nt)
-      nxi = int(decomp%nx); neta = int(decomp%ny)
-    endif
-  end subroutine infer_layout
+    i0 = merge(1, 0, case_periodic_x); j0 = merge(1, 0, case_periodic_y)
+    case_du = merge(0, 1, case_periodic_x); case_dv = merge(0, 1, case_periodic_y)
+    nxi = int(decomp%nx) + merge(0, 2, case_periodic_x)
+    neta = int(decomp%ny) + merge(0, 2, case_periodic_y)
+    call set_file_layout(ncid, 'grid', case_grdname)
+  end subroutine set_grid_layout
 
   subroutine set_file_layout(ncid, what, path)
-    ! With &periodic_settings present: the file start of this tile's
-    ! window in a grid, initial or restart file. A closed direction needs
+    ! The file start of this tile's window in a grid, initial or restart
+    ! file. A closed direction needs
     ! LLm+2 (MMm+2) rho points. A periodic direction takes either layout,
     ! each file on its own: roms_gpu's LLm (MMm), no boundary points, or UCLA
     ! ROMS's LLm+2 (MMm+2), whose first and last points are periodic copies

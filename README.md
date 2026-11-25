@@ -746,17 +746,14 @@ v0.1.2-beta, bit for bit.
 - Periodic grids can be set in the namelist: the new optional group
   `&periodic_settings` with `ew_periodic` and `ns_periodic`, UCLA ROMS's
   `EW_PERIODIC` and `NS_PERIODIC` (a key left out is `.false.`; one
-  direction may be periodic alone). UCLA ROMS ignores the group, so one
-  namelist serves both models. With the group, the grid, initial and
+  direction may be periodic alone). The grid, initial and
   restart files may each use UCLA ROMS's layout (LLm+2 x MMm+2 whatever the
   periodicity; the interior is read) or roms_gpu's (no boundary points in a periodic direction), and
   a file that fits neither stops the run with the sizes expected. Forcing
   fields on a periodic grid are checked per direction and also accept
   roms_gpu's periodic u (v) faces (LLm, MMm). Before, the GPU model only
   inferred the periodicity from the grid file's size, so a UCLA ROMS
-  periodic grid ran as a closed basin without a message. Without the group
-  the run is unchanged, bit for bit, and a start-up line names the layout
-  inferred. Output keeps roms_gpu's layout. Also fixed: `tile_balance =
+  periodic grid ran as a closed basin without a message. Output keeps roms_gpu's layout. Also fixed: `tile_balance =
   'wet'` (the default) stopped the run on a roms_gpu-layout periodic grid
   file with `mask_rho`.
 - Surface forcing on a periodic grid: after each record the forcing
@@ -1011,6 +1008,10 @@ v0.1.2-beta, bit for bit.
   the depth mean of the viscous increment: the sponge did not damp
   `ubar`, `vbar` and `zeta`. Runs without lateral viscosity are unchanged
   bit for bit.
+- Namelist: `&periodic_settings` (`ew_periodic`, `ns_periodic`, default
+  `.false.`) sets the periodic directions, as in UCLA ROMS after 0.16.0.
+  The size of the grid file no longer does: a grid file of LLm x MMm points
+  (doubly periodic) needs both keys, and stops the run without them.
 - Namelist: `&open_boundary_settings` (`obc_west`, `obc_east`, `obc_south`,
   `obc_north`, default `.true.`) sets the open sides, as in UCLA ROMS after
   0.16.0. Before, the sides with `zeta` or barotropic velocity data in the
