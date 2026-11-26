@@ -16,6 +16,10 @@
     nt_bgc = 32
 /
 
+&numerics_settings
+  upstream_ts_land_curv = .true.
+/
+
 &grid_settings
     grdname = 'input_data/PACMED12km_v2ni_grid.nc'
 /
