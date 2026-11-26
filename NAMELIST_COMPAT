@@ -115,6 +115,15 @@
 # case must set surf_frc_type = 'flux', and one without surface forcing
 # 'none'. The restoring switches need 'bulk'.
 #
+# File layout: &pio_settings parallel_io (default .true.), as UCLA ROMS after
+# 0.16.0 (there it goes with the build option make PIO=yes, which replaces
+# the cpp key PARALLEL_IO). .true. means joined files, the only layout the
+# GPU reads and writes; .false. (UCLA ROMS's per-rank files, its default
+# build) stops the run. The group is read in every run; pio_stride and
+# pio_direct_read (UCLA ROMS's PIO tuning) are read and ignored. UCLA ROMS's
+# template sets parallel_io = .false., so a namelist made from it must set
+# .true. (or drop the key) to run on the GPU.
+#
 # MARBL on or off: &marbl_biogeochemistry_settings use_marbl (default .false.;
 # a missing group is .false.), as UCLA ROMS after 0.16.0 (there it goes with
 # the build option make MARBL=yes, which replaces the cpp key MARBL). The
