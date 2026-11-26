@@ -350,6 +350,10 @@ v0.1.2-beta, bit for bit.
   the depth mean of the viscous increment: the sponge did not damp
   `ubar`, `vbar` and `zeta`. Runs without lateral viscosity are unchanged
   bit for bit.
+- Namelist: `parallel_io` (`&pio_settings`, default `.true.`), as in UCLA
+  ROMS after 0.16.0: the GPU reads and writes joined files only, so
+  `parallel_io = .false.` (UCLA ROMS's per-rank files) stops the run.
+  `pio_stride` and `pio_direct_read` are read and ignored.
 - Namelist: `use_marbl` (`&marbl_biogeochemistry_settings`, default
   `.false.`) switches MARBL on, as in UCLA ROMS after 0.16.0; before,
   `nt_bgc > 0` did. `nt_bgc` must be 0 without it and MARBL's tracer count

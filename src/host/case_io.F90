@@ -126,6 +126,13 @@ contains
     character(len=512) :: grdname, inifile, ininame, title, output_root_name
 
     logical :: salinity, mpi_masking
+    ! &pio_settings (UCLA ROMS): parallel_io says the files are joined, the
+    ! only layout the GPU reads and writes; pio_stride and pio_direct_read
+    ! tune UCLA ROMS's PIO and are read and ignored
+    logical :: parallel_io
+    integer :: pio_stride
+    character(len=16) :: pio_direct_read
+    namelist /pio_settings/ parallel_io, pio_stride, pio_direct_read
     namelist /param_settings/ np_xi, np_eta, llm, mmm, nz, n, &
                               nt_passive, nt_bgc, nt_cdr_oae, nt_cdr_dor, salinity, mpi_masking
     logical :: ana_grid, ana_initial
@@ -175,6 +182,14 @@ contains
     endif
     ! mpi_masking (UCLA ROMS: drop all-land tiles and choose its tiling) is
     ! read and ignored: it only sets how UCLA ROMS splits the domain
+    parallel_io = .true.; pio_stride = 1; pio_direct_read = 'on'
+    rewind(unit); read(unit, nml=pio_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'PIO_SETTINGS')
+    if (.not. parallel_io) then   ! UCLA ROMS: per-rank files (a build without make PIO=yes)
+      write(*,'(a)') 'ERROR: PIO_SETTINGS parallel_io = .false.: per-rank (partitioned) files are UCLA ROMS only;'// &
+                     ' the GPU reads and writes joined files (parallel_io = .true., the default)'
+      error stop 'read_namelist: parallel_io'
+    endif
     call read_periodic_settings(unit)
     call set_cdr_lite(nt_cdr_oae, nt_cdr_dor)
     case_nt_passive = max(nt_passive, 0_ip)
