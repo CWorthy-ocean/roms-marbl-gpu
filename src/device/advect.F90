@@ -1,5 +1,6 @@
 module advect
-  ! Horizontal UP3 (UPSTREAM_TS + LAND_CURV, wet-only face T) and
+  ! Horizontal UP3 (UPSTREAM_TS; land curvature with upstream_ts_land_curv,
+  ! wet-only face T) and
   ! thickness-aware vertical C4 (predictor) / U3 (corrector). Fluxes
   ! only; LF-AM3 and Hz(n+1) updates stay in pre_step3d / step3d_t.
   use kinds
@@ -37,13 +38,15 @@ contains
   end subroutine tracer_advect_fluxes
 
   subroutine horiz_up3_fluxes(tidx, itrc)
-    ! UPSTREAM_TS + LAND_CURV, fused per direction so curvature cannot
+    ! UPSTREAM_TS (land curvature dropped with upstream_ts_land_curv),
+    ! fused per direction so curvature cannot
     ! race the flux store through 2-D work arrays. Land T=0 is kept out
     ! of the centered face value; finished wrk3a/wrk3b are zero on land faces.
     integer(ip), intent(in) :: tidx, itrc
     integer(ip) :: i, j, k, nx, ny, nz, t_slot, itr
     integer(ip) :: west, east, south, north
     real(rp) :: d_l, d_c, d_r, curv_l, curv_r, t_l, t_c, face_t, uflux
+    logical :: lc
 
     nx = decomp%nx
     ny = decomp%ny
@@ -51,6 +54,7 @@ contains
     call ensure_wrk3()
     t_slot = tidx
     itr = itrc
+    lc = land_curv_on   ! by value into the kernels
     ! edge codes: 0 interior, 1 physical edge (wall), 2 open-boundary edge,
     ! whose faces get the inflow term (open_edge_codes)
     call open_edge_codes(west, east, south, north)
@@ -83,8 +87,10 @@ contains
           else
             d_r = apply_mask(t(i + 1, j, k, t_slot, itr) - t_c, umask(i + 1, j))
           endif
-          curv_l = (d_c - d_l) * umask(i - 1, j) * umask(i, j)
-          curv_r = (d_r - d_c) * umask(i, j) * umask(i + 1, j)
+          curv_l = (d_c - d_l)
+          if (lc) curv_l = curv_l * umask(i - 1, j) * umask(i, j)
+          curv_r = (d_r - d_c)
+          if (lc) curv_r = curv_r * umask(i, j) * umask(i + 1, j)
           if (rmask(i - 1, j) > 0.5_rp .and. rmask(i, j) > 0.5_rp) then
             face_t = 0.5_rp * (t_l + t_c)
           elseif (rmask(i - 1, j) > 0.5_rp) then
@@ -125,8 +131,10 @@ contains
           else
             d_r = apply_mask(t(i, j + 1, k, t_slot, itr) - t_c, vmask(i, j + 1))
           endif
-          curv_l = (d_c - d_l) * vmask(i, j - 1) * vmask(i, j)
-          curv_r = (d_r - d_c) * vmask(i, j) * vmask(i, j + 1)
+          curv_l = (d_c - d_l)
+          if (lc) curv_l = curv_l * vmask(i, j - 1) * vmask(i, j)
+          curv_r = (d_r - d_c)
+          if (lc) curv_r = curv_r * vmask(i, j) * vmask(i, j + 1)
           if (rmask(i, j - 1) > 0.5_rp .and. rmask(i, j) > 0.5_rp) then
             face_t = 0.5_rp * (t_l + t_c)
           elseif (rmask(i, j - 1) > 0.5_rp) then
@@ -469,8 +477,9 @@ contains
 #ifdef USE_CUDA
   attributes(device) &
 #endif
-  function up3_fx(i, j, k, ts, itr, west, east, nx) result(fx)
+  function up3_fx(i, j, k, ts, itr, west, east, nx, lc) result(fx)
     integer(ip), value :: i, j, k, ts, itr, west, east, nx
+    logical, value :: lc   ! upstream_ts_land_curv
     real(rp) :: fx, d_l, d_c, d_r, curv_l, curv_r, t_l, t_c, face_t, uflux
     t_c = t(i, j, k, ts, itr)
     t_l = t(i - 1, j, k, ts, itr)
@@ -485,8 +494,10 @@ contains
     else
       d_r = apply_mask(t(i + 1, j, k, ts, itr) - t_c, umask(i + 1, j))
     endif
-    curv_l = (d_c - d_l) * umask(i - 1, j) * umask(i, j)
-    curv_r = (d_r - d_c) * umask(i, j) * umask(i + 1, j)
+    curv_l = (d_c - d_l)
+    if (lc) curv_l = curv_l * umask(i - 1, j) * umask(i, j)
+    curv_r = (d_r - d_c)
+    if (lc) curv_r = curv_r * umask(i, j) * umask(i + 1, j)
     if (rmask(i - 1, j) > 0.5_rp .and. rmask(i, j) > 0.5_rp) then
       face_t = 0.5_rp * (t_l + t_c)
     elseif (rmask(i - 1, j) > 0.5_rp) then
@@ -509,8 +520,9 @@ contains
 #ifdef USE_CUDA
   attributes(device) &
 #endif
-  function up3_fe(i, j, k, ts, itr, south, north, ny) result(fe)
+  function up3_fe(i, j, k, ts, itr, south, north, ny, lc) result(fe)
     integer(ip), value :: i, j, k, ts, itr, south, north, ny
+    logical, value :: lc   ! upstream_ts_land_curv
     real(rp) :: fe, d_l, d_c, d_r, curv_l, curv_r, t_l, t_c, face_t, uflux
     t_c = t(i, j, k, ts, itr)
     t_l = t(i, j - 1, k, ts, itr)
@@ -525,8 +537,10 @@ contains
     else
       d_r = apply_mask(t(i, j + 1, k, ts, itr) - t_c, vmask(i, j + 1))
     endif
-    curv_l = (d_c - d_l) * vmask(i, j - 1) * vmask(i, j)
-    curv_r = (d_r - d_c) * vmask(i, j) * vmask(i, j + 1)
+    curv_l = (d_c - d_l)
+    if (lc) curv_l = curv_l * vmask(i, j - 1) * vmask(i, j)
+    curv_r = (d_r - d_c)
+    if (lc) curv_r = curv_r * vmask(i, j) * vmask(i, j + 1)
     if (rmask(i, j - 1) > 0.5_rp .and. rmask(i, j) > 0.5_rp) then
       face_t = 0.5_rp * (t_l + t_c)
     elseif (rmask(i, j - 1) > 0.5_rp) then
@@ -751,10 +765,11 @@ contains
     integer(ip) :: i, j, k, itr, nx, ny, nz, ntr, ts, nn, lim, jpr, njp
     integer(ip) :: west, east, south, north
     real(rp) :: dtl, dtpp, dtpp1, fe_lo, fe_mid
-    logical :: two, act0, act1
+    logical :: two, act0, act1, lc
 
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = nt
     ts = tidx; nn = n_new; dtl = dt_in
+    lc = land_curv_on   ! upstream_ts_land_curv, by value into the kernel
     ! edge codes: 0 interior, 1 physical edge (wall), 2 open-boundary edge,
     ! whose faces get the inflow term (open_edge_codes)
     call open_edge_codes(west, east, south, north)
@@ -780,20 +795,20 @@ contains
           dtpp = dtl * pm(i, j) * pn(i, j)
           if (act1) dtpp1 = dtl * pm(i, j + 1) * pn(i, j + 1)
           do itr = 1, ntr
-            fe_lo = up3_fe(i, j, k, ts, itr, south, north, ny)
-            fe_mid = up3_fe(i, j + 1, k, ts, itr, south, north, ny)
+            fe_lo = up3_fe(i, j, k, ts, itr, south, north, ny, lc)
+            fe_mid = up3_fe(i, j + 1, k, ts, itr, south, north, ny, lc)
             if (act0) then
               t(i, j, k, nn, itr) = t(i, j, k, nn, itr) - dtpp * &
-                   (up3_fx(i + 1, j, k, ts, itr, west, east, nx) - &
-                    up3_fx(i, j, k, ts, itr, west, east, nx) + &
+                   (up3_fx(i + 1, j, k, ts, itr, west, east, nx, lc) - &
+                    up3_fx(i, j, k, ts, itr, west, east, nx, lc) + &
                     fe_mid - &
                     fe_lo)
             endif
             if (act1) then
               t(i, j + 1, k, nn, itr) = t(i, j + 1, k, nn, itr) - dtpp1 * &
-                   (up3_fx(i + 1, j + 1, k, ts, itr, west, east, nx) - &
-                    up3_fx(i, j + 1, k, ts, itr, west, east, nx) + &
-                    up3_fe(i, j + 2, k, ts, itr, south, north, ny) - &
+                   (up3_fx(i + 1, j + 1, k, ts, itr, west, east, nx, lc) - &
+                    up3_fx(i, j + 1, k, ts, itr, west, east, nx, lc) + &
+                    up3_fe(i, j + 2, k, ts, itr, south, north, ny, lc) - &
                     fe_mid)
             endif
           enddo

@@ -132,6 +132,14 @@
 # MARBL's tracer count (32 with the default settings) with it; otherwise the
 # run stops. A MARBL case must add use_marbl = .true.
 #
+# Numerics: the optional group &numerics_settings, as UCLA ROMS after 0.16.0
+# (there it replaces the cpp keys UPSTREAM_TS_LAND_CURV, ADV_ISONEUTRAL and
+# PARABOLIC_SPLINES; all default .false.). upstream_ts_land_curv drops the
+# curvature term of the horizontal UP3 tracer flux at faces whose stencil
+# touches land; before, the GPU always did, so a case that should keep its
+# results must set upstream_ts_land_curv = .true. adv_isoneutral and
+# parabolic_splines = .true. stop the run (UCLA ROMS only).
+#
 # Salinity and MPI masking, as UCLA ROMS after 0.16.0 (there they replace
 # the cpp keys SALINITY and MPI_MASKING): &param_settings salinity (default
 # .true.) is read, and .false. (a temperature-only run) stops: the GPU always
