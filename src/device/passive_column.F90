@@ -356,12 +356,13 @@ contains
   DEVICE_ATTR
   subroutine up3_col(itr, ci, i, j, k0, k1, dtp, ntr, nx, ny, is, ie, js, je, nz, &
                      west, east, south, north, tps, tpn, nbt_, ncl, nwet, pm_, pn_, FlxU_, FlxV_, &
-                     umask_, vmask_, rmask_)
+                     umask_, vmask_, rmask_, lc)
     ! Corrector at levels k0:k1: UP3 faces from tps (slot ts) applied to tpn
     ! (slot nn). The 3-D arrays are addressed through flat 64-bit offsets
-    ! (column part once, one stride per level).
+    ! (column part once, one stride per level). lc: upstream_ts_land_curv.
     integer(ip), intent(in) :: itr, ci, i, j, k0, k1, ntr, nx, ny, is, ie, js, je, nz
     integer(ip), intent(in) :: west, east, south, north
+    logical, intent(in) :: lc
     real(rp), intent(in) :: dtp
     integer(ip), intent(in) :: ncl, nwet, nbt_(8, nwet)
     real(pp), intent(in) :: tps(*)
@@ -381,6 +382,10 @@ contains
     vm0 = vmask_(i, j - 1); vm1 = vmask_(i, j); vm2 = vmask_(i, j + 1); vm3 = vmask_(i, j + 2)
     bu0 = um0 > 0.5_rp; bu1 = um1 > 0.5_rp; bu2 = um2 > 0.5_rp; bu3 = um3 > 0.5_rp
     bv0 = vm0 > 0.5_rp; bv1 = vm1 > 0.5_rp; bv2 = vm2 > 0.5_rp; bv3 = vm3 > 0.5_rp
+    if (.not. lc) then   ! um*, vm* only scale the curvature terms of up3_div from here
+      um0 = 1.0_rp; um1 = 1.0_rp; um2 = 1.0_rp; um3 = 1.0_rp
+      vm0 = 1.0_rp; vm1 = 1.0_rp; vm2 = 1.0_rp; vm3 = 1.0_rp
+    endif
     brw = rmask_(i - 1, j) > 0.5_rp; brc = rmask_(i, j) > 0.5_rp; bre = rmask_(i + 1, j) > 0.5_rp
     brs = rmask_(i, j - 1) > 0.5_rp; brn = rmask_(i, j + 1) > 0.5_rp
     wedge = (west >= 1 .and. i == 1)
@@ -667,9 +672,10 @@ contains
 
   attributes(global) launch_bounds(128, 5) subroutine up3_kernel(nwet, nlev, wet_i, wet_j, dtp, ntr, nx, ny, nz, is, ie, js, je, &
                                            west, east, south, north, tps, tpn, nbt_, ncl, &
-                                           pm_, pn_, FlxU_, FlxV_, umask_, vmask_, rmask_)
+                                           pm_, pn_, FlxU_, FlxV_, umask_, vmask_, rmask_, lc)
     integer(ip), value :: nwet, nlev, ntr, nx, ny, nz, is, ie, js, je, west, east, south, north, ncl
     real(rp), value :: dtp
+    logical, value :: lc
     integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
     integer(ip), device, intent(in) :: nbt_(8, nwet)
     real(pp), device, intent(in) :: tps(ntr, 0:ncl, nz)
@@ -685,7 +691,7 @@ contains
     i = wet_i(cc); j = wet_j(cc)
     call up3_col(itr, cc, i, j, k0, k1, dtp, ntr, nx, ny, is, ie, js, je, nz, &
                  west, east, south, north, tps, tpn, nbt_, ncl, nwet, pm_, pn_, FlxU_, FlxV_, &
-                 umask_, vmask_, rmask_)
+                 umask_, vmask_, rmask_, lc)
   end subroutine up3_kernel
 
   attributes(global) launch_bounds(128, 10) subroutine t3dmix_kernel(nel, nwet, nmx, mixc_, wet_i, wet_j, nr, nn, dtl, ntr, nx, ny, nz, is, ie, js, je, nslot, &
@@ -770,7 +776,7 @@ contains
     else
       call up3_kernel<<<grid, block>>>(nwet, HLEV, wet_i, wet_j, dtp, ntr, nx, ny, nz, is, ie, js, je, &
            west, east, south, north, tp(1, 0, 1, ts), tp(1, 0, 1, nn), &
-           tpnb, ntpcol, pm, pn, FlxU, FlxV, umask, vmask, rmask)
+           tpnb, ntpcol, pm, pn, FlxU, FlxV, umask, vmask, rmask, land_curv_on)
     endif
 #else
     do c = 1, nwet; do itr = 1, ntr
@@ -781,7 +787,7 @@ contains
       else
         call up3_col(itr, c, wet_i(c), wet_j(c), 1_ip, nz, dtp, ntr, nx, ny, is, ie, js, je, nz, &
                      west, east, south, north, tp(1, 0, 1, ts), tp(1, 0, 1, nn), &
-                     tpnb, ntpcol, nwet, pm, pn, FlxU, FlxV, umask, vmask, rmask)
+                     tpnb, ntpcol, nwet, pm, pn, FlxU, FlxV, umask, vmask, rmask, land_curv_on)
       endif
     enddo; enddo
 #endif

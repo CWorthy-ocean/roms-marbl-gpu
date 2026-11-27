@@ -181,8 +181,9 @@ contains
     integer :: i, j, k, q, nx, ny, nz, ns, nr
     integer(ip) :: itr, c0, cm, cp
     real(rp) :: t0, xm, xp, fu, m0, m1, m2, m3, dc, dl, dr, de, ft, f, fm, bg
-    logical :: b1, b2, bo, bc
+    logical :: b1, b2, bo, bc, lc
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ns = nsel; nr = nrhs
+    lc = land_curv_on   ! by value into the kernels
     if (decomp%edge_w .and. obc_west) then
 #ifdef USE_CUDA
       !$cuf kernel do(3) <<<*, *, 0, work_stream>>>
@@ -196,6 +197,9 @@ contains
             fu = FlxU(1, j, k)
             m0 = umask(0, j); m1 = umask(1, j); m2 = umask(2, j)
             b1 = m1 > 0.5_rp; b2 = m2 > 0.5_rp
+            if (.not. lc) then   ! upstream_ts_land_curv off: no land factor on the curvature
+              m0 = 1.0_rp; m1 = 1.0_rp; m2 = 1.0_rp
+            endif
             bo = rmask(0, j) > 0.5_rp; bc = rmask(1, j) > 0.5_rp
             dc = 0.0_rp
             if (b1) dc = t0 - xm
@@ -236,6 +240,9 @@ contains
             fu = FlxU(nx + 1, j, k)
             m1 = umask(nx, j); m2 = umask(nx + 1, j); m3 = umask(nx + 2, j)
             b1 = m1 > 0.5_rp; b2 = m2 > 0.5_rp
+            if (.not. lc) then   ! upstream_ts_land_curv off: no land factor on the curvature
+              m1 = 1.0_rp; m2 = 1.0_rp; m3 = 1.0_rp
+            endif
             bc = rmask(nx, j) > 0.5_rp; bo = rmask(nx + 1, j) > 0.5_rp
             dc = 0.0_rp
             if (b1) dc = t0 - xm
@@ -276,6 +283,9 @@ contains
             fu = FlxV(i, 1, k)
             m0 = vmask(i, 0); m1 = vmask(i, 1); m2 = vmask(i, 2)
             b1 = m1 > 0.5_rp; b2 = m2 > 0.5_rp
+            if (.not. lc) then   ! upstream_ts_land_curv off: no land factor on the curvature
+              m0 = 1.0_rp; m1 = 1.0_rp; m2 = 1.0_rp
+            endif
             bo = rmask(i, 0) > 0.5_rp; bc = rmask(i, 1) > 0.5_rp
             dc = 0.0_rp
             if (b1) dc = t0 - xm
@@ -316,6 +326,9 @@ contains
             fu = FlxV(i, ny + 1, k)
             m1 = vmask(i, ny); m2 = vmask(i, ny + 1); m3 = vmask(i, ny + 2)
             b1 = m1 > 0.5_rp; b2 = m2 > 0.5_rp
+            if (.not. lc) then   ! upstream_ts_land_curv off: no land factor on the curvature
+              m1 = 1.0_rp; m2 = 1.0_rp; m3 = 1.0_rp
+            endif
             bc = rmask(i, ny) > 0.5_rp; bo = rmask(i, ny + 1) > 0.5_rp
             dc = 0.0_rp
             if (b1) dc = t0 - xm
