@@ -138,7 +138,11 @@
 # curvature term of the horizontal UP3 tracer flux at faces whose stencil
 # touches land; before, the GPU always did, so a case that should keep its
 # results must set upstream_ts_land_curv = .true. adv_isoneutral and
-# parabolic_splines = .true. stop the run (UCLA ROMS only).
+# parabolic_splines = .true. stop the run (UCLA ROMS only). eos (UCLA ROMS
+# after 0.16.0; there it replaces the cpp keys NONLIN_EOS and SPLIT_EOS):
+# 'nonlinear' (the default) is the GPU's split nonlinear equation of state;
+# 'linear' (UCLA ROMS only, with &lin_rho_eos_settings) and any other value
+# stop the run.
 #
 # Salinity and MPI masking, as UCLA ROMS after 0.16.0 (there they replace
 # the cpp keys SALINITY and MPI_MASKING): &param_settings salinity (default

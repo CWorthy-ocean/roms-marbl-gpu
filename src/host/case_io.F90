@@ -337,17 +337,20 @@ contains
   end subroutine read_periodic_settings
 
   subroutine read_numerics_settings(unit)
-    ! Optional group &numerics_settings, as the CPU (UCLA ROMS step 10a; all
-    ! defaults .false.). upstream_ts_land_curv drops the third-order
-    ! curvature of the horizontal UP3 tracer flux at faces whose stencil
-    ! touches land. adv_isoneutral and parabolic_splines are UCLA ROMS only
-    ! and stop the run.
+    ! Optional group &numerics_settings, as the CPU (UCLA ROMS steps 10a and
+    ! 10b; logical defaults .false., eos 'nonlinear'). upstream_ts_land_curv
+    ! drops the third-order curvature of the horizontal UP3 tracer flux at
+    ! faces whose stencil touches land. adv_isoneutral, parabolic_splines and
+    ! eos = 'linear' are UCLA ROMS only and stop the run; the GPU has the
+    ! split nonlinear equation of state (UCLA ROMS's eos = 'nonlinear').
     integer, intent(in) :: unit
     integer :: ios
     character(len=512) :: msg
     logical :: adv_isoneutral, upstream_ts_land_curv, parabolic_splines
-    namelist /numerics_settings/ adv_isoneutral, upstream_ts_land_curv, parabolic_splines
+    character(len=16) :: eos
+    namelist /numerics_settings/ adv_isoneutral, upstream_ts_land_curv, parabolic_splines, eos
     adv_isoneutral = .false.; upstream_ts_land_curv = .false.; parabolic_splines = .false.
+    eos = 'nonlinear'
     rewind(unit)
     read(unit, nml=numerics_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'NUMERICS_SETTINGS')
@@ -361,6 +364,17 @@ contains
                      ' is UCLA ROMS only; the GPU has thickness-aware C4 / U3'
       error stop 'read_namelist: parabolic_splines'
     endif
+    select case (trim(eos))
+    case ('nonlinear')
+    case ('linear')
+      write(*,'(a)') "ERROR: NUMERICS_SETTINGS eos = 'linear': the linear equation of state is UCLA ROMS only;"// &
+                     " the GPU has the nonlinear one (eos = 'nonlinear', the default)"
+      error stop 'read_namelist: eos'
+    case default
+      write(*,'(a)') "ERROR: NUMERICS_SETTINGS eos = '"//trim(eos)//"': not a known equation of state"// &
+                     " ('nonlinear' or 'linear'; the GPU runs 'nonlinear')"
+      error stop 'read_namelist: eos'
+    end select
     land_curv_on = upstream_ts_land_curv
   end subroutine read_numerics_settings
 
