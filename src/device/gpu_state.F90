@@ -69,6 +69,7 @@ module gpu_state
   real(rp), public :: rdrg = 0.0_rp
   real(rp), public :: rdrg2 = 0.0_rp
   logical,  public :: linear_drag_on = .false.   ! &bottom_drag_settings linear_drag
+  logical,  public :: land_curv_on = .false.     ! &numerics_settings upstream_ts_land_curv
   real(rp), public :: visc2 = 0.0_rp
   real(rp), public :: akv_bak = 0.0_rp
   real(rp), public :: akt_bak(2) = 0.0_rp

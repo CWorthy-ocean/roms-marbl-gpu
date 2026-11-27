@@ -201,6 +201,7 @@ contains
       error stop 'read_namelist: parallel_io'
     endif
     call read_periodic_settings(unit)
+    call read_numerics_settings(unit)
     call set_cdr_lite(nt_cdr_oae, nt_cdr_dor)
     case_nt_passive = max(nt_passive, 0_ip)
 
@@ -340,6 +341,34 @@ contains
     case_periodic_x = ew_periodic
     case_periodic_y = ns_periodic
   end subroutine read_periodic_settings
+
+  subroutine read_numerics_settings(unit)
+    ! Optional group &numerics_settings, as the CPU (UCLA ROMS step 10a; all
+    ! defaults .false.). upstream_ts_land_curv drops the third-order
+    ! curvature of the horizontal UP3 tracer flux at faces whose stencil
+    ! touches land. adv_isoneutral and parabolic_splines are UCLA ROMS only
+    ! and stop the run.
+    integer, intent(in) :: unit
+    integer :: ios
+    character(len=512) :: msg
+    logical :: adv_isoneutral, upstream_ts_land_curv, parabolic_splines
+    namelist /numerics_settings/ adv_isoneutral, upstream_ts_land_curv, parabolic_splines
+    adv_isoneutral = .false.; upstream_ts_land_curv = .false.; parabolic_splines = .false.
+    rewind(unit)
+    read(unit, nml=numerics_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'NUMERICS_SETTINGS')
+    if (adv_isoneutral) then
+      write(*,'(a)') 'ERROR: NUMERICS_SETTINGS adv_isoneutral = .true.: isoneutral advection and diffusion'// &
+                     ' are UCLA ROMS only'
+      error stop 'read_namelist: adv_isoneutral'
+    endif
+    if (parabolic_splines) then
+      write(*,'(a)') 'ERROR: NUMERICS_SETTINGS parabolic_splines = .true.: spline vertical tracer advection'// &
+                     ' is UCLA ROMS only; the GPU has thickness-aware C4 / U3'
+      error stop 'read_namelist: parabolic_splines'
+    endif
+    land_curv_on = upstream_ts_land_curv
+  end subroutine read_numerics_settings
 
   subroutine read_tile_settings(unit)
     ! Optional &tile_settings group (absent = 'wet' balance, land weight from

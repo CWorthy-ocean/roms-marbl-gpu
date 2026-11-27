@@ -157,6 +157,14 @@
 # MARBL's tracer count (32 with the default settings) with it; otherwise the
 # run stops. A MARBL case must add use_marbl = .true.
 #
+# Numerics: the optional group &numerics_settings, as UCLA ROMS after 0.16.0
+# (there it replaces the cpp keys UPSTREAM_TS_LAND_CURV, ADV_ISONEUTRAL and
+# PARABOLIC_SPLINES; all default .false.). upstream_ts_land_curv drops the
+# curvature term of the horizontal UP3 tracer flux at faces whose stencil
+# touches land; before, the GPU always did, so a case that should keep its
+# results must set upstream_ts_land_curv = .true. adv_isoneutral and
+# parabolic_splines = .true. stop the run (UCLA ROMS only).
+#
 # Salinity and MPI masking, as UCLA ROMS after 0.16.0 (there they replace
 # the cpp keys SALINITY and MPI_MASKING): &param_settings salinity (default
 # .true.) is read, and .false. (a temperature-only run) stops: the GPU always
@@ -330,9 +338,10 @@
 # The group and its logical switch imex_igw are required in every
 # namelist, as in UCLA ROMS (ucla-roms PR for the imex_igw key, branch
 # imex-igw-key); imex_igw has no default:
-#   imex_igw = .true.   IMEX on (UCLA ROMS: needs a build with IMEX_IGW)
-#   imex_igw = .false.  the stock step (UCLA ROMS: a build without
-#                       IMEX_IGW); the group's other keys are read (an
+#   imex_igw = .true.   IMEX on (UCLA ROMS up to 0.16.0: also needed a
+#                       build with the cpp key IMEX_IGW; after it, the
+#                       setting alone decides, as on the GPU)
+#   imex_igw = .false.  the stock step; the group's other keys are read (an
 #                       unknown or removed key still stops the run) and
 #                       ignored, with a start-up note that lists them
 # A namelist without the group or without the key stops the run at
