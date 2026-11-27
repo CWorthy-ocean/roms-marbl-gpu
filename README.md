@@ -1092,12 +1092,13 @@ The GPU model implements one configuration of UCLA ROMS, the one in common
 use with MARBL; other CPU options are not available. In ROMS terms:
 
 - SM09 s-coordinate, Shchepetkin pressure-gradient scheme
+- Split nonlinear equation of state (`&numerics_settings eos = 'nonlinear'`, the default)
 - LF-AM3 predictor / corrector time stepping
 - Split-explicit barotropic mode (FB AB3-AM4) with the `weight(1:2,1:nfast)` filter, or the implicit free surface (`&implicit_fs`)
 - Thickness-aware C4 predictor / U3 corrector vertical advection
 - UPSTREAM_TS horizontal tracer advection; `&numerics_settings upstream_ts_land_curv` (default `.false.`, as UCLA ROMS) drops the curvature term at faces next to land
 - LMD94 interior mixing and KPP surface and bottom boundary layers (SMOOTH_RIG, INT_AT_RHO_POINTS, SMOOTH_HBL, Jwt=1)
-- Not available (the run stops): NHMG, isoneutral advection (`adv_isoneutral`), parabolic splines (`parabolic_splines`), LMD_CONVEC
+- Not available (the run stops): NHMG, isoneutral advection (`adv_isoneutral`), parabolic splines (`parabolic_splines`), the linear equation of state (`eos = 'linear'`), LMD_CONVEC
 
 ## BGC tracer subcycling
 
