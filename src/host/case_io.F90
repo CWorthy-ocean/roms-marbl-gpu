@@ -730,8 +730,10 @@ contains
     real(rp) :: rdrg, rdrg2, zob, visc2, akv_bak, rho0
     real(rp) :: akt_bak(nml_ntrc_max), tnu2(nml_ntrc_max)
     logical :: linear_drag, ana_vmix
+    logical :: lmd_mixing, lmd_kpp, lmd_bkpp, lmd_nonlocal, lmd_rimix, lmd_convec
     namelist /bottom_drag_settings/ rdrg, rdrg2, zob, linear_drag
-    namelist /vertical_mixing_settings/ akv_bak, akt_bak, ana_vmix
+    namelist /vertical_mixing_settings/ akv_bak, akt_bak, ana_vmix, &
+                                        lmd_mixing, lmd_kpp, lmd_bkpp, lmd_nonlocal, lmd_rimix, lmd_convec
     namelist /lateral_visc_settings/ visc2
     namelist /tracer_diff2/ tnu2
     namelist /rho0_settings/ rho0
@@ -740,6 +742,12 @@ contains
     akt_bak = 0.0_rp; akt_bak(1:2) = akt_bak_in
     tnu2 = 0.0_rp; rho0 = rho0_in
     linear_drag = .false.; ana_vmix = .false.
+    ! The LMD settings of UCLA ROMS after 0.16.0 (there they replace the cpp
+    ! keys LMD_*), with its defaults: the GPU has LMD94 interior mixing with
+    ! KPP surface and bottom boundary layers, the nonlocal flux and Ri mixing
+    ! (lmd.F90), and no convective mixing.
+    lmd_mixing = .true.; lmd_kpp = .true.; lmd_bkpp = .true.
+    lmd_nonlocal = .true.; lmd_rimix = .true.; lmd_convec = .false.
     rewind(unit); read(unit, nml=bottom_drag_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'BOTTOM_DRAG_SETTINGS')
     rewind(unit); read(unit, nml=vertical_mixing_settings, iostat=ios, iomsg=msg)
@@ -748,6 +756,16 @@ contains
       write(*,'(a)') 'ERROR: VERTICAL_MIXING_SETTINGS ana_vmix = .true.: analytical vertical mixing (ana_vmix.h)'// &
                      ' is UCLA ROMS only'
       error stop 'read_namelist: ana_vmix'
+    endif
+    if (.not. (lmd_mixing .and. lmd_kpp .and. lmd_bkpp .and. lmd_nonlocal .and. lmd_rimix)) then
+      write(*,'(a,5l2)') 'ERROR: VERTICAL_MIXING_SETTINGS lmd_mixing, lmd_kpp, lmd_bkpp, lmd_nonlocal, lmd_rimix =', &
+                         lmd_mixing, lmd_kpp, lmd_bkpp, lmd_nonlocal, lmd_rimix
+      write(*,'(a)') '  the GPU has LMD mixing with all five (the default); turning one off is UCLA ROMS only'
+      error stop 'read_namelist: lmd'
+    endif
+    if (lmd_convec) then
+      write(*,'(a)') 'ERROR: VERTICAL_MIXING_SETTINGS lmd_convec = .true.: convective mixing is UCLA ROMS only'
+      error stop 'read_namelist: lmd_convec'
     endif
     rewind(unit); read(unit, nml=lateral_visc_settings, iostat=ios, iomsg=msg)
     call nml_stop(ios, msg, 'LATERAL_VISC_SETTINGS')

@@ -144,6 +144,12 @@
 # 'linear' (UCLA ROMS only, with &lin_rho_eos_settings) and any other value
 # stop the run.
 #
+# Vertical mixing, as UCLA ROMS after 0.16.0 (there the logicals replace the
+# cpp keys LMD_MIXING, LMD_KPP, LMD_BKPP, LMD_NONLOCAL, LMD_RIMIX and
+# LMD_CONVEC): &vertical_mixing_settings lmd_mixing, lmd_kpp, lmd_bkpp,
+# lmd_nonlocal and lmd_rimix (default .true.) and lmd_convec (default
+# .false.) are read. The GPU runs the defaults; any other value stops.
+#
 # Salinity and MPI masking, as UCLA ROMS after 0.16.0 (there they replace
 # the cpp keys SALINITY and MPI_MASKING): &param_settings salinity (default
 # .true.) is read, and .false. (a temperature-only run) stops: the GPU always
